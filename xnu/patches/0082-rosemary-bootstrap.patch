@@ -1,0 +1,278 @@
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+index f2d8bf8..c5603c5 100644
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -45,7 +45,7 @@ CFLAGS+= -include meta_features.h -DDRIVER_PRIVATE \
+ SFLAGS+= -include meta_features.h
+ 
+ # This provider is built into SWEET; other boards use their normal kext.
+-ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
++ifneq ($(filter SWEET ROSEMARY,$(CURRENT_MACHINE_CONFIG)),)
+ SWEET_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sweet_libpthread
+ SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
+ sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..d9b5ac0 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -67,6 +67,7 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOPlatformDevice;"
+     "     'IONameMatch'     = 'sweet,display';"
+     "   },"
++#if !defined(ROSEMARY)
+     "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+     "     'IOProviderClass' = IOResources;"
+@@ -82,6 +83,7 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++#endif
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..1570047 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -766,7 +766,7 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		}
+ 	}
+ 
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) && !defined(ROSEMARY)
+ //
+ //	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
+ //
+diff --git a/libkern/conf/Makefile.template b/libkern/conf/Makefile.template
+index aca295c..91531e5 100644
+--- a/libkern/conf/Makefile.template
++++ b/libkern/conf/Makefile.template
+@@ -19,7 +19,7 @@ include $(MakeInc_def)
+ CFLAGS+= -include meta_features.h -DLIBKERN_KERNEL_PRIVATE -DOSALLOCDEBUG=1
+ SFLAGS+= -include meta_features.h
+ 
+-ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
++ifneq ($(filter SWEET ROSEMARY,$(CURRENT_MACHINE_CONFIG)),)
+ SWEET_AES_ROOT = $(SRCROOT)/libkern/crypto/sweet_bearssl
+ SWEET_AES_INC = -I$(SWEET_AES_ROOT)/inc -I$(SWEET_AES_ROOT)/src
+ sweet_aes.o_INCFLAGS = $(SWEET_AES_INC)
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 9a748ea..8ac42f0 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -29,7 +29,7 @@ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else ifneq ($(findstring _host,$(RC_ProjectName)),)
+ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else
+-SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET
++SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET ROSEMARY
+ 
+ endif
+ 
+@@ -62,6 +62,7 @@ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++MACHINE_FLAGS_ARM64_ROSEMARY = -DARM64_BOARD_CONFIG_SWEET -DROSEMARY -march=armv8.2-a+crypto
+ 
+ 
+ #
+@@ -261,7 +262,7 @@ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := $(shell echo $(CURRENT_ARCH_CONFIG) | tr A-Z a-z)
+ ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)
+ # sweet's Cortex-A76/A55 have no pointer authentication: stay plain arm64
+-ifneq ($(CURRENT_MACHINE_CONFIG),SWEET)
++ifeq ($(filter SWEET ROSEMARY,$(CURRENT_MACHINE_CONFIG)),)
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e
+ endif
+ endif
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb568..ce77485 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1836,17 +1836,20 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ static void
+ sweet_early_map_final(void)
+ {
+-	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+-	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
+-	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+-	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+-	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+-	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+-	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+-	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+-	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+-	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	assert(SWEET_EARLY_FB_VA + SWEET_EARLY_FB_MAP_BLOCKS * ARM_TT_L2_SIZE <= gVirtBase);
++	for (unsigned int i = 0; i < SWEET_EARLY_FB_MAP_BLOCKS; i++) {
++		const vm_map_address_t va = SWEET_EARLY_FB_VA + i * ARM_TT_L2_SIZE;
++		const pmap_paddr_t pa = SWEET_EARLY_FB_MAP_BASE + i * ARM_TT_L2_SIZE;
++		tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
++		assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
++		tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
++		tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
++		assert(*slot == ARM_TTE_EMPTY);
++		*slot = pa | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	}
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+ #endif
+@@ -2190,7 +2193,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ #if defined(SWEET)
+ 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+-	sweet_early_relocate(SWEET_EARLY_FB_VA);
++	sweet_early_relocate(SWEET_EARLY_FB_VA + SWEET_EARLY_FB_OFFSET);
+ #endif
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+ 
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..4fe4758 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -515,10 +515,10 @@ LEXT(start_first_cpu)
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	MOV64	x0, (SWEET_EARLY_FB_BASE + 2368 * SWEET_EARLY_FB_STRIDE)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
++	mov		x4, #SWEET_EARLY_FB_STRIDE
+ Lsweet_mark_row:
+ 	mov		x3, #64
+ 	mov		x5, x0
+@@ -680,19 +680,25 @@ Lkernelcache_base_found:
+ 
+ #if defined(SWEET)
+ 	/*
+-	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
++	 * Splash framebuffer: one block on sweet, two on rosemary, in the EXISTING V=P
+ 	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+ 	 * create_bootstrap_mapping would replace the RAM L2 table.
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, SWEET_EARLY_FB_MAP_BASE
++	MOV64	x6, (1 << ARM_TT_L2_SHIFT)
++	mov		x5, #SWEET_EARLY_FB_MAP_BLOCKS
++Lsweet_map_fb_block:
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	add		x10, x10, x6
++	subs	x5, x5, #1
++	b.ne	Lsweet_map_fb_block
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 6928957..bba2997 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,11 +11,11 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_EARLY_FB_BASE;
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH 1080u
+ #define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_STRIDE (SWEET_EARLY_FB_STRIDE / 4)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+@@ -99,7 +99,11 @@ sweet_early_mark(unsigned int stage, const char *label)
+ 		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
++#if defined(ROSEMARY)
++	sweet_early_string("ROSEMARY EARLY ");
++	#else
+ 	sweet_early_string("SWEET EARLY ");
++#endif
+ 	if (stage >= 10) {
+ 		sweet_early_putc((char)('0' + stage / 10));
+ 	}
+@@ -116,7 +120,11 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 		return;
+ 	}
+ 	early_panicking = 1;
++#if defined(ROSEMARY)
++	sweet_early_string("\nROSEMARY EARLY PANIC: ");
++	#else
+ 	sweet_early_string("\nSWEET EARLY PANIC: ");
++#endif
+ 	va_list copy;
+ 	va_copy(copy, *args);
+ 	_doprnt(fmt, &copy, sweet_early_putc, 16);
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index c86b9e7..0ab2eac 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -267,7 +267,9 @@ _cnputc(char c, bool poll)
+  * @param size The number of characters to print to the console.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++#if !defined(ROSEMARY)
+ extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
++#endif
+ /*
+  * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents:
+  * console text still goes to the persistent log, but is not drawn over
+@@ -282,7 +284,9 @@ _cnputs(char *c, int size, bool poll)
+ 	extern int disableConsoleOutput;
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++#if !defined(ROSEMARY)
+ 	sweet_log_append(c, size);
++#endif
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;
+ 	}
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f4..50650b8 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -43,11 +43,25 @@
+ #endif /* ! ASSEMBLER */
+ 
+ /*
+- * Qualcomm numbers the architected timer PPIs 1/2/3/0 (secure phys, phys,
+- * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
+- * (CNTV) is INTID 16 + 3 = 19.
++ * Timer PPI numbers are board-specific: Qualcomm uses 3 (INTID 19), while
++ * MT6785 uses 11 (INTID 27). The Rosemary ADT also publishes the live value.
+  */
++#if defined(ROSEMARY)
++/* MT6785's architected virtual timer PPI is 11, GIC INTID 16 + 11 = 27. */
++#define SWEET_EARLY_FB_BASE       0x7bd20000
++#define SWEET_EARLY_FB_MAP_BASE   0x7a000000
++#define SWEET_EARLY_FB_OFFSET     0x01d20000
++#define SWEET_EARLY_FB_STRIDE     4352
++#define SWEET_EARLY_FB_MAP_BLOCKS 2
++#define SWEET_VTIMER_INTID        27
++#else
++#define SWEET_EARLY_FB_BASE       0x9c000000
++#define SWEET_EARLY_FB_MAP_BASE   0x9c000000
++#define SWEET_EARLY_FB_OFFSET     0
++#define SWEET_EARLY_FB_STRIDE     4320
++#define SWEET_EARLY_FB_MAP_BLOCKS 1
+ #define SWEET_VTIMER_INTID        19
++#endif
+ #define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
+ 
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
