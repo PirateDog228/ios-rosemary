@@ -9,7 +9,7 @@ diff --git a/bsd/dev/rosemary_ufs.c b/bsd/dev/rosemary_ufs.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/rosemary_ufs.c
-@@ -0,0 +1,679 @@
+@@ -0,0 +1,716 @@
 +/*
 + * ROSEMARY (Redmi Note 10S, MT6785) internal UFS root device.
 + *
@@ -594,6 +594,35 @@ new file mode 100644
 +	.d_type       = D_DISK,
 +};
 +
++/*
++ * Diagnostics: show what the first blocks of the partition really contain, so a
++ * failed root mount can be told apart (ext4/Android still there, zeros from a
++ * DMA problem, or a real HFS+ volume header). Boot-arg ufspause=<seconds> keeps
++ * the lines on the screen before the mount retries scroll them away.
++ */
++static void
++ufs_dump_head(void)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	if (ufs_read_blocks(su.first_block, 1)) {
++		printf("ROSEMARY UFS: head read failed\n");
++		return;
++	}
++	uint32_t nz = 0;
++	for (uint32_t i = 0; i < UFS_BLOCK; i++) {
++		nz += (b[i] != 0);
++	}
++	printf("ROSEMARY UFS: block0 nonzero bytes %u of %u, ext4 magic@0x438 %02x%02x\n",
++	    nz, UFS_BLOCK, b[0x438], b[0x439]);
++	const uint32_t *w = (const uint32_t *)(b + 0x400);
++	/* HFS+ volume header (big endian): sig, version, attributes, lastMountedVersion, journalInfoBlock */
++	printf("ROSEMARY UFS: vh@0x400 %08x %08x %08x %08x\n", w[0], w[1], w[2], w[3]);
++	printf("ROSEMARY UFS: vh@0x410 %08x %08x %08x %08x\n", w[4], w[5], w[6], w[7]);
++	printf("ROSEMARY UFS: vh@0x420 %08x %08x %08x %08x\n", w[8], w[9], w[10], w[11]);
++	printf("ROSEMARY UFS: vh@0x430 %08x %08x %08x %08x\n", w[12], w[13], w[14], w[15]);
++	printf("ROSEMARY UFS: (HFS+ sig is 482b..., case-sensitive HX = 4858...; ext4 = 53ef)\n");
++}
++
 +static int
 +rosemary_ufs_init(void)
 +{
@@ -648,6 +677,9 @@ new file mode 100644
 +	if (!error) {
 +		error = ufs_find_partition(want);
 +	}
++	if (!error) {
++		ufs_dump_head();
++	}
 +	lck_mtx_unlock(&rosemary_ufs_lock);
 +	if (error) {
 +		return error;
@@ -670,6 +702,11 @@ new file mode 100644
 +	printf("ROSEMARY UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
 +	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
 +	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	uint32_t pause = 0;
++	PE_parse_boot_argn("ufspause", &pause, sizeof(pause));
++	for (uint32_t i = 0; i < pause * 1000 && i < 120000; i++) {
++		delay(1000);				/* microseconds */
++	}
 +	return 0;
 +}
 +
