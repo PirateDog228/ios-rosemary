@@ -90,7 +90,11 @@ int mmu_enable(struct mmu_info *info)
 	zero_table(l2);
 	for (uint64_t i = 0; i < (8UL << 30) >> BLK_SHIFT; i++)
 		l2[i] = (i << BLK_SHIFT) | DEV_FLAGS | D_BLOCK;
-	l2[FB_PHYS >> BLK_SHIFT] = (FB_PHYS & ~(BLK_SIZE - 1)) | NC_FLAGS | D_BLOCK;
+	/* The rosemary splash buffer is about 35 MiB and crosses a 32 MiB
+	 * block boundary. Mark every block it covers as non-cacheable. */
+	for (uint64_t blk = FB_PHYS >> BLK_SHIFT;
+	     blk <= (FB_PHYS + FB_SIZE - 1) >> BLK_SHIFT; blk++)
+		l2[blk] = (blk << BLK_SHIFT) | NC_FLAGS | D_BLOCK;
 
 	/* L3 for each block that holds part of the image */
 	for (uint64_t blk = img_lo >> BLK_SHIFT; blk <= (img_hi - 1) >> BLK_SHIFT; blk++) {

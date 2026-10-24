@@ -10,15 +10,14 @@
 #include "console.h"
 #include "mmu.h"
 #include "loader.h"
+#ifndef ROSEMARY
 #include "ufs.h"
+#endif
 
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
 #define PSHOLD			0x0c264000UL
 
-#define GICD_BASE		0x17a00000UL
-#define GICR_BASE		0x17a60000UL
-#define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
 #define GICR_WAKER		0x14
@@ -30,8 +29,6 @@
 #define GICR_ISPENDR0		(GICR_SGI + 0x200)
 #define GICR_ISACTIVER0		(GICR_SGI + 0x300)
 #define GICR_ICFGR1		(GICR_SGI + 0xc04)
-#define VTIMER_INTID		19	/* DT: <GIC_PPI 3 ...>, not the usual 27 */
-#define PTIMER_INTID		18	/* DT: <GIC_PPI 2 ...> */
 #define SGI_INTID		1
 
 #define PSCI_VERSION		0x84000000UL
@@ -88,6 +85,18 @@ static uint64_t smc(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
 	return x0;
 }
 
+#ifdef ROSEMARY
+/* LK leaves the MT6785 watchdog armed. Disable it before handing off to XNU. */
+static uint32_t rosemary_wdt_disable(void)
+{
+	uint32_t before = rd32(0x10007000UL);
+	wr32(0x10007000UL, 0x22000000U); /* TOPRGU key + clear watchdog enable */
+	wr32(0x10007008UL, 0x1971U);     /* restart key */
+	__asm__ volatile("dsb sy; isb" ::: "memory");
+	return before;
+}
+#endif
+
 static uint64_t now(void)
 {
 	isb();
@@ -106,10 +115,14 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 	con_skip();
 	con_str("RESET", after_s > 20 ? "in 40s" : "in 20s");
 	delay_ms(after_s * 1000);
+#ifndef ROSEMARY
 	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
 	__asm__ volatile("dsb sy" ::: "memory");
+#endif
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+#ifndef ROSEMARY
 	wr32(PSHOLD, 0);
+#endif
 	for (;;)
 		__asm__ volatile("wfe");
 }
@@ -367,23 +380,36 @@ static uint64_t ticks_mem(void)
 
 static uint32_t to_us(uint64_t ticks)
 {
-	return ticks * 10 / 192;	/* 19.2 MHz */
+	uint64_t hz = rsr("cntfrq_el0");
+	return hz ? (uint32_t)(ticks * 1000000 / hz) : 0;
 }
 
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
+#ifdef ROSEMARY
+	/* Disable LK's watchdog before any framebuffer drawing or payload work. */
+	uint32_t wdt_before = rosemary_wdt_disable();
+#endif
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
+#ifdef ROSEMARY
+	con_str("SHIM", "rosemary XNU loader");
+	con_hex2("WDT", "was=", wdt_before, "now=", rd32(0x10007000UL));
+	con_skip();
+#else
 	con_str("SHIM", "sweet milestone 4: xnu loader");
+#endif
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
 
-	/* No payload: probe the internal UFS while the MMU is still off. */
+	/* UFS is only present on sweet; rosemary uses eMMC and has no storage
+	 * driver in this shim yet. */
+#ifndef ROSEMARY
 	stage = "ufs";
 	test_ufs();
 	con_skip();
@@ -391,6 +417,10 @@ void shim_main(uint64_t dtb)
 	con_str("UFS", "probe done, reset in ~3 min");
 	delay_ms(180000);
 	reset(20);
+#else
+	con_str("STORAGE", "rosemary eMMC driver pending");
+	con_skip();
+#endif
 
 	stage = "fill off";
 	uint64_t fill_off = ticks_fill(RED);
@@ -405,7 +435,11 @@ void shim_main(uint64_t dtb)
 	if (rc)
 		con_clear(RED);
 
+#ifdef ROSEMARY
+	con_str("SHIM", "rosemary MMU/GIC");
+#else
 	con_str("SHIM", "sweet milestone 3");
+#endif
 	con_skip();
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
 	con_hex2("IMAGE", "lo=", mi.img_lo, "hi=", mi.img_hi);

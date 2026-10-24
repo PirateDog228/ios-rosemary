@@ -1,3 +1,76 @@
+# ios-rosemary (Redmi Note 10S, MT6785) - ACTIVE WORK, handoff 2026-10-23
+
+Branch `rosemary-bringup`. Port of the sweet work to rosemary (MediaTek Helio G95, MT6785). Diagnostic stages 0, 4, 5, 6, and 7 have been booted; Stage 7 confirmed SMP startup on all seven secondary CPUs and successful MMU/GIC checks. Everything below marked (DTS) comes from the Lineage kernel source `LineageOS/android_kernel_xiaomi_mt6785` (branch lineage-23.2: `arch/arm64/boot/dts/mediatek/mt6785.dts`, `rosemary.dts`, `cust_mt6785_msdc.dtsi`, `touchscreen.dtsi`; copies in `research/rosemary-draft/`). Values in the DTS memory/chosen nodes are placeholders that LK rewrites at boot, so trust only what the diag prints from the live DTB.
+
+## CORRECTION + Stage 8 (2026-10-24, later)
+- **Storage is UFS, not eMMC.** Live `/proc/iomem` has `ufshci@11270000`; partitions are `/dev/block/sda`, `sdb`, `sdc` (`userdata` = `sdc61`, `boot_a` = `sdc36`, `boot_b` = `sdc56`). `mmc0@11240000` is the SD slot. The "eMMC" statements above are wrong; ignore the "needs an MSDC driver" lines. Android GPT is on LUN 2 (sdc).
+- Added `shim/rosemary-diag/ufs_mtk.c/.h` + stage 8 hook in `diag.c` and `build.sh` (`STAGE=8`, optional `EXTRA_CMDLINE="rdiag_ufsinit=1 rdiag_ufslun=2"`). Default is read-only: register dump, NOP OUT, TUR, READ CAPACITY on LUN0-2, INQUIRY, GPT of LUN2 (prints userdata/boot_a/boot_b/super/... with partition number, LBA, MiB, fs type of userdata). `rdiag_ufsinit=1` additionally enables the host, runs DME_LINKSTARTUP and sets fDeviceInit if LK left the host disabled (no MTK clock/PHY setup, experimental). It compiles cleanly (clang, no warnings, no undefined symbols, no absolute data relocations) but is **not tested on hardware**.
+- Unknown until run: whether LK leaves `HCE=1`. If the screen says "host DISABLED", rerun with `rdiag_ufsinit=1`; if that fails, a real MTK bring-up (UFS clocks, MPHY, VCC/VCCQ via MT6359, ufs-mediatek vendor regs) is needed. Reference: Linux `drivers/ufs/host/ufs-mediatek.c` in the Lineage mt6785 kernel.
+- **GitHub layout (checked 2026-10-24):** the user's fork is `PirateDog228/ios-rosemary` (fork of `dipa-studio/ios-sweet`). Its `main` is just the upstream project (sweet). The branch with the XNU CI work is `rosemary-ci-build` (patches 0082, 0083-master-config, 0083-mockfs-config, 0084-rosemary-kperf-kpc; the stage scripts 0019/0020/0026 were fixed there, do not overwrite them). The local branch `rosemary-bringup` was never pushed. Build with: `gh workflow run xnu.yml -R PirateDog228/ios-rosemary --ref rosemary-ci-build -f machine_config=ROSEMARY`.
+- **Patch 0085 (2026-10-24, not built, not booted):** `xnu/patches/0085-rosemary-ufs-root-device.patch` adds `bsd/dev/rosemary_ufs.c` (the sweet UFS driver 0028+0030+0034+0069 minus the log thread, on LUN 2, DT node `/rosemary-ufs`, boot-args `ufsroot= ufslun= ufsrw= ufscache= ufswait=`), registers it in `bsd/conf/files` and re-enables the `rd=ufsroot0` branch of `IOFindBSDRoot` for ROSEMARY (it calls `rosemary_ufs_rootdev`). `git apply --check` was verified only against a synthetic tree rebuilt from patches 0028+0082 (stock XNU was not reachable), so the first CI run is the real test. `tools/mkadt_rosemary.py` now emits `/rosemary-ufs` (reg 0x11270000+0x3000) instead of the useless MSDC node.
+- First XNU test plan: cmdline `rd=ufsroot0 ufslun=2 cpus=1 debug=0xc serial=3 keepsyms=1 -noprogress` (no `ufsrw`, nothing is written). Expected: line `ROSEMARY UFS: "userdata" on LUN 2: first block 0x2b6000, 110907 MiB, read-only` then an HFS mount failure, because userdata is still ext4 Android. That outcome proves the storage path. Then flash the iOS root image into `userdata` (destructive: confirm with the user first) and boot with `ufsrw=1 rootrw=1`.
+- Known gaps: `research/ipsw-x/d22ap.adt` still missing (no `/product`), persistent log to the end of userdata (0047) not ported to rosemary, touch/display/USB not ported.
+
+- (superseded by the 0085 note above) Next after a good stage 8: port to XNU as `bsd/dev/rosemary_ufs.c` modelled on `0028/0030/0034` (root = `userdata` on LUN 2), then the log ring at the end of userdata.
+
+## Current XNU prep (2026-10-24)
+- Stage 7 user readback confirms all seven secondaries entered (`SMP started=7`), CPU1 is Cortex-A55 (`MIDR 0x411fd050`), CPUs6-7 are Cortex-A76 (`0x413fd0b0`), all at EL1 with 16K granule support. MMU and GIC summary is `mmu=1 gic=1`; PAR translations succeed for image, framebuffer, and GIC.
+- Added local patch `xnu/patches/0082-rosemary-bootstrap.patch`: separate `MACHINE_CONFIG=ROSEMARY`, reuses the Sweet CPU/GIC setup, maps rosemary's offset framebuffer across two 32 MiB blocks with stride 4352, uses virtual timer INTID 27, and avoids Sweet-only UFS logging/root selection plus Sweet HID/battery IOKit personalities.
+- The full XNU source is staged with patches 0001-0081 in ignored scratch `research/xnu-8796.141.3`; the new patch is applied there for source inspection. It is **not compiled**: this Linux host has no Xcode/KDK, and no Mac is available. The shim build is not an XNU kernel. Do not flash a Rosemary XNU image until a kernel is built and its boot image is inspected.
+- No phone image was flashed during this prep, and nothing was committed, pushed, or uploaded. Keep `boot_a` (TWRP) unchanged; the current diagnostics use `boot_b` per the user's note.
+
+## What the earlier draft got wrong (corrected 2026-10-21)
+- Framebuffer base `0x7bd20000` is rosemary's, not sweet's. LK reports it in `/chosen` (`atag,videolfb-fb_base_l/h`, `vramSize`, `lcmname`, `islcm_inited`); the live atag and Android display log report size `0x22e0000`, 1080x2400, and stride 4352 bytes (1088 pixels). Pixel order is still a guess (`rdiag_rgba=1`). The DTS placeholder `0x7e605000 / 0x17e8000` is stale.
+- RAM: MTK DRAM starts at 0x40000000 (DTS placeholder `0x40000000 + 0x3e605000`, LK fixes it up). sweet's 0x100000000 window does not apply.
+- Storage is **eMMC** (mmc0 @0x11230000 + msdc0_top @0x11f50000, 8-bit HS400, CQHCI), not UFS. The UFS node in the old ADT was a leftover; `shim/ufs.c` and `sweet_ufs.c` are useless here. Needs an MSDC driver (standard MSDC regs; MTK-specific top/clock/tuning).
+- Boot chain is MediaTek LK (not Qualcomm ABL): boot.img v2, base 0x40078000, kernel loaded at 0x40080000, x0 = DTB, entry EL (1 or 2) is unknown -> diag prints CurrentEL and now installs vectors for EL2 too.
+
+## Hardware facts (DTS)
+- CPU: 8 cores. Reported Stage 7 MIDRs: CPU1 `0x411fd050` (Cortex-A55), CPUs6-7 `0x413fd0b0` (Cortex-A76); stock DTB MPIDRs are `0x000,0x100,...,0x700`. Remaining per-core MIDRs were not transcribed. Timer 13 MHz, virtual timer PPI 11 = INTID 27.
+- GICv3: GICD 0x0c000000 (0x40000), GICR 0x0c040000 (0x200000) (draft already right).
+- eMMC MSDC0 0x11230000, top 0x11f50000, SPI 101. UART0 0x11002000. WDT toprgu 0x10007000. Keypad 0x10010000. PWRAP 0x1000d000 (MT6359 PMIC behind it). USB: xHCI 0x11200000, mtu3 MAC 0x11201000, IPPC 0x11203e00 (not DWC3 - the sweet USB-gadget log trick needs a new mtu3 driver).
+- Display: mmsys 0x14000000, OVL0 0x14008000, OVL0_2L 0x14009000, RDMA0 0x1400b000, DSI0 0x14014000, panel 1080x2400.
+- Touch: i2c0 0x11007000 @0x5d Goodix GT9885 (compat goodix,gt9885; GTX8 protocol, differs from sweet's GT9896) and Focaltech @0x38 as alternative; rail = MT6359 VTP LDO (via PWRAP, not RPMh); reset GPIO2, irq GPIO1.
+
+## Diagnostic (`shim/rosemary-diag`, stages 0, 4, 5, and 6 run; stage 7 built)
+Stage 0 reads the LK-fixed DTB and paints CPU ID registers, memory, framebuffer, and reserved-memory. The code disables the MediaTek watchdog, so it is storage-read-only but does change one hardware register. Stages 1-3 read selected GIC/UART, display/MSDC0, and USB/PMIC registers; an inaccessible block may hang or abort. Stage 4 attempts PSCI CPU startup, 16K MMU setup, and a GIC timer/SGI check. It takes CPU targets from the live DTB and skips its EL1 MMU test if LK entered at EL2.
+
+Stage 0 was run on the phone. User-reported `CurrentEL=4` means entry at EL1, and `TGran16=1` means the boot CPU reports 16K granule support.
+
+Stage 4 was run on the phone: `cpu-nodes=8`, `SMP started=0`, `MMU rc=0`, summary `smp=0 mmu=1 gic=1`; `PSCI ver=00010001`, `on_feat=0`; reported PAR values `img=40083B80`, `fb=7BD21B00`, `gic=0C000B00` all indicate successful translation (`PAR.F=0`). The reported secondary `T16=0` values are not valid feature readings because no secondary CPU reached `secondary_main` (the arrays remain zero). User's approximate CPU lines show `ret/seen` as zero and `want` values beginning `0x100`, `0x200`, etc.; exact per-CPU `ret`/`want` still need to be copied. `PSCI_FEATURES(CPU_ON)=0` reports CPU_ON implemented; this does not prove a secondary reached the provided entry point.
+
+Stage 5 was flashed to active `boot_b` and run. User reports `SMP entry=40080858`, every target `ret=0`, `want=0x100,0x200,...`, `seen=0`, `aff=1 entry=0`, and `SMP started=0`. The `want` IDs match the stock DTB and each CPU_ON call returned success. Stage 5 immediately asked a secondary to power itself off after recording data, so `aff=1` is also consistent with a secondary that ran and then powered off; the zero marker/data could be stale cache visibility. Stage 6 keeps secondaries online, puts each CPU's telemetry in a cache-line-aligned record, and cleans/invalidates shared data before reading it to distinguish those cases.
+
+The extracted stock boot DTB has CPU `reg` MPIDRs `0x000, 0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700` and `enable-method = "psci"`, matching the user's reported `want=0x100,0x200,...`; these values are in the source DTB, not introduced by the diagnostic parser. CPU topology in the actual silicon still needs runtime confirmation.
+
+Stage 5 diagnostic is built at `shim/rosemary-diag/out-rdiag-stage5-20261024/stage5-boot.img` (SHA256 `49e386300987412c89b99c938b354c4df98d7280886dddc0218fd467bbcfa127`). It adds the runtime `secondary_entry` address, an assembly marker at the first secondary instruction, and PSCI AFFINITY_INFO after the 1 s startup wait. `aff=0` is ON, `1` is OFF, `2` is ON_PENDING; `entry=1` means the target reached the first instruction.
+
+Stage 6 diagnostic is built at `shim/rosemary-diag/out-rdiag-stage6-20261024/stage6-boot.img` (SHA256 `3f555a16f01279992b1474712f533b290831631bb415c5dfe21f7afc83c6d220`). It keeps secondaries online in `WFE`, records their entry and CPU registers in 64-byte-aligned per-CPU records, and performs cache maintenance around shared telemetry.
+
+Stage 6 was flashed to `boot_b` and run. User reports every CPU has `aff=0` while `entry`, `seen`, and other telemetry remain zero (the `want` MPIDRs remain `0x100,0x200,...`). PSCI therefore reports each target online, but the per-target records indexed using the PSCI context argument are still empty. Stage 7 records each secondary by hardware MPIDR AFF1 and separately prints the incoming PSCI context ID to test whether the context differs from the actual CPU slot.
+
+Stage 7 diagnostic is built at `shim/rosemary-diag/out-rdiag-stage7-20261024/stage7-boot.img` (SHA256 `37a6d7b8082576d0fabae2a0f7034ccb5522f091ccd7f5f371b3191e9a59da54`). It writes the early entry marker into the record indexed by MPIDR AFF1, saves the original context ID, and passes the MPIDR-derived slot to `secondary_main`.
+
+Stage 7 was flashed to `boot_b` and run. User reports CPU1, CPU6, and CPU7 each have `ret=0`, `entry=1`, `aff=0`, and `ctx=0`; `seen=0x81000100`, `0x81000600`, and `0x81000700` respectively, matching each hardware MPIDR (the U bit is set in the readback). `SMP started=7`. All secondary CPUs reached the assembly marker and recorded CPU data. The call site passes context IDs 1..7, but entry x0 was observed as zero for the reported CPUs; verify later whether PSCI firmware ignores context_id or the SMC call ABI needs adjustment.
+
+User reports CPU1 `midr=0x411fd050`, CPU6 and CPU7 `midr=0x413fd0b0`, all with `EL=1 T16=1`. Stage 7 `MMU rc=0 sctlr=0x30d01805 ttbr=0x4008800`, `PAR img=0x40083b80 fb=0x7bd21b00 gic=0x0c000b00`, `TCR=0x1409cb51c`, and `SUM smp=7 mmu=1 gic=1`. PAR.F is clear for all three probes, so image, framebuffer, and GIC addresses translated successfully. This validates the CPU, 16K translation, and GIC interrupt paths needed as a foundation for the XNU port.
+
+On 2026-10-24, the board-configured generic shim compiled and packed successfully with `shim/build_rosemary.sh` to `shim/out-rosemary-cfg3-20261024/rosemary-shim-boot.img`. This is a local build only; it contains no XNU payload and has not been flashed or hardware-tested. It uses the stock MTK DTB, so keep the image local. Rosemary reset goes through PSCI and avoids the Qualcomm-only IMEM/PSHOLD writes.
+
+Apple XNU `xnu-8796.141.3` (commit `1b191cb58250d0705d8a51287127505aa4bc0789`) and the existing Sweet patches 0001-0081 are staged only in the ignored local scratch tree `research/xnu-8796.141.3`. The source host is Linux x86_64 with no `xcodebuild`/`xcrun`, so XNU cannot be built here with the project's current workflow; do not run or publish a GitHub Actions build unless the user later authorizes that route.
+
+The diagnostic build preserves the stock boot image envelope, ramdisk, embedded DTB, embedded AVB block, and footer. The kernel is modified, so the stock AVB signature/hash does not authenticate the new image; this assumes an unlocked bootloader that accepts custom boot images. It builds one stage at a time, writes to a new output directory, and refuses to overwrite an existing one. The user reports `boot_b` contains a diagnostic image and is okay with replacing it; `boot_a` has TWRP. The fixed-status stage 0 is at `shim/rosemary-diag/out-rdiag-fixed-status-20261023/stage0-boot.img`. Stage 4 is at `shim/rosemary-diag/out-rdiag-stage4-20261023/stage4-boot.img`; stage 5 is at `shim/rosemary-diag/out-rdiag-stage5-20261024/stage5-boot.img`.
+
+Earlier stage 0-3 code had host-only parser checks against `tools/mkstubdtb.py`; these do not verify the current working tree or on-device behavior.
+
+## NEXT
+1. The rosemary shim now has a separate board configuration for framebuffer, GIC and timer interrupt IDs. Its MMU maps both 32 MiB blocks touched by the 35 MiB splash buffer. Build locally with `shim/build_rosemary.sh`; its default output directory is protected from accidental overwrite.
+2. The ADT generator is adapted to rosemary measurements, but currently warns when `research/ipsw-x/d22ap.adt` is absent, so it omits `/product`. Supply the iPhone X `/product` node before relying on MobileGestalt identity.
+3. Next platform milestone is a bootable XNU payload. This checkout currently contains the sweet patch series, not an XNU source tree or built kernel. Then bring up MTK eMMC/MSDC0 and MT6359/PWRAP, followed by Goodix GT9885 touch, display, and mtu3 USB logging. Keep `boot_a` untouched as the TWRP recovery slot.
+4. Old v0 diag kept in `research/rosemary-draft/old-v0/`.
+
+---
+
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 ## Agent handoff / active work (2026-10-15, latest)
