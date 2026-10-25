@@ -1,0 +1,265 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -1,4 +1,5 @@
+ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/rosemary_ufs.c			standard
++bsd/dev/rosemary_keys.c		standard
+ bsd/dev/sweet_ufs.c			standard
+diff --git a/bsd/dev/rosemary_keys.c b/bsd/dev/rosemary_keys.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/rosemary_keys.c
+@@ -0,0 +1,221 @@
++/*
++ * ROSEMARY (Redmi Note 10S, MT6785 + MT6359 PMIC) hardware keys, polled.
++ *
++ *   power       MT6359 PWRKEY   TOPSTATUS (PMIC reg 0x28) bit 1, via PWRAP WACS2
++ *   volume down MT6359 HOMEKEY  TOPSTATUS bit 3 (MTK wires vol-down to the PMIC
++ *               "home" pin: legacy hw-rstkey 17); override with rosekeydown=<bit>
++ *   volume up   keypad matrix KPD_MEM1 bit 0 (row 0, col 0); override rosekeyup=<bit>
++ *
++ * Polarity follows Linux (mtk-pmic-keys, mt6779-keypad): bit 0 = pressed.
++ * Everything is read-only. The wiring is a hypothesis taken from other MT6785
++ * phones, so every change of the watched bits is printed ("ROSEMARY KEYS:") to
++ * let the real mapping be read from the persistent log.
++ * Boot-args: rosekeys=0 disables, rosekpd=0 skips the keypad block,
++ * rosekeyup=<kpd bit>, rosekeydown=<kpd bit> (default: PMIC homekey).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) && defined(ROSEMARY)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_key(int key, int down);
++void rosemary_keys_init(void);
++
++#define PWRAP_PA        0x1000d000u
++#define PWRAP_SIZE      0x1000u
++#define PWRAP_INIT_DONE2 0x0a0u
++#define PWRAP_WACS2_EN  0x09cu
++#define PWRAP_WACS2_CMD 0xc20u
++#define PWRAP_WACS2_RDATA 0xc24u
++#define PWRAP_WACS2_VLDCLR 0xc28u
++#define PWRAP_FSM(v)    (((v) >> 16) & 7u)
++#define PWRAP_FSM_IDLE  0u
++#define PWRAP_FSM_VLDCLR 6u
++
++#define KPD_PA          0x10010000u
++#define KPD_SIZE        0x1000u
++#define KPD_MEM         0x004u          /* MEM1..MEM5, bits [15:0] used, 1 = up */
++#define KPD_NMEM        5
++
++#define MT6359_HWCID    0x08u
++#define MT6359_TOPSTATUS 0x28u
++#define PMIC_PWRKEY     0x2u
++#define PMIC_HOMEKEY    0x8u
++
++static vm_offset_t pwrap, kpd;
++static int keys_chan;
++static bool pmic_ok;
++static unsigned logs_left = 80;
++
++static inline uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static bool
++pwrap_wait(uint32_t fsm)
++{
++	for (unsigned i = 0; i < 10000; i++) {
++		if (PWRAP_FSM(rd(pwrap, PWRAP_WACS2_RDATA)) == fsm) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* 16-bit PMIC register read through WACS2 (same sequence as Linux pwrap_read16). */
++static bool
++pmic_read(uint16_t reg, uint16_t *out)
++{
++	if (!pwrap_wait(PWRAP_FSM_IDLE)) {
++		return false;
++	}
++	wr(pwrap, PWRAP_WACS2_CMD, ((uint32_t)reg >> 1) << 16);
++	if (!pwrap_wait(PWRAP_FSM_VLDCLR)) {
++		return false;
++	}
++	*out = (uint16_t)(rd(pwrap, PWRAP_WACS2_RDATA) & 0xffffu);
++	wr(pwrap, PWRAP_WACS2_VLDCLR, 1);
++	return true;
++}
++
++static void
++keys_wait(void)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&keys_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++keys_thread(void *arg, wait_result_t result)
++{
++	int upbit = 0, downbit = -1, use_kpd = 1;
++	int state[3] = { 0, 0, 0 };
++	uint32_t last_mem[KPD_NMEM], last_top = 0xffffffffu;
++	bool have_top = false;
++	unsigned errors = 0;
++
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("rosekeyup", &upbit, sizeof(upbit));
++	(void)PE_parse_boot_argn("rosekeydown", &downbit, sizeof(downbit));
++	(void)PE_parse_boot_argn("rosekpd", &use_kpd, sizeof(use_kpd));
++	for (int i = 0; i < KPD_NMEM; i++) {
++		last_mem[i] = use_kpd ? (rd(kpd, KPD_MEM + 4u * i) & 0xffffu) : 0xffffu;
++	}
++	for (;;) {
++		int now[3] = { 0, 0, 0 };
++		uint16_t top = 0;
++
++		if (pmic_ok) {
++			if (pmic_read(MT6359_TOPSTATUS, &top)) {
++				errors = 0;
++				now[0] = !(top & PMIC_PWRKEY);
++				if (downbit < 0) {
++					now[2] = !(top & PMIC_HOMEKEY);
++				}
++				if (have_top && top != last_top && logs_left) {
++					uint32_t d = top ^ last_top;
++					if ((d & (PMIC_PWRKEY | PMIC_HOMEKEY)) || logs_left > 60) {
++						printf("ROSEMARY KEYS: TOPSTATUS %#x -> %#x (pwr=%d home=%d)\n",
++						    last_top, top, now[0], !(top & PMIC_HOMEKEY));
++						logs_left--;
++					}
++				}
++				last_top = top;
++				have_top = true;
++			} else if ((errors++ % 250u) == 0) {
++				printf("ROSEMARY KEYS: PMIC read timeout (WACS2 rdata %#x)\n",
++				    rd(pwrap, PWRAP_WACS2_RDATA));
++			}
++		}
++		if (use_kpd) {
++			for (int i = 0; i < KPD_NMEM; i++) {
++				uint32_t m = rd(kpd, KPD_MEM + 4u * i) & 0xffffu;
++				uint32_t d = m ^ last_mem[i];
++				for (int b = 0; d && b < 16; b++) {
++					if ((d >> b) & 1u) {
++						if (logs_left) {
++							printf("ROSEMARY KEYS: kpd bit %d (MEM%d.%d) %s\n",
++							    i * 32 + b, i + 1, b, ((m >> b) & 1u) ? "up" : "DOWN");
++							logs_left--;
++						}
++					}
++				}
++				last_mem[i] = m;
++			}
++			if (upbit >= 0 && (upbit / 32) < KPD_NMEM) {
++				now[1] = !((last_mem[upbit / 32] >> (upbit % 32)) & 1u);
++			}
++			if (downbit >= 0 && (downbit / 32) < KPD_NMEM) {
++				now[2] = !((last_mem[downbit / 32] >> (downbit % 32)) & 1u);
++			}
++		}
++		for (int k = 0; k < 3; k++) {
++			if (now[k] != state[k]) {
++				state[k] = now[k];
++				printf("ROSEMARY KEYS: key=%d (0 power,1 up,2 down) down=%d\n", k, state[k]);
++				sweet_hid_key(k, state[k]);
++			}
++		}
++		keys_wait();
++	}
++}
++
++void
++rosemary_keys_init(void)
++{
++	int enabled = 1, use_kpd = 1;
++	thread_t thread;
++	uint16_t hwcid = 0, top = 0;
++
++	(void)PE_parse_boot_argn("rosekeys", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("ROSEMARY KEYS: disabled (rosekeys=0)\n");
++		return;
++	}
++	(void)PE_parse_boot_argn("rosekpd", &use_kpd, sizeof(use_kpd));
++	pwrap = ml_io_map(PWRAP_PA, PWRAP_SIZE);
++	kpd = use_kpd ? ml_io_map(KPD_PA, KPD_SIZE) : 0;
++	if (!pwrap || (use_kpd && !kpd)) {
++		printf("ROSEMARY KEYS: MMIO mapping failed\n");
++		return;
++	}
++	printf("ROSEMARY KEYS: pwrap init_done2=%#x wacs2_en=%#x rdata=%#x\n",
++	    rd(pwrap, PWRAP_INIT_DONE2), rd(pwrap, PWRAP_WACS2_EN), rd(pwrap, PWRAP_WACS2_RDATA));
++	if ((rd(pwrap, PWRAP_INIT_DONE2) & 1u) && pmic_read(MT6359_HWCID, &hwcid) &&
++	    pmic_read(MT6359_TOPSTATUS, &top)) {
++		pmic_ok = true;
++	}
++	printf("ROSEMARY KEYS: pmic %s HWCID=%#x TOPSTATUS=%#x\n", pmic_ok ? "ok" : "NOT readable", hwcid, top);
++	if (kpd) {
++		printf("ROSEMARY KEYS: kpd MEM1-5 = %#x %#x %#x %#x %#x\n", rd(kpd, KPD_MEM) & 0xffffu,
++		    rd(kpd, KPD_MEM + 4) & 0xffffu, rd(kpd, KPD_MEM + 8) & 0xffffu,
++		    rd(kpd, KPD_MEM + 12) & 0xffffu, rd(kpd, KPD_MEM + 16) & 0xffffu);
++	}
++	if (kernel_thread_start(keys_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("ROSEMARY KEYS: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET && ROSEMARY */
+diff --git a/bsd/dev/rosemary_ufs.c b/bsd/dev/rosemary_ufs.c
+--- a/bsd/dev/rosemary_ufs.c
++++ b/bsd/dev/rosemary_ufs.c
+@@ -1,3 +1,7 @@
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	rosemary_log_start();
++	{
++		extern void rosemary_keys_init(void);
++		rosemary_keys_init();
++	}
+ 	uint32_t pause = 0;
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -1,7 +1,6 @@
+     "     'IOProviderClass' = IOPlatformDevice;"
+     "     'IONameMatch'     = 'sweet,display';"
+     "   },"
+-#if !defined(ROSEMARY)
+     "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+     "     'IOProviderClass' = IOResources;"
+@@ -12,6 +11,7 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
++#if !defined(ROSEMARY)
+     "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
