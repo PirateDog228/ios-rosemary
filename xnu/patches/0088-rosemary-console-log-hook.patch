@@ -1,0 +1,15 @@
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -4,5 +4,3 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-#if !defined(ROSEMARY)
+ extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
+-#endif
+ /*
+@@ -21,5 +19,3 @@ _cnputs(char *c, int size, bool poll)
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-#if !defined(ROSEMARY)
+ 	sweet_log_append(c, size);
+-#endif
+ 	if (sweet_console_muted && !panic_active()) {
