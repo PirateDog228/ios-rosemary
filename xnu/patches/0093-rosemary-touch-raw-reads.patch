@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/rosemary_touch.c b/bsd/dev/rosemary_touch.c
+--- a/bsd/dev/rosemary_touch.c
++++ b/bsd/dev/rosemary_touch.c
+@@ -266,6 +266,10 @@
+ 	int e;
+ 
+ 	printf("ROSEMARY TOUCH: reading IDs from 0x%02x\n", addr);
++	bzero(buf, sizeof(buf));
++	e = i2c_xfer(addr, NULL, 0, buf, 1);
++	printf("ROSEMARY TOUCH: i2c 0x%02x plain read -> %d: %02x stat=%#x %u us fifo=%#x dbg=%#x\n", addr, e,
++	    buf[0], i2c_last_stat, i2c_last_loops, rd(i2c, I2C_FIFO_STAT), rd(i2c, I2C_DEBUGSTAT));
+ 	static const uint16_t goodix_regs[] = { 0x4022, 0x4100, 0x8140 };
+ 	for (unsigned k = 0; k < 3; k++) {
+ 		uint8_t a[2] = { (uint8_t)(goodix_regs[k] >> 8), (uint8_t)goodix_regs[k] };
+@@ -360,6 +364,7 @@
+ 		int t = 0;
+ 		/* LK never set I2C0 up (timing=0), so try a few clock settings. A working one NACKs
+ 		 * the absent address 0x10 and ACKs the touch chip; ID reads follow only then. */
++		bool valid = false;
+ 		static const uint32_t cfgs[][2] = { { 4, 0x73f }, { 0, 0x73f }, { 9, 0x73f }, { 4, 0x1f0f } };
+ 		int user = PE_parse_boot_argn("rosei2cdiv", &t, sizeof(t));
+ 		for (unsigned c = 0; c < 4; c++) {
+@@ -382,6 +387,7 @@
+ 			int a38 = i2c_ack(0x38);
+ 			if (absent == -2 && (a5d == 0 || a14 == 0 || a38 == 0)) {
+ 				printf("ROSEMARY TOUCH: config %u looks valid\n", c);
++				valid = true;
+ 				if (a5d == 0) {
+ 					i2c_probe_one(0x5d);
+ 				}
+@@ -394,6 +400,16 @@
+ 				break;
+ 			}
+ 		}
++		if (!valid) {
++			printf("ROSEMARY TOUCH: no config looked valid, reading anyway (0x10 is a control: nothing answers there)\n");
++			i2c_setup(4, 0x73f);
++			i2c_probe_one(0x10);
++			i2c_probe_one(0x5d);
++			i2c_probe_one(0x14);
++			i2c_probe_one(0x38);
++			gpio_dump(51, "scl0");
++			gpio_dump(52, "sda0");
++		}
+ 		printf("ROSEMARY TOUCH: probe done\n");
+ 	}
+ idle:
