@@ -1,0 +1,104 @@
+diff --git a/bsd/dev/rosemary_keys.c b/bsd/dev/rosemary_keys.c
+--- a/bsd/dev/rosemary_keys.c
++++ b/bsd/dev/rosemary_keys.c
+@@ -1,17 +1,18 @@
+ /*
+  * ROSEMARY (Redmi Note 10S, MT6785 + MT6359 PMIC) hardware keys, polled.
+  *
+- *   power       MT6359 PWRKEY   TOPSTATUS (PMIC reg 0x28) bit 1, via PWRAP WACS2
+- *   volume down MT6359 HOMEKEY  TOPSTATUS bit 3 (MTK wires vol-down to the PMIC
+- *               "home" pin: legacy hw-rstkey 17); override with rosekeydown=<bit>
+- *   volume up   keypad matrix KPD_MEM1 bit 0 (row 0, col 0); override rosekeyup=<bit>
++ *   power       MT6359 PWRKEY   TOPSTATUS (PMIC reg 0x2a) bit 1, via PWRAP WACS2
++ *   volume up   MT6359 HOMEKEY  TOPSTATUS bit 3 (unconfirmed)
++ *   volume down keypad matrix column 0 (MEM1 bit 0): measured on hardware, the
++ *               key pulls the whole column, so bits 0,9,34,43,68,... all move.
+  *
+- * Polarity follows Linux (mtk-pmic-keys, mt6779-keypad): bit 0 = pressed.
+- * Everything is read-only. The wiring is a hypothesis taken from other MT6785
+- * phones, so every change of the watched bits is printed ("ROSEMARY KEYS:") to
+- * let the real mapping be read from the persistent log.
++ * PMIC polarity is learned: the value read at start-up is "released" (it was 0
++ * with nothing pressed, so a set bit means pressed on this PMIC). Keypad bits
++ * follow Linux mt6779-keypad: 0 = pressed.
++ * Everything is read-only. Changes of the watched bits are printed
++ * ("ROSEMARY KEYS:") so the mapping can be read from the persistent log.
+  * Boot-args: rosekeys=0 disables, rosekpd=0 skips the keypad block,
+- * rosekeyup=<kpd bit>, rosekeydown=<kpd bit> (default: PMIC homekey).
++ * rosekeyup=<kpd bit> (default: PMIC homekey), rosekeydown=<kpd bit> (default 0).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET) && defined(ROSEMARY)
+ #include <sys/param.h>
+@@ -43,14 +44,15 @@
+ #define KPD_NMEM        5
+ 
+ #define MT6359_HWCID    0x08u
+-#define MT6359_TOPSTATUS 0x28u
++#define MT6359_TOPSTATUS 0x2au
+ #define PMIC_PWRKEY     0x2u
+ #define PMIC_HOMEKEY    0x8u
+ 
+ static vm_offset_t pwrap, kpd;
+ static int keys_chan;
+ static bool pmic_ok;
+-static unsigned logs_left = 80;
++static unsigned pmic_logs = 60, kpd_logs = 24;
++static uint16_t pmic_idle;
+ 
+ static inline uint32_t
+ rd(vm_offset_t base, uint32_t off)
+@@ -108,7 +110,7 @@
+ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+-	int upbit = 0, downbit = -1, use_kpd = 1;
++	int upbit = -1, downbit = 0, use_kpd = 1;
+ 	int state[3] = { 0, 0, 0 };
+ 	uint32_t last_mem[KPD_NMEM], last_top = 0xffffffffu;
+ 	bool have_top = false;
+@@ -129,17 +131,14 @@
+ 		if (pmic_ok) {
+ 			if (pmic_read(MT6359_TOPSTATUS, &top)) {
+ 				errors = 0;
+-				now[0] = !(top & PMIC_PWRKEY);
+-				if (downbit < 0) {
+-					now[2] = !(top & PMIC_HOMEKEY);
++				now[0] = !!((top ^ pmic_idle) & PMIC_PWRKEY);
++				if (upbit < 0) {
++					now[1] = !!((top ^ pmic_idle) & PMIC_HOMEKEY);
+ 				}
+-				if (have_top && top != last_top && logs_left) {
+-					uint32_t d = top ^ last_top;
+-					if ((d & (PMIC_PWRKEY | PMIC_HOMEKEY)) || logs_left > 60) {
+-						printf("ROSEMARY KEYS: TOPSTATUS %#x -> %#x (pwr=%d home=%d)\n",
+-						    last_top, top, now[0], !(top & PMIC_HOMEKEY));
+-						logs_left--;
+-					}
++				if (have_top && top != last_top && pmic_logs) {
++					printf("ROSEMARY KEYS: TOPSTATUS %#x -> %#x (pwr=%d home=%d)\n",
++					    last_top, top, now[0], !!((top ^ pmic_idle) & PMIC_HOMEKEY));
++					pmic_logs--;
+ 				}
+ 				last_top = top;
+ 				have_top = true;
+@@ -154,10 +153,10 @@
+ 				uint32_t d = m ^ last_mem[i];
+ 				for (int b = 0; d && b < 16; b++) {
+ 					if ((d >> b) & 1u) {
+-						if (logs_left) {
++						if (kpd_logs) {
+ 							printf("ROSEMARY KEYS: kpd bit %d (MEM%d.%d) %s\n",
+ 							    i * 32 + b, i + 1, b, ((m >> b) & 1u) ? "up" : "DOWN");
+-							logs_left--;
++							kpd_logs--;
+ 						}
+ 					}
+ 				}
+@@ -207,6 +206,7 @@
+ 		pmic_ok = true;
+ 	}
+ 	printf("ROSEMARY KEYS: pmic %s HWCID=%#x TOPSTATUS=%#x\n", pmic_ok ? "ok" : "NOT readable", hwcid, top);
++	pmic_idle = top;
+ 	if (kpd) {
+ 		printf("ROSEMARY KEYS: kpd MEM1-5 = %#x %#x %#x %#x %#x\n", rd(kpd, KPD_MEM) & 0xffffu,
+ 		    rd(kpd, KPD_MEM + 4) & 0xffffu, rd(kpd, KPD_MEM + 8) & 0xffffu,
