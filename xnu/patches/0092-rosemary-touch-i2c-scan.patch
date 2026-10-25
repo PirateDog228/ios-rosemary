@@ -1,0 +1,135 @@
+diff --git a/bsd/dev/rosemary_touch.c b/bsd/dev/rosemary_touch.c
+--- a/bsd/dev/rosemary_touch.c
++++ b/bsd/dev/rosemary_touch.c
+@@ -69,6 +69,7 @@
+ #define INT_HS_NACK     (1u << 2)
+ 
+ static vm_offset_t pwrap, infra, gpio, i2c;
++static uint32_t i2c_last_stat, i2c_last_loops;
+ static int touch_chan;
+ 
+ static inline uint32_t
+@@ -189,6 +190,7 @@
+ 	if (wlen > 8 || rlen > 8) {
+ 		return -3;
+ 	}
++	wr(i2c, I2C_INTR_MASK, INT_COMP | INT_ACKERR | INT_HS_NACK);
+ 	wr(i2c, I2C_INTR_STAT, INT_COMP | INT_ACKERR | INT_HS_NACK);
+ 	wr(i2c, I2C_FIFO_CLR, 1);
+ 	if (wlen && rlen) {
+@@ -209,13 +211,16 @@
+ 		wr(i2c, I2C_TRANSAC_LEN, 1);
+ 	}
+ 	wr(i2c, I2C_START, 1);
+-	for (unsigned i = 0; i < 20000; i++) {
++	unsigned loops = 0;
++	for (; loops < 20000; loops++) {
+ 		st = rd(i2c, I2C_INTR_STAT);
+ 		if (st & (INT_COMP | INT_ACKERR | INT_HS_NACK)) {
+ 			break;
+ 		}
+ 		delay(1);
+ 	}
++	i2c_last_stat = st;
++	i2c_last_loops = loops;
+ 	wr(i2c, I2C_INTR_STAT, INT_COMP | INT_ACKERR | INT_HS_NACK);
+ 	if (!(st & (INT_COMP | INT_ACKERR | INT_HS_NACK))) {
+ 		wr(i2c, I2C_SOFTRESET, 1);
+@@ -232,15 +237,35 @@
+ }
+ 
+ static void
+-i2c_probe_one(unsigned addr)
++i2c_setup(uint32_t div, uint32_t timing)
+ {
+-	uint8_t z = 0, buf[8];
++	wr(i2c, I2C_SOFTRESET, 1);
++	delay(100);
++	wr(i2c, I2C_IO_CONFIG, 0x3);
++	wr(i2c, I2C_DCM_EN, 0);
++	wr(i2c, I2C_CLOCK_DIV, div);
++	wr(i2c, I2C_TIMING, timing);
++	wr(i2c, I2C_EXT_CONF, 0);
++}
++
++static int
++i2c_ack(unsigned addr)
++{
++	uint8_t z = 0;
+ 	int e = i2c_xfer(addr, &z, 1, NULL, 0);
+ 
+-	printf("ROSEMARY TOUCH: i2c 0x%02x write-probe -> %d (0 ack, -1 timeout, -2 nack)\n", addr, e);
+-	if (e) {
+-		return;
+-	}
++	printf("ROSEMARY TOUCH:   0x%02x -> %d (0 ack, -1 timeout, -2 nack) stat=%#x after %u us\n",
++	    addr, e, i2c_last_stat, i2c_last_loops);
++	return e;
++}
++
++static void
++i2c_probe_one(unsigned addr)
++{
++	uint8_t buf[8];
++	int e;
++
++	printf("ROSEMARY TOUCH: reading IDs from 0x%02x\n", addr);
+ 	static const uint16_t goodix_regs[] = { 0x4022, 0x4100, 0x8140 };
+ 	for (unsigned k = 0; k < 3; k++) {
+ 		uint8_t a[2] = { (uint8_t)(goodix_regs[k] >> 8), (uint8_t)goodix_regs[k] };
+@@ -332,19 +357,43 @@
+ 		    rd(i2c, I2C_TIMING), rd(i2c, I2C_CLOCK_DIV), rd(i2c, I2C_IO_CONFIG),
+ 		    rd(i2c, I2C_EXT_CONF), rd(i2c, I2C_CONTROL), rd(i2c, I2C_HS),
+ 		    rd(i2c, I2C_DCM_EN), rd(i2c, I2C_DEBUGSTAT));
+-		int t;
+-		if (PE_parse_boot_argn("rosei2ctiming", &t, sizeof(t))) {
+-			wr(i2c, I2C_TIMING, (uint32_t)t);
+-		}
+-		if (PE_parse_boot_argn("rosei2cdiv", &t, sizeof(t))) {
+-			wr(i2c, I2C_CLOCK_DIV, (uint32_t)t);
+-		}
+-		if (PE_parse_boot_argn("rosei2cio", &t, sizeof(t))) {
+-			wr(i2c, I2C_IO_CONFIG, (uint32_t)t);
++		int t = 0;
++		/* LK never set I2C0 up (timing=0), so try a few clock settings. A working one NACKs
++		 * the absent address 0x10 and ACKs the touch chip; ID reads follow only then. */
++		static const uint32_t cfgs[][2] = { { 4, 0x73f }, { 0, 0x73f }, { 9, 0x73f }, { 4, 0x1f0f } };
++		int user = PE_parse_boot_argn("rosei2cdiv", &t, sizeof(t));
++		for (unsigned c = 0; c < 4; c++) {
++			uint32_t div = cfgs[c][0], tim = cfgs[c][1];
++			int ut;
++			if (user && c > 0) {
++				break;
++			}
++			if (user) {
++				div = (uint32_t)t;
++				if (PE_parse_boot_argn("rosei2ctiming", &ut, sizeof(ut))) {
++					tim = (uint32_t)ut;
++				}
++			}
++			printf("ROSEMARY TOUCH: i2c config %u: div=%#x timing=%#x\n", c, div, tim);
++			i2c_setup(div, tim);
++			int absent = i2c_ack(0x10);
++			int a5d = i2c_ack(0x5d);
++			int a14 = i2c_ack(0x14);
++			int a38 = i2c_ack(0x38);
++			if (absent == -2 && (a5d == 0 || a14 == 0 || a38 == 0)) {
++				printf("ROSEMARY TOUCH: config %u looks valid\n", c);
++				if (a5d == 0) {
++					i2c_probe_one(0x5d);
++				}
++				if (a14 == 0) {
++					i2c_probe_one(0x14);
++				}
++				if (a38 == 0) {
++					i2c_probe_one(0x38);
++				}
++				break;
++			}
+ 		}
+-		i2c_probe_one(0x5d);
+-		i2c_probe_one(0x14);
+-		i2c_probe_one(0x38);
+ 		printf("ROSEMARY TOUCH: probe done\n");
+ 	}
+ idle:
