@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/rosemary_rtc.c b/bsd/dev/rosemary_rtc.c
 --- a/bsd/dev/rosemary_rtc.c
 +++ b/bsd/dev/rosemary_rtc.c
-@@ -1,8 +1,8 @@
+@@ -1,8 +1,7 @@
 -/*
 - * ROSEMARY (Redmi Note 10S, MT6785 + MT6359): read-only RTC probe.
 - *
