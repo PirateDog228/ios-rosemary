@@ -1,0 +1,110 @@
+diff --git a/bsd/dev/rosemary_rtc.c b/bsd/dev/rosemary_rtc.c
+--- a/bsd/dev/rosemary_rtc.c
++++ b/bsd/dev/rosemary_rtc.c
+@@ -1,8 +1,8 @@
+-/*
+- * ROSEMARY (Redmi Note 10S, MT6785 + MT6359): read-only RTC probe.
+- *
+- * This deliberately logs raw MT6359 RTC registers without changing the
+- * hardware clock or XNU's calendar. Once the register snapshot and year
+- * encoding are confirmed in the persistent log, a later change can safely
+- * initialize XNU wall time from this RTC.
+- */
++/*
++ * ROSEMARY (Redmi Note 10S, MT6785 + MT6359): RTC reader and wall-clock init.
++ *
++ * Read and validate RTC calendar fields, then set the XNU calendar clock.
++ * RTC calendar registers are never written by this driver. Use
++ * rosemaryrtctime=0 to leave the XNU calendar unchanged.
++ */
+@@ -81,11 +81,61 @@
+ 	return true;
+ }
+ 
++/*
++ * Convert a validated Gregorian UTC date to seconds since 1970-01-01.
++ * MT6359 RTC year values are offsets from 1968; the current hardware log
++ * confirms 2026 (raw year 58) and is within the driver's 7-bit range.
++ */
++static bool
++rtc_calendar_to_epoch(uint32_t year, uint32_t month, uint32_t day,
++	uint32_t hour, uint32_t minute, uint32_t second, clock_sec_t *epoch)
++{
++	static const uint8_t days_in_month[12] = {
++		31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
++	};
++	uint32_t days = 0;
++	uint32_t max_day;
++
++	/* Reject reset/garbage values; MT6397-family RTC supports 1968..2095. */
++	if (year < 2020 || year > 2095 || month < 1 || month > 12 ||
++		hour > 23 || minute > 59 || second > 59) {
++		return false;
++	}
++
++	max_day = days_in_month[month - 1];
++	if (month == 2 && (year % 4 == 0) &&
++		((year % 100 != 0) || (year % 400 == 0))) {
++		max_day++;
++	}
++	if (day < 1 || day > max_day) {
++		return false;
++	}
++
++	for (uint32_t y = 1970; y < year; y++) {
++		days += ((y % 4 == 0) && ((y % 100 != 0) || (y % 400 == 0))) ? 366 : 365;
++	}
++	for (uint32_t m = 1; m < month; m++) {
++		days += days_in_month[m - 1];
++		if (m == 2 && (year % 4 == 0) &&
++			((year % 100 != 0) || (year % 400 == 0))) {
++			days++;
++		}
++	}
++	days += day - 1;
++
++	*epoch = (clock_sec_t)((uint64_t)days * 86400ULL +
++		(uint64_t)hour * 3600ULL + (uint64_t)minute * 60ULL + second);
++	return true;
++}
++
+ void
+ rosemary_rtc_init(void)
+ {
+-	int enabled = 1;
++	int enabled = 1, set_calendar = 1;
+ 	uint16_t fields[RTC_TC_COUNT], sec_before, sec_after;
++	uint32_t month, year;
++	clock_sec_t rtc_epoch, wall_seconds;
++	clock_usec_t wall_microseconds;
+ 	bool stable = false;
+ 
+ 	(void)PE_parse_boot_argn("rosemaryrtc", &enabled, sizeof(enabled));
+@@ -135,8 +185,26 @@
+ 		printf("ROSEMARY RTC: could not get a stable snapshot\n");
+ 		return;
+ 	}
+-	printf("ROSEMARY RTC: raw SEC=%u MIN=%u HOU=%u DOM=%u DOW=%u MTH=%u YEA=%u (sec check %u -> %u); read-only, clock unchanged\n",
++	month = fields[5] & 0x0fu;
++	year = 1968u + fields[6];
++	printf("ROSEMARY RTC: raw SEC=%u MIN=%u HOU=%u DOM=%u DOW=%u MTH=%u YEA=%u (sec check %u -> %u); RTC calendar fields sampled\n",
+ 	    fields[0], fields[1], fields[2], fields[3], fields[4], fields[5],
+ 	    fields[6], sec_before, sec_after);
++	if (!rtc_calendar_to_epoch(year, month, fields[3], fields[2], fields[1],
++	    fields[0], &rtc_epoch)) {
++		printf("ROSEMARY RTC: invalid calendar fields; XNU clock unchanged\n");
++		return;
++	}
++	(void)PE_parse_boot_argn("rosemaryrtctime", &set_calendar, sizeof(set_calendar));
++	if (!set_calendar) {
++		printf("ROSEMARY RTC: XNU clock update disabled (rosemaryrtctime=0)\n");
++		return;
++	}
++	clock_set_calendar_microtime(rtc_epoch, 0);
++	clock_get_calendar_microtime(&wall_seconds, &wall_microseconds);
++	printf("ROSEMARY RTC: set XNU UTC to %04u-%02u-%02u %02u:%02u:%02uZ epoch=%llu; readback=%llu.%06u\n",
++	    year, month, fields[3], fields[2], fields[1], fields[0],
++	    (unsigned long long)rtc_epoch, (unsigned long long)wall_seconds,
++	    (unsigned)wall_microseconds);
+ }
+ #endif /* ROSEMARY */
