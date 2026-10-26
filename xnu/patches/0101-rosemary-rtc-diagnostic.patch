@@ -10,7 +10,7 @@ diff --git a/bsd/dev/rosemary_rtc.c b/bsd/dev/rosemary_rtc.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/rosemary_rtc.c
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,142 @@
 +/*
 + * ROSEMARY (Redmi Note 10S, MT6785 + MT6359): read-only RTC probe.
 + *
@@ -22,10 +22,12 @@ new file mode 100644
 +#if defined(ROSEMARY)
 +#include <sys/param.h>
 +#include <sys/systm.h>
++#include <kern/clock.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void rosemary_rtc_init(void);
 +
 +#define PWRAP_PA              0x1000d000u
 +#define PWRAP_SIZE            0x1000u
@@ -126,7 +128,7 @@ new file mode 100644
 +			return;
 +		}
 +		for (unsigned i = 0; i < RTC_TC_COUNT; i++) {
-+			uint16_t reg = MT6359_RTC_TC_SEC + 2u * i;
++			uint16_t reg = (uint16_t)(MT6359_RTC_TC_SEC + 2u * i);
 +			if (!rtc_pmic_read(reg, &fields[i])) {
 +				printf("ROSEMARY RTC: PMIC read timeout at register %#x\n", reg);
 +				return;
