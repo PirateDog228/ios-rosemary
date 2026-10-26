@@ -1,0 +1,170 @@
+diff --git a/bsd/dev/rosemary_touch.c b/bsd/dev/rosemary_touch.c
+index 753323d..69f7423 100644
+--- a/bsd/dev/rosemary_touch.c
++++ b/bsd/dev/rosemary_touch.c
+@@ -30,6 +30,8 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern uint64_t mach_absolute_time(void);
++extern void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void rosemary_touch_init(void);
+ 
+@@ -43,6 +45,7 @@ void rosemary_touch_init(void);
+ #define FT_ADDR         0x38u
+ #define MT6360_LDO      0x64u
+ #define HALF_US         3u
++#define RELEASE_MS      60u
+ 
+ static vm_offset_t gpio;
+ static int touch_chan;
+@@ -316,7 +319,6 @@ touch_thread(void *arg, wait_result_t result)
+ 	int delay_s = 12, logn = 120;
+ 	bool active[10] = { false };
+ 	unsigned errors = 0, polls = 0;
+-	uint8_t last[8] = { 0 };
+ 
+ 	(void)arg;
+ 	(void)result;
+@@ -343,10 +345,35 @@ touch_thread(void *arg, wait_result_t result)
+ 		return;
+ 	}
+ 	printf("ROSEMARY TOUCH: running\n");
++	/*
++	 * The FT3418 never reports "no touch" after the first contact (reg 2 stays 1 and
++	 * the last point stays frozen), so a lift is detected by silence: no INT edge and
++	 * no change of the reported point for RELEASE_MS. INT (GPIO1) is sampled every ms.
++	 */
++	uint64_t last_event = 0, last_poll = 0;
++	unsigned int_prev = 1, edges = 0;
++	uint8_t prev[6] = { 0 };
++
+ 	for (;;) {
+ 		uint8_t hdr[3], buf[3 + 6 * 10], zero = 0;
++		uint64_t now_ns;
++		bool event = false;
++
++		sleep_ms(1);
++		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
++		unsigned lvl = gpio_din(PIN_IRQ);
++		bool edge = (int_prev && !lvl);
+ 
+-		sleep_ms(8);
++		int_prev = lvl;
++		if (edge) {
++			edges++;
++		}
++		if (!edge && (now_ns - last_poll) < 8 * NSEC_PER_MSEC) {
++			goto check_release;
++		}
++		last_poll = now_ns;
++		p_scl = BUS0_SCL;
++		p_sda = BUS0_SDA;
+ 		if (i2c_read(FT_ADDR, &zero, 1, hdr, 3)) {
+ 			if ((errors++ % 500u) == 0) {
+ 				printf("ROSEMARY TOUCH: read error\n");
+@@ -356,54 +383,68 @@ touch_thread(void *arg, wait_result_t result)
+ 		errors = 0;
+ 		polls++;
+ 		if ((polls % 625u) == 0 && polls < 625u * 24) {
+-			printf("ROSEMARY TOUCH: alive polls=%u hdr %02x %02x %02x\n", polls, hdr[0], hdr[1], hdr[2]);
++			printf("ROSEMARY TOUCH: alive polls=%u hdr %02x %02x %02x int=%u edges=%u\n",
++			    polls, hdr[0], hdr[1], hdr[2], lvl, edges);
+ 		}
+ 		int n = hdr[2] & 0x0f;
+-		bool seen[10] = { false };
+ 
+-		if (n > 10) {
++		if (n == 0 || n > 10) {
++			goto check_release;
++		}
++		if (i2c_read(FT_ADDR, &zero, 1, buf, 3 + 6 * n)) {
+ 			continue;
+ 		}
+-		if (n) {
+-			if (i2c_read(FT_ADDR, &zero, 1, buf, 3 + 6 * n)) {
++		if (edge) {
++			event = true;
++		}
++		for (int i = 0; i < n; i++) {
++			const uint8_t *p = buf + 3 + 6 * i;
++			int flag = p[0] >> 6;
++			int x = ((p[0] & 0x0f) << 8) | p[1];
++			int id = p[2] >> 4;
++			int y = ((p[2] & 0x0f) << 8) | p[3];
++
++			if (id >= 10) {
+ 				continue;
+ 			}
+-			if (logn > 0 && (n != last[0] || buf[3] != last[1] || buf[4] != last[2] ||
+-			    buf[5] != last[3] || buf[6] != last[4])) {
+-				logn--;
+-				printf("ROSEMARY TOUCH: frame n=%d p0 %02x %02x %02x %02x\n", n, buf[3], buf[4], buf[5], buf[6]);
+-			}
+-			last[0] = (uint8_t)n; last[1] = buf[3]; last[2] = buf[4]; last[3] = buf[5]; last[4] = buf[6];
+-			for (int i = 0; i < n; i++) {
+-				const uint8_t *p = buf + 3 + 6 * i;
+-				int flag = p[0] >> 6;
+-				int x = ((p[0] & 0x0f) << 8) | p[1];
+-				int id = p[2] >> 4;
+-				int y = ((p[2] & 0x0f) << 8) | p[3];
+-
+-				if (id >= 10) {
+-					continue;
++			if (flag == 1) {
++				if (active[id]) {
++					active[id] = false;
++					sweet_hid_touch(id, 0, 0, 0);
+ 				}
+-				if (flag == 1) {
+-					continue;	/* lift: handled by the "not seen" release below */
++				continue;
++			}
++			if (i == 0 && memcmp(prev, p, 6) != 0) {
++				event = true;
++				memcpy(prev, p, 6);
++				if (logn > 0) {
++					logn--;
++					printf("ROSEMARY TOUCH: frame n=%d p0 %02x %02x %02x %02x int=%u\n", n, p[0], p[1], p[2], p[3], lvl);
+ 				}
+-				seen[id] = true;
+-				active[id] = true;
+-				sweet_hid_touch(id, 1, x, y);
+ 			}
+-		}
+-		if (n == 0 && last[0] != 0) {
+-			last[0] = 0;
+-			if (logn > 0) {
+-				logn--;
+-				printf("ROSEMARY TOUCH: frame n=0 hdr %02x %02x %02x\n", hdr[0], hdr[1], hdr[2]);
++			if (event || active[id]) {
++				if (event) {
++					last_event = now_ns;
++				}
++				if (now_ns - last_event < RELEASE_MS * NSEC_PER_MSEC) {
++					active[id] = true;
++					sweet_hid_touch(id, 1, x, y);
++				}
+ 			}
+ 		}
+-		for (int i = 0; i < 10; i++) {
+-			if (active[i] && !seen[i]) {
+-				active[i] = false;
+-				sweet_hid_touch(i, 0, 0, 0);
++check_release:
++		if (now_ns - last_event >= RELEASE_MS * NSEC_PER_MSEC) {
++			for (int i = 0; i < 10; i++) {
++				if (active[i]) {
++					active[i] = false;
++					sweet_hid_touch(i, 0, 0, 0);
++					if (logn > 0) {
++						logn--;
++						printf("ROSEMARY TOUCH: release %d by silence edges=%u\n", i, edges);
++					}
++				}
+ 			}
++			memset(prev, 0, sizeof(prev));
+ 		}
+ 	}
+ }
