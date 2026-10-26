@@ -1,0 +1,165 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -24,2 +24,3 @@
+ bsd/dev/rosemary_keys.c		standard
++bsd/dev/rosemary_rtc.c		standard
+ bsd/dev/sweet_ufs.c		standard
+diff --git a/bsd/dev/rosemary_rtc.c b/bsd/dev/rosemary_rtc.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/rosemary_rtc.c
+@@ -0,0 +1,140 @@
++/*
++ * ROSEMARY (Redmi Note 10S, MT6785 + MT6359): read-only RTC probe.
++ *
++ * This deliberately logs raw MT6359 RTC registers without changing the
++ * hardware clock or XNU's calendar. Once the register snapshot and year
++ * encoding are confirmed in the persistent log, a later change can safely
++ * initialize XNU wall time from this RTC.
++ */
++#if defined(ROSEMARY)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define PWRAP_PA              0x1000d000u
++#define PWRAP_SIZE            0x1000u
++#define PWRAP_INIT_DONE2      0x0a0u
++#define PWRAP_WACS2_CMD       0xc20u
++#define PWRAP_WACS2_RDATA     0xc24u
++#define PWRAP_WACS2_VLDCLR    0xc28u
++#define PWRAP_FSM(v)          (((v) >> 16) & 7u)
++#define PWRAP_FSM_IDLE        0u
++#define PWRAP_FSM_VLDCLR      6u
++
++#define MT6359_RTC_TC_SEC     0x592u
++#define MT6359_RTC_TC_MIN     0x594u
++#define MT6359_RTC_TC_HOU     0x596u
++#define MT6359_RTC_TC_DOM     0x598u
++#define MT6359_RTC_TC_DOW     0x59au
++#define MT6359_RTC_TC_MTH     0x59cu
++#define MT6359_RTC_TC_YEA     0x59eu
++#define RTC_TC_COUNT          7
++
++static vm_offset_t rtc_pwrap;
++
++static inline uint32_t
++rtc_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(rtc_pwrap + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++rtc_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(rtc_pwrap + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static bool
++rtc_pwrap_wait(uint32_t fsm)
++{
++	for (unsigned i = 0; i < 10000; i++) {
++		if (PWRAP_FSM(rtc_rd(PWRAP_WACS2_RDATA)) == fsm) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* 16-bit PMIC register read through WACS2; never writes RTC data. */
++static bool
++rtc_pmic_read(uint16_t reg, uint16_t *out)
++{
++	if (!rtc_pwrap_wait(PWRAP_FSM_IDLE)) {
++		return false;
++	}
++	rtc_wr(PWRAP_WACS2_CMD, ((uint32_t)reg >> 1) << 16);
++	if (!rtc_pwrap_wait(PWRAP_FSM_VLDCLR)) {
++		return false;
++	}
++	*out = (uint16_t)(rtc_rd(PWRAP_WACS2_RDATA) & 0xffffu);
++	rtc_wr(PWRAP_WACS2_VLDCLR, 1);
++	return true;
++}
++
++void
++rosemary_rtc_init(void)
++{
++	int enabled = 1;
++	uint16_t fields[RTC_TC_COUNT], sec_before, sec_after;
++	bool stable = false;
++
++	(void)PE_parse_boot_argn("rosemaryrtc", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("ROSEMARY RTC: disabled (rosemaryrtc=0)\n");
++		return;
++	}
++
++	rtc_pwrap = ml_io_map(PWRAP_PA, PWRAP_SIZE);
++	if (!rtc_pwrap) {
++		printf("ROSEMARY RTC: PWRAP mapping failed\n");
++		return;
++	}
++	if (!(rtc_rd(PWRAP_INIT_DONE2) & 1u)) {
++		printf("ROSEMARY RTC: PWRAP WACS2 is not initialized\n");
++		return;
++	}
++
++	/*
++	 * Follow the MediaTek RTC driver's snapshot rule: read the calendar
++	 * fields, then seconds again; retry if the seconds rolled over while
++	 * the fields were being sampled.
++	 */
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		if (!rtc_pmic_read(MT6359_RTC_TC_SEC, &sec_before)) {
++			printf("ROSEMARY RTC: PMIC read timeout at seconds\n");
++			return;
++		}
++		for (unsigned i = 0; i < RTC_TC_COUNT; i++) {
++			uint16_t reg = MT6359_RTC_TC_SEC + 2u * i;
++			if (!rtc_pmic_read(reg, &fields[i])) {
++				printf("ROSEMARY RTC: PMIC read timeout at register %#x\n", reg);
++				return;
++			}
++		}
++		if (!rtc_pmic_read(MT6359_RTC_TC_SEC, &sec_after)) {
++			printf("ROSEMARY RTC: PMIC read timeout on seconds recheck\n");
++			return;
++		}
++		if (sec_before <= fields[0] && sec_after >= fields[0]) {
++			stable = true;
++			break;
++		}
++	}
++
++	if (!stable) {
++		printf("ROSEMARY RTC: could not get a stable snapshot\n");
++		return;
++	}
++	printf("ROSEMARY RTC: raw SEC=%u MIN=%u HOU=%u DOM=%u DOW=%u MTH=%u YEA=%u (sec check %u -> %u); read-only, clock unchanged\n",
++	    fields[0], fields[1], fields[2], fields[3], fields[4], fields[5],
++	    fields[6], sec_before, sec_after);
++}
++#endif /* ROSEMARY */
+diff --git a/bsd/dev/rosemary_ufs.c b/bsd/dev/rosemary_ufs.c
+--- a/bsd/dev/rosemary_ufs.c
++++ b/bsd/dev/rosemary_ufs.c
+@@ -794,5 +794,9 @@ rosemary_ufs_init(void)
+ 	rosemary_log_start();
++	{
++		extern void rosemary_rtc_init(void);
++		rosemary_rtc_init();
++	}
+ 	{
+ 		extern void rosemary_keys_init(void);
+ 		rosemary_keys_init();
+ 	}
