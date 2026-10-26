@@ -432,15 +432,10 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
 
-## Touch (0094) — findings from stage 10 diag
+## Rosemary FT3418 touch — handoff 2026-10-26
 
-- Touch IC: Focaltech FT3418 @0x38 on I2C0 (SCL GPIO51, SDA GPIO52); reg 0xA3 = 0x54. Goodix gt9885 in DT is NOT the live one.
-- Reset = GPIO2 (pulse low 10 ms, then high), INT = GPIO1 (held low during reset, then input).
-- Supply "vtp" 3.0 V = MT6360 LDO2 on I2C5 (SCL GPIO28, SDA GPIO29), slave 0x64: reg 0x15 = 0xaa (3.0 V), reg 0x11 |= 0x40 (enable).
-  MT6360 PMIC/LDO writes are ignored without a PEC byte: CRC-8 (poly 0x07) over addr_w + reg + val.
-- Both buses are bit-banged on GPIO (MT I2C controller never reports NACKs from LK state).
-- Driver: bsd/dev/rosemary_touch.c (patch 0094, replaces diag 0091-0093). Polled every 8 ms, feeds sweet_hid_touch(id, down, x, y).
-  Boot-args: rosetouch=0 off, rosetouchdelay=<s> (12), rosetouchlog=<n> frames logged (12).
-- Diag-image pitfalls: no absolute pointers (no pointer tables / string selects / jump tables / memcpy), stage 9 is reserved (old timing probe), touch scan = stage 10.
-- CI trap: a patch that fails git apply only prints "Skipping patch" and the run stays green. Verify with
-  `strings xnu/out/kernel.development.rosemary | grep -c "ROSEMARY TOUCH: FT3418"`.
+- Active checkout: `PirateDog228/ios-rosemary`, branch `rosemary-ci-build`, base `9439d04` (`rosemary: FT3418 touch fix1`). The target is Redmi Note 10S / Rosemary with Focaltech FT3418; older Sweet/Goodix notes are unrelated.
+- `tp-android.txt` identifies `/sys/bus/i2c/devices/0-0038` as `fts`, IC `ft3418`, ID `0x5452` (register `0xa3` starts with `0x54`), I2C0 address `0x38`, panel 1080x2400 and 10 contacts. Android reports IRQ/reset GPIO46/47, while the earlier stage-10 and boot logs use GPIO1/2; boot15 shows GPIO1 transitions alongside changing FT frames. Leave the code on GPIO1/2 until a controlled test resolves this discrepancy.
+- CI run `40300099468` failed at `rosemary_touch.c:487`: `kernel_thread_start_priority` is undeclared in this BSD translation unit. Patch `0100-rosemary-touch-build-fix.patch` switches back to public `kernel_thread_start`. The patch was applied to the exact `xnu-buildtree` source from that failed run and passed the `patch --dry-run` context check. A syntax-only replay with the run's compile flags (a local `tools/xnu-cc.py` copy pointed at the installed Linux clang) reported `0 of 1 files failed`.
+- Logs `boot10.txt`, `boot11.txt`, and `boot15.txt` confirm FT3418 ID `54 01` and live coordinate frames. `boot15` also shows the 150 ms silence fallback emitting HID ups after down/contact reports. Patch 0100 now reads a full frame when points are present, tracks activity per finger ID, immediately releases on point-count zero, and allows `rosetouchrel=0` to disable the fallback for a diagnostic build. Default fallback remains 150 ms pending phone evidence because earlier logs also show stale reports after lift.
+- User's untracked `build.txt` records the manual route: commit/push, dispatch `xnu.yml` with `ROSEMARY`, download `xnu-kernel`, check skipped patches and kernel strings, build ADT/payload/shim, then `fastboot flash boot_b`. Do not flash without explicit confirmation. No new CI/image build has run for patch 0100.
