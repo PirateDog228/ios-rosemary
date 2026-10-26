@@ -1,0 +1,714 @@
+diff --git a/bsd/dev/rosemary_touch.c b/bsd/dev/rosemary_touch.c
+index ac5d265..5bbfcdc 100644
+--- a/bsd/dev/rosemary_touch.c
++++ b/bsd/dev/rosemary_touch.c
+@@ -1,16 +1,24 @@
+ /*
+- * ROSEMARY touch bring-up diagnostic (Goodix GT9885 @0x5d or Focaltech @0x38 on
+- * MT6785 I2C0). Nothing here is known to work yet: it is a staged probe that logs
+- * ("ROSEMARY TOUCH:") what it finds so the next step can be written from facts.
++ * ROSEMARY touch: Focaltech FT3418 (I2C0, 0x38), polled, bit-banged.
+  *
+- * Boot-arg rosetouch=<mask> (default 1; 0 = off). Stages run in this order:
+- *   0x01 read-only dump: infracfg gate registers, GPIO 1/2/51/52, PMIC LDOs, I2C0 regs
+- *   0x04 enable MT6359 VIO28 (reg 0x1d5a bit 0) through PWRAP (a guess for "vtp")
+- *   0x10 set GPIO51/52 to the SCL0/SDA0 function (mode rosei2cmode, default 1)
+- *   0x08 reset pulse: GPIO1 (irq) low, GPIO2 (reset) low 10 ms -> high, then irq input
+- *   0x02 I2C0 probe of 0x5d, 0x14 and 0x38 (FIRST I2C0 ACCESS: may hang if its clock is off)
+- * rosetouchdelay=<s> (default 45) waits before the stages run.
+- * Optional I2C overrides: rosei2ctiming, rosei2cdiv, rosei2cio (written before probing).
++ * Found with the bare-metal stage 10 (shim/rosemary-diag/i2c_diag.c) and the
++ * Android log from TWRP:
++ *   - the touch IC is powered by LDO2 ("vtp", 3.0 V) of the MT6360 sub-PMIC on I2C5
++ *     (GPIO28 = SCL, GPIO29 = SDA, slave 0x64, reg 0x15 = voltage, reg 0x11 bit 6 =
++ *     enable). Its PMIC/LDO blocks drop writes that lack a PEC byte (CRC-8, poly 7,
++ *     over addr_w + reg + value).
++ *   - after the supply is on and GPIO2 (reset) has been pulsed, the FT3418 answers
++ *     on I2C0 (GPIO51 = SCL, GPIO52 = SDA) at 0x38; reg 0xa3 reads 0x54.
++ * Both buses are bit-banged on the GPIO pins: the MediaTek I2C controller was never
++ * made to report NACKs reliably, and a polled bit-bang is plenty for 100 Hz.
++ *
++ * Data layout (FT5x46 family): reg 0 mode, reg 1 gesture, reg 2 low nibble = number of
++ * touches, then 6 bytes per point: [0] event flag (7:6: 0 down, 1 up, 2 contact) and X
++ * high (3:0), [1] X low, [2] id (7:4) and Y high (3:0), [3] Y low, [4] weight, [5] area.
++ * Panel size 1080x2400.
++ *
++ * Boot-args: rosetouch=0 disables; rosetouchdelay=<s> start delay (default 12);
++ * rosetouchlog=<n> log the first n frames (default 12).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET) && defined(ROSEMARY)
+ #include <sys/param.h>
+@@ -25,407 +33,375 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void rosemary_touch_init(void);
+ 
+-#define PWRAP_PA        0x1000d000u
+-#define PWRAP_WACS2_RDATA 0xc24u
+-#define PWRAP_WACS2_CMD 0xc20u
+-#define PWRAP_WACS2_VLDCLR 0xc28u
+-#define PWRAP_FSM(v)    (((v) >> 16) & 7u)
+-
+-#define INFRA_PA        0x10001000u
+ #define GPIO_PA         0x10005000u
+-#define I2C0_PA         0x11007000u
+-
+-#define PMIC_VIO28_CON0 0x1d5au
+-#define PMIC_VIO18_CON0 0x1ca8u
+-#define PMIC_VIO28_MON  0x1d5cu
+-
+-#define I2C_DATA        0x00u
+-#define I2C_SLAVE       0x04u
+-#define I2C_INTR_MASK   0x08u
+-#define I2C_INTR_STAT   0x0cu
+-#define I2C_CONTROL     0x10u
+-#define I2C_XFER_LEN    0x14u
+-#define I2C_TRANSAC_LEN 0x18u
+-#define I2C_DELAY_LEN   0x1cu
+-#define I2C_TIMING      0x20u
+-#define I2C_START       0x24u
+-#define I2C_EXT_CONF    0x28u
+-#define I2C_FIFO_STAT   0x30u
+-#define I2C_FIFO_CLR    0x38u
+-#define I2C_IO_CONFIG   0x40u
+-#define I2C_HS          0x48u
+-#define I2C_SOFTRESET   0x50u
+-#define I2C_DCM_EN      0x54u
+-#define I2C_DEBUGSTAT   0x64u
+-#define I2C_XFER_LEN_AUX 0x6cu
+-#define I2C_CLOCK_DIV   0x70u
+-
+-#define CTL_RS          (1u << 1)
+-#define CTL_CLK_EXT     (1u << 3)
+-#define CTL_DIR_CHANGE  (1u << 4)
+-#define CTL_ACKERR_DET  (1u << 5)
+-#define INT_COMP        (1u << 0)
+-#define INT_ACKERR      (1u << 1)
+-#define INT_HS_NACK     (1u << 2)
+-
+-static vm_offset_t pwrap, infra, gpio, i2c;
+-static uint32_t i2c_last_stat, i2c_last_loops;
++#define PIN_IRQ         1u
++#define PIN_RST         2u
++#define BUS0_SCL        51u
++#define BUS0_SDA        52u
++#define BUS5_SCL        28u
++#define BUS5_SDA        29u
++#define FT_ADDR         0x38u
++#define MT6360_LDO      0x64u
++#define HALF_US         3u
++
++static vm_offset_t gpio;
+ static int touch_chan;
++static unsigned p_scl, p_sda;
+ 
+ static inline uint32_t
+-rd(vm_offset_t base, uint32_t off)
++grd(uint32_t off)
+ {
+-	uint32_t v = *(volatile uint32_t *)(base + off);
++	uint32_t v = *(volatile uint32_t *)(gpio + off);
+ 	__asm__ volatile ("dmb oshld" ::: "memory");
+ 	return v;
+ }
+ 
+ static inline void
+-wr(vm_offset_t base, uint32_t off, uint32_t v)
++gwr(uint32_t off, uint32_t v)
+ {
+ 	__asm__ volatile ("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(base + off) = v;
++	*(volatile uint32_t *)(gpio + off) = v;
+ 	__asm__ volatile ("dsb osh" ::: "memory");
+ }
+ 
+ static void
+-sleep_ms(uint32_t ms)
++gpio_set_mode(unsigned n, unsigned mode)
+ {
+-	uint64_t deadline;
+-	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+-	(void)assert_wait_deadline(&touch_chan, THREAD_UNINT, deadline);
+-	thread_block(THREAD_CONTINUE_NULL);
+-}
++	uint32_t base = 0x300u + 0x10u * (n / 8);
++	unsigned sh = 4 * (n % 8);
+ 
+-/* ---- PMIC through PWRAP WACS2 ---- */
+-static bool
+-pwrap_idle(void)
+-{
+-	for (unsigned i = 0; i < 10000; i++) {
+-		if (PWRAP_FSM(rd(pwrap, PWRAP_WACS2_RDATA)) == 0) {
+-			return true;
+-		}
+-		delay(1);
+-	}
+-	return false;
++	gwr(base + 8, 7u << sh);
++	gwr(base + 4, (mode & 7u) << sh);
+ }
+ 
+-static bool
+-pmic_read(uint16_t reg, uint16_t *out)
++static void
++gpio_out(unsigned n, unsigned level)
+ {
+-	if (!pwrap_idle()) {
+-		return false;
+-	}
+-	wr(pwrap, PWRAP_WACS2_CMD, ((uint32_t)reg >> 1) << 16);
+-	for (unsigned i = 0; i < 10000; i++) {
+-		if (PWRAP_FSM(rd(pwrap, PWRAP_WACS2_RDATA)) == 6) {
+-			*out = (uint16_t)(rd(pwrap, PWRAP_WACS2_RDATA) & 0xffffu);
+-			wr(pwrap, PWRAP_WACS2_VLDCLR, 1);
+-			return true;
+-		}
+-		delay(1);
+-	}
+-	return false;
+-}
++	uint32_t m = 1u << (n % 32);
+ 
+-static bool
+-pmic_write(uint16_t reg, uint16_t val)
+-{
+-	if (!pwrap_idle()) {
+-		return false;
+-	}
+-	wr(pwrap, PWRAP_WACS2_CMD, (1u << 31) | (((uint32_t)reg >> 1) << 16) | val);
+-	return pwrap_idle();
++	gwr(0x000u + 0x10u * (n / 32) + 4, m);
++	gwr(0x100u + 0x10u * (n / 32) + (level ? 4 : 8), m);
+ }
+ 
+-/* ---- GPIO (MediaTek paris layout: DIR 0x0, DO 0x100, DI 0x200, MODE 0x300; SET +4, CLR +8) ---- */
+-static unsigned
+-gpio_mode(unsigned n)
++static void
++gpio_in(unsigned n)
+ {
+-	return (rd(gpio, 0x300u + 0x10u * (n / 8)) >> (4 * (n % 8))) & 7u;
++	gwr(0x000u + 0x10u * (n / 32) + 8, 1u << (n % 32));
+ }
+ 
+ static unsigned
+-gpio_bit(uint32_t base, unsigned n)
++gpio_din(unsigned n)
+ {
+-	return (rd(gpio, base + 0x10u * (n / 32)) >> (n % 32)) & 1u;
++	return (grd(0x200u + 0x10u * (n / 32)) >> (n % 32)) & 1u;
+ }
+ 
+ static void
+-gpio_dump(unsigned n, const char *name)
++sleep_ms(uint32_t ms)
+ {
+-	printf("ROSEMARY TOUCH: gpio%u (%s) mode=%u dir=%u dout=%u din=%u\n", n, name,
+-	    gpio_mode(n), gpio_bit(0x000u, n), gpio_bit(0x100u, n), gpio_bit(0x200u, n));
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&touch_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* ---- bit-banged I2C on the pins in p_scl/p_sda (open drain via direction) ---- */
++static void scl_lo(void) { gpio_out(p_scl, 0); }
++static void sda_lo(void) { gpio_out(p_sda, 0); }
++static void sda_hi(void) { gpio_in(p_sda); }
++
+ static void
+-gpio_set_mode(unsigned n, unsigned mode)
++scl_hi(void)
+ {
+-	uint32_t base = 0x300u + 0x10u * (n / 8);
+-	unsigned sh = 4 * (n % 8);
+-	wr(gpio, base + 8, 7u << sh);
+-	wr(gpio, base + 4, (mode & 7u) << sh);
++	gpio_in(p_scl);
++	for (int i = 0; i < 500 && !gpio_din(p_scl); i++) {
++		delay(1);
++	}
+ }
+ 
+ static void
+-gpio_out(unsigned n, unsigned level)
++i2c_start(void)
+ {
+-	uint32_t m = 1u << (n % 32);
+-	wr(gpio, 0x000u + 0x10u * (n / 32) + 4, m);          /* output */
+-	wr(gpio, 0x100u + 0x10u * (n / 32) + (level ? 4 : 8), m);
++	sda_hi();
++	scl_hi();
++	delay(HALF_US);
++	sda_lo();
++	delay(HALF_US);
++	scl_lo();
+ }
+ 
+ static void
+-gpio_in(unsigned n)
++i2c_stop(void)
+ {
+-	wr(gpio, 0x000u + 0x10u * (n / 32) + 8, 1u << (n % 32));
++	sda_lo();
++	delay(HALF_US);
++	scl_hi();
++	delay(HALF_US);
++	sda_hi();
++	delay(HALF_US);
+ }
+ 
+-/* ---- I2C0 (mt65xx register layout, FIFO mode, polled) ---- */
+ static int
+-i2c_xfer(unsigned addr, const uint8_t *w, unsigned wlen, uint8_t *r, unsigned rlen)
++i2c_wr(uint8_t b)
+ {
+-	uint32_t ctl = CTL_ACKERR_DET | CTL_CLK_EXT, st = 0;
+-
+-	if (wlen > 8 || rlen > 8) {
+-		return -3;
++	for (int i = 7; i >= 0; i--) {
++		if ((b >> i) & 1) {
++			sda_hi();
++		} else {
++			sda_lo();
++		}
++		delay(HALF_US);
++		scl_hi();
++		delay(HALF_US);
++		scl_lo();
+ 	}
+-	wr(i2c, I2C_INTR_MASK, INT_COMP | INT_ACKERR | INT_HS_NACK);
+-	wr(i2c, I2C_INTR_STAT, INT_COMP | INT_ACKERR | INT_HS_NACK);
+-	wr(i2c, I2C_FIFO_CLR, 1);
+-	if (wlen && rlen) {
+-		ctl |= CTL_DIR_CHANGE | CTL_RS;
++	sda_hi();
++	delay(HALF_US);
++	scl_hi();
++	delay(HALF_US);
++	int ack = !gpio_din(p_sda);
++	scl_lo();
++	return ack;
++}
++
++static uint8_t
++i2c_rd(int ack)
++{
++	uint8_t v = 0;
++
++	sda_hi();
++	for (int i = 0; i < 8; i++) {
++		delay(HALF_US);
++		scl_hi();
++		delay(HALF_US);
++		v = (uint8_t)((v << 1) | gpio_din(p_sda));
++		scl_lo();
+ 	}
+-	wr(i2c, I2C_CONTROL, ctl);
+-	if (wlen) {
+-		wr(i2c, I2C_SLAVE, addr << 1);
+-		wr(i2c, I2C_XFER_LEN, wlen);
+-		wr(i2c, I2C_XFER_LEN_AUX, rlen);
+-		wr(i2c, I2C_TRANSAC_LEN, rlen ? 2 : 1);
+-		for (unsigned i = 0; i < wlen; i++) {
+-			wr(i2c, I2C_DATA, w[i]);
+-		}
++	if (ack) {
++		sda_lo();
+ 	} else {
+-		wr(i2c, I2C_SLAVE, (addr << 1) | 1);
+-		wr(i2c, I2C_XFER_LEN, rlen);
+-		wr(i2c, I2C_TRANSAC_LEN, 1);
+-	}
+-	wr(i2c, I2C_START, 1);
+-	unsigned loops = 0;
+-	for (; loops < 20000; loops++) {
+-		st = rd(i2c, I2C_INTR_STAT);
+-		if (st & (INT_COMP | INT_ACKERR | INT_HS_NACK)) {
+-			break;
+-		}
+-		delay(1);
++		sda_hi();
+ 	}
+-	i2c_last_stat = st;
+-	i2c_last_loops = loops;
+-	wr(i2c, I2C_INTR_STAT, INT_COMP | INT_ACKERR | INT_HS_NACK);
+-	if (!(st & (INT_COMP | INT_ACKERR | INT_HS_NACK))) {
+-		wr(i2c, I2C_SOFTRESET, 1);
++	delay(HALF_US);
++	scl_hi();
++	delay(HALF_US);
++	scl_lo();
++	sda_hi();
++	return v;
++}
++
++/* write reg bytes, repeated start, read n bytes. 0 = ok */
++static int
++i2c_read(uint8_t addr, const uint8_t *reg, int nreg, uint8_t *out, int n)
++{
++	i2c_start();
++	if (!i2c_wr((uint8_t)(addr << 1))) {
++		i2c_stop();
+ 		return -1;
+ 	}
+-	if (st & (INT_ACKERR | INT_HS_NACK)) {
+-		wr(i2c, I2C_SOFTRESET, 1);
+-		return -2;
++	for (int i = 0; i < nreg; i++) {
++		if (!i2c_wr(reg[i])) {
++			i2c_stop();
++			return -2;
++		}
+ 	}
+-	for (unsigned i = 0; i < rlen; i++) {
+-		r[i] = (uint8_t)rd(i2c, I2C_DATA);
++	i2c_start();
++	if (!i2c_wr((uint8_t)(addr << 1 | 1))) {
++		i2c_stop();
++		return -3;
++	}
++	for (int i = 0; i < n; i++) {
++		out[i] = i2c_rd(i < n - 1);
+ 	}
++	i2c_stop();
+ 	return 0;
+ }
+ 
+-static void
+-i2c_setup(uint32_t div, uint32_t timing)
++static uint8_t
++crc8(const uint8_t *d, int n)
+ {
+-	wr(i2c, I2C_SOFTRESET, 1);
+-	delay(100);
+-	wr(i2c, I2C_IO_CONFIG, 0x3);
+-	wr(i2c, I2C_DCM_EN, 0);
+-	wr(i2c, I2C_CLOCK_DIV, div);
+-	wr(i2c, I2C_TIMING, timing);
+-	wr(i2c, I2C_EXT_CONF, 0);
++	uint8_t c = 0;
++
++	while (n--) {
++		c ^= *d++;
++		for (int i = 0; i < 8; i++) {
++			c = (uint8_t)((c & 0x80) ? (c << 1) ^ 0x07 : c << 1);
++		}
++	}
++	return c;
+ }
+ 
++/* MT6360 write with PEC over addr_w + reg + val */
+ static int
+-i2c_ack(unsigned addr)
++mt6360_write(uint8_t reg, uint8_t val)
+ {
+-	uint8_t z = 0;
+-	int e = i2c_xfer(addr, &z, 1, NULL, 0);
++	uint8_t m[3] = { (uint8_t)(MT6360_LDO << 1), reg, val };
++	int ok;
+ 
+-	printf("ROSEMARY TOUCH:   0x%02x -> %d (0 ack, -1 timeout, -2 nack) stat=%#x after %u us\n",
+-	    addr, e, i2c_last_stat, i2c_last_loops);
+-	return e;
++	i2c_start();
++	ok = i2c_wr(m[0]) && i2c_wr(reg) && i2c_wr(val) && i2c_wr(crc8(m, 3));
++	i2c_stop();
++	return ok;
+ }
+ 
+-static void
+-i2c_probe_one(unsigned addr)
++static int
++mt6360_read(uint8_t reg, uint8_t *v)
+ {
+-	uint8_t buf[8];
+-	int e;
+-
+-	printf("ROSEMARY TOUCH: reading IDs from 0x%02x\n", addr);
+-	bzero(buf, sizeof(buf));
+-	e = i2c_xfer(addr, NULL, 0, buf, 1);
+-	printf("ROSEMARY TOUCH: i2c 0x%02x plain read -> %d: %02x stat=%#x %u us fifo=%#x dbg=%#x\n", addr, e,
+-	    buf[0], i2c_last_stat, i2c_last_loops, rd(i2c, I2C_FIFO_STAT), rd(i2c, I2C_DEBUGSTAT));
+-	static const uint16_t goodix_regs[] = { 0x4022, 0x4100, 0x8140 };
+-	for (unsigned k = 0; k < 3; k++) {
+-		uint8_t a[2] = { (uint8_t)(goodix_regs[k] >> 8), (uint8_t)goodix_regs[k] };
+-		bzero(buf, sizeof(buf));
+-		e = i2c_xfer(addr, a, 2, buf, 8);
+-		printf("ROSEMARY TOUCH: i2c 0x%02x reg16 %#06x -> %d: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+-		    addr, goodix_regs[k], e, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+-	}
+-	static const uint8_t ft_regs[] = { 0xa3, 0xa6, 0xa8 };
+-	for (unsigned k = 0; k < 3; k++) {
+-		buf[0] = 0;
+-		e = i2c_xfer(addr, &ft_regs[k], 1, buf, 1);
+-		printf("ROSEMARY TOUCH: i2c 0x%02x reg8 %#04x -> %d: %02x\n", addr, ft_regs[k], e, buf[0]);
++	return i2c_read(MT6360_LDO, &reg, 1, v, 1);
++}
++
++static bool
++power_on(void)
++{
++	uint8_t en = 0, vs = 0;
++
++	p_scl = BUS5_SCL;
++	p_sda = BUS5_SDA;
++	gpio_set_mode(p_scl, 0);
++	gpio_set_mode(p_sda, 0);
++	sda_hi();
++	gpio_in(p_scl);
++	delay(1000);
++	if (mt6360_read(0x11, &en) || mt6360_read(0x15, &vs)) {
++		printf("ROSEMARY TOUCH: MT6360 LDO2 not readable\n");
++		return false;
+ 	}
++	(void)mt6360_write(0x15, 0xaa);		/* 3.0 V */
++	delay(2000);
++	(void)mt6360_write(0x11, (uint8_t)(en | 0x40));
++	delay(20000);
++	uint8_t en2 = 0, vs2 = 0;
++	(void)mt6360_read(0x11, &en2);
++	(void)mt6360_read(0x15, &vs2);
++	printf("ROSEMARY TOUCH: MT6360 LDO2 en %#x -> %#x, vsel %#x -> %#x\n", en, en2, vs, vs2);
++	gpio_in(p_scl);
++	gpio_in(p_sda);
++	return (en2 & 0x40) && vs2 == 0xaa;
++}
++
++static void
++reset_touch(void)
++{
++	gpio_set_mode(PIN_IRQ, 0);
++	gpio_set_mode(PIN_RST, 0);
++	gpio_out(PIN_IRQ, 0);
++	gpio_out(PIN_RST, 0);
++	delay(10000);
++	gpio_out(PIN_RST, 1);
++	delay(5000);
++	gpio_in(PIN_IRQ);
++	sleep_ms(300);
++}
++
++static bool
++ft_probe(void)
++{
++	uint8_t reg = 0xa3, id[2] = { 0, 0 };
++
++	p_scl = BUS0_SCL;
++	p_sda = BUS0_SDA;
++	gpio_set_mode(p_scl, 0);
++	gpio_set_mode(p_sda, 0);
++	sda_hi();
++	gpio_in(p_scl);
++	delay(1000);
++	int e = i2c_read(FT_ADDR, &reg, 1, id, 2);
++	printf("ROSEMARY TOUCH: FT3418 id reg 0xa3 -> e=%d %02x %02x\n", e, id[0], id[1]);
++	return e == 0 && id[0] == 0x54;
+ }
+ 
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+-	int mask = 1, delay_s = 45, mode = 1;
+-	uint16_t v = 0;
++	int delay_s = 12, logn = 12;
++	bool active[10] = { false };
++	unsigned errors = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+-	(void)PE_parse_boot_argn("rosetouch", &mask, sizeof(mask));
+ 	(void)PE_parse_boot_argn("rosetouchdelay", &delay_s, sizeof(delay_s));
+-	(void)PE_parse_boot_argn("rosei2cmode", &mode, sizeof(mode));
++	(void)PE_parse_boot_argn("rosetouchlog", &logn, sizeof(logn));
+ 	for (int i = 0; i < delay_s; i++) {
+ 		sleep_ms(1000);
+ 	}
+-	printf("ROSEMARY TOUCH: stages %#x\n", mask);
+-	pwrap = ml_io_map(PWRAP_PA, 0x1000);
+-	infra = ml_io_map(INFRA_PA, 0x1000);
+ 	gpio = ml_io_map(GPIO_PA, 0x1000);
+-	if (!pwrap || !infra || !gpio) {
+-		printf("ROSEMARY TOUCH: MMIO mapping failed\n");
+-		goto idle;
++	if (!gpio) {
++		printf("ROSEMARY TOUCH: GPIO mapping failed\n");
++		return;
+ 	}
+-	if (mask & 1) {
+-		printf("ROSEMARY TOUCH: infra STA0..4 = %#x %#x %#x %#x %#x (1 = gated)\n",
+-		    rd(infra, 0x90), rd(infra, 0x94), rd(infra, 0xac), rd(infra, 0xc8), rd(infra, 0xd8));
+-		gpio_dump(1, "touch irq");
+-		gpio_dump(2, "touch reset");
+-		gpio_dump(51, "scl0");
+-		gpio_dump(52, "sda0");
+-		uint16_t a = 0, b = 0, c = 0;
+-		bool ok = pmic_read(PMIC_VIO28_CON0, &a) && pmic_read(PMIC_VIO28_MON, &b) &&
+-		    pmic_read(PMIC_VIO18_CON0, &c);
+-		printf("ROSEMARY TOUCH: pmic %s VIO28 CON0=%#x MON=%#x VIO18 CON0=%#x\n", ok ? "ok" : "unreadable", a, b, c);
++	if (!power_on()) {
++		printf("ROSEMARY TOUCH: supply did not come up, trying anyway\n");
+ 	}
+-	if (mask & 4) {
+-		if (pmic_read(PMIC_VIO28_CON0, &v) && pmic_write(PMIC_VIO28_CON0, v | 1u)) {
+-			sleep_ms(50);
+-			uint16_t after = 0;
+-			(void)pmic_read(PMIC_VIO28_CON0, &after);
+-			printf("ROSEMARY TOUCH: VIO28 CON0 %#x -> %#x\n", v, after);
+-		} else {
+-			printf("ROSEMARY TOUCH: VIO28 enable failed\n");
+-		}
++	bool ok = false;
++	for (int t = 0; t < 3 && !ok; t++) {
++		reset_touch();
++		ok = ft_probe();
+ 	}
+-	if (mask & 0x10) {
+-		gpio_set_mode(51, (unsigned)mode);
+-		gpio_set_mode(52, (unsigned)mode);
+-		gpio_dump(51, "scl0");
+-		gpio_dump(52, "sda0");
+-	}
+-	if (mask & 8) {
+-		gpio_set_mode(1, 0);
+-		gpio_set_mode(2, 0);
+-		gpio_out(1, 0);
+-		gpio_out(2, 0);
+-		sleep_ms(10);
+-		gpio_out(2, 1);
+-		sleep_ms(5);
+-		gpio_in(1);
+-		sleep_ms(300);
+-		gpio_dump(1, "touch irq");
+-		gpio_dump(2, "touch reset");
++	if (!ok) {
++		printf("ROSEMARY TOUCH: FT3418 not found, giving up\n");
++		return;
+ 	}
+-	if (mask & 2) {
+-		i2c = ml_io_map(I2C0_PA, 0x1000);
+-		if (!i2c) {
+-			printf("ROSEMARY TOUCH: I2C0 mapping failed\n");
+-			goto idle;
++	printf("ROSEMARY TOUCH: running\n");
++	for (;;) {
++		uint8_t hdr[3], buf[3 + 6 * 10], zero = 0;
++
++		sleep_ms(8);
++		if (i2c_read(FT_ADDR, &zero, 1, hdr, 3)) {
++			if ((errors++ % 500u) == 0) {
++				printf("ROSEMARY TOUCH: read error\n");
++			}
++			continue;
++		}
++		errors = 0;
++		int n = hdr[2] & 0x0f;
++		bool seen[10] = { false };
++
++		if (n > 10) {
++			continue;
+ 		}
+-		printf("ROSEMARY TOUCH: i2c0 about to be read\n");
+-		sleep_ms(1500);
+-		printf("ROSEMARY TOUCH: i2c0 timing=%#x div=%#x io=%#x ext=%#x ctl=%#x hs=%#x dcm=%#x dbg=%#x\n",
+-		    rd(i2c, I2C_TIMING), rd(i2c, I2C_CLOCK_DIV), rd(i2c, I2C_IO_CONFIG),
+-		    rd(i2c, I2C_EXT_CONF), rd(i2c, I2C_CONTROL), rd(i2c, I2C_HS),
+-		    rd(i2c, I2C_DCM_EN), rd(i2c, I2C_DEBUGSTAT));
+-		int t = 0;
+-		/* LK never set I2C0 up (timing=0), so try a few clock settings. A working one NACKs
+-		 * the absent address 0x10 and ACKs the touch chip; ID reads follow only then. */
+-		bool valid = false;
+-		static const uint32_t cfgs[][2] = { { 4, 0x73f }, { 0, 0x73f }, { 9, 0x73f }, { 4, 0x1f0f } };
+-		int user = PE_parse_boot_argn("rosei2cdiv", &t, sizeof(t));
+-		for (unsigned c = 0; c < 4; c++) {
+-			uint32_t div = cfgs[c][0], tim = cfgs[c][1];
+-			int ut;
+-			if (user && c > 0) {
+-				break;
++		if (n) {
++			if (i2c_read(FT_ADDR, &zero, 1, buf, 3 + 6 * n)) {
++				continue;
+ 			}
+-			if (user) {
+-				div = (uint32_t)t;
+-				if (PE_parse_boot_argn("rosei2ctiming", &ut, sizeof(ut))) {
+-					tim = (uint32_t)ut;
+-				}
++			if (logn > 0) {
++				logn--;
++				printf("ROSEMARY TOUCH: frame n=%d p0 %02x %02x %02x %02x\n", n, buf[3], buf[4], buf[5], buf[6]);
+ 			}
+-			printf("ROSEMARY TOUCH: i2c config %u: div=%#x timing=%#x\n", c, div, tim);
+-			i2c_setup(div, tim);
+-			int absent = i2c_ack(0x10);
+-			int a5d = i2c_ack(0x5d);
+-			int a14 = i2c_ack(0x14);
+-			int a38 = i2c_ack(0x38);
+-			if (absent == -2 && (a5d == 0 || a14 == 0 || a38 == 0)) {
+-				printf("ROSEMARY TOUCH: config %u looks valid\n", c);
+-				valid = true;
+-				if (a5d == 0) {
+-					i2c_probe_one(0x5d);
+-				}
+-				if (a14 == 0) {
+-					i2c_probe_one(0x14);
++			for (int i = 0; i < n; i++) {
++				const uint8_t *p = buf + 3 + 6 * i;
++				int flag = p[0] >> 6;
++				int x = ((p[0] & 0x0f) << 8) | p[1];
++				int id = p[2] >> 4;
++				int y = ((p[2] & 0x0f) << 8) | p[3];
++
++				if (id >= 10) {
++					continue;
+ 				}
+-				if (a38 == 0) {
+-					i2c_probe_one(0x38);
++				if (flag == 1) {
++					continue;	/* lift: handled by the "not seen" release below */
+ 				}
+-				break;
++				seen[id] = true;
++				active[id] = true;
++				sweet_hid_touch(id, 1, x, y);
+ 			}
+ 		}
+-		if (!valid) {
+-			printf("ROSEMARY TOUCH: no config looked valid, reading anyway (0x10 is a control: nothing answers there)\n");
+-			i2c_setup(4, 0x73f);
+-			i2c_probe_one(0x10);
+-			i2c_probe_one(0x5d);
+-			i2c_probe_one(0x14);
+-			i2c_probe_one(0x38);
+-			gpio_dump(51, "scl0");
+-			gpio_dump(52, "sda0");
++		for (int i = 0; i < 10; i++) {
++			if (active[i] && !seen[i]) {
++				active[i] = false;
++				sweet_hid_touch(i, 0, 0, 0);
++			}
+ 		}
+-		printf("ROSEMARY TOUCH: probe done\n");
+-	}
+-idle:
+-	for (;;) {
+-		sleep_ms(60000);
+ 	}
+ }
+ 
+ void
+ rosemary_touch_init(void)
+ {
+-	int mask = 1;
++	int on = 1;
+ 	thread_t thread;
+ 
+-	(void)PE_parse_boot_argn("rosetouch", &mask, sizeof(mask));
+-	if (!mask) {
++	(void)PE_parse_boot_argn("rosetouch", &on, sizeof(on));
++	if (!on) {
+ 		printf("ROSEMARY TOUCH: disabled (rosetouch=0)\n");
+ 		return;
+ 	}
