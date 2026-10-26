@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/rosemary_touch.c b/bsd/dev/rosemary_touch.c
+index 69f7423..f07eb91 100644
+--- a/bsd/dev/rosemary_touch.c
++++ b/bsd/dev/rosemary_touch.c
+@@ -45,7 +45,7 @@ void rosemary_touch_init(void);
+ #define FT_ADDR         0x38u
+ #define MT6360_LDO      0x64u
+ #define HALF_US         3u
+-#define RELEASE_MS      60u
++#define RELEASE_MS      80u
+ 
+ static vm_offset_t gpio;
+ static int touch_chan;
+@@ -444,7 +444,6 @@ check_release:
+ 					}
+ 				}
+ 			}
+-			memset(prev, 0, sizeof(prev));
+ 		}
+ 	}
+ }
