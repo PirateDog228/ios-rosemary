@@ -11,3 +11,4 @@ xnu/out-*/
 __pycache__/
 shim/rosemary-diag/out/
 logs/
+shim/rosemary-diag/
