@@ -1,0 +1,116 @@
+diff --git a/bsd/dev/rosemary_touch.c b/bsd/dev/rosemary_touch.c
+index 17403e0..b2e002d 100644
+--- a/bsd/dev/rosemary_touch.c
++++ b/bsd/dev/rosemary_touch.c
+@@ -45,13 +45,24 @@ void rosemary_touch_init(void);
+ #define FT_ADDR         0x38u
+ #define MT6360_LDO      0x64u
+ #define HALF_US         3u
+-#define RELEASE_MS      100u
++#define RELEASE_MS      150u
+ 
+ static vm_offset_t gpio;
+ static int touch_chan;
+ static unsigned p_scl, p_sda;
+ static unsigned rel_ms = RELEASE_MS;
+ 
++static bool
++any_active(const bool *a)
++{
++	for (int i = 0; i < 10; i++) {
++		if (a[i]) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ static inline uint32_t
+ grd(uint32_t off)
+ {
+@@ -355,6 +366,8 @@ touch_thread(void *arg, wait_result_t result)
+ 	uint64_t last_event = 0, last_poll = 0;
+ 	unsigned int_prev = 1, edges = 0;
+ 	uint8_t prev[6] = { 0 };
++	uint64_t g_start = 0, g_last = 0, g_maxgap = 0;
++	unsigned g_changes = 0, g_loops = 0, g_count = 0, loops = 0;
+ 
+ 	for (;;) {
+ 		uint8_t hdr[3], buf[3 + 6 * 10], zero = 0;
+@@ -362,6 +375,8 @@ touch_thread(void *arg, wait_result_t result)
+ 		bool event = false;
+ 
+ 		sleep_ms(1);
++		loops++;
++		g_loops++;
+ 		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+ 		unsigned lvl = gpio_din(PIN_IRQ);
+ 		bool edge = (int_prev && !lvl);
+@@ -370,7 +385,7 @@ touch_thread(void *arg, wait_result_t result)
+ 		if (edge) {
+ 			edges++;
+ 		}
+-		if (!edge && (now_ns - last_poll) < 8 * NSEC_PER_MSEC) {
++		if (!edge && !any_active(active) && (now_ns - last_poll) < 8 * NSEC_PER_MSEC) {
+ 			goto check_release;
+ 		}
+ 		last_poll = now_ns;
+@@ -385,8 +400,8 @@ touch_thread(void *arg, wait_result_t result)
+ 		errors = 0;
+ 		polls++;
+ 		if ((polls % 625u) == 0 && polls < 625u * 24) {
+-			printf("ROSEMARY TOUCH: alive polls=%u hdr %02x %02x %02x int=%u edges=%u\n",
+-			    polls, hdr[0], hdr[1], hdr[2], lvl, edges);
++			printf("ROSEMARY TOUCH: alive polls=%u loops=%u hdr %02x %02x %02x int=%u edges=%u\n",
++			    polls, loops, hdr[0], hdr[1], hdr[2], lvl, edges);
+ 		}
+ 		int n = hdr[2] & 0x0f;
+ 
+@@ -416,7 +431,17 @@ touch_thread(void *arg, wait_result_t result)
+ 			if (i == 0 && memcmp(prev, p, 6) != 0) {
+ 				event = true;
+ 				memcpy(prev, p, 6);
+-				if (logn > 0) {
++				if (!any_active(active)) {
++					g_start = now_ns;
++					g_changes = 0;
++					g_maxgap = 0;
++					g_loops = 0;
++				} else if (now_ns - g_last > g_maxgap) {
++					g_maxgap = now_ns - g_last;
++				}
++				g_changes++;
++				g_last = now_ns;
++				if (logn > 0 && polls < 4000) {
+ 					logn--;
+ 					printf("ROSEMARY TOUCH: frame n=%d p0 %02x %02x %02x %02x %02x %02x int=%u\n", n, p[0], p[1], p[2], p[3], p[4], p[5], lvl);
+ 				}
+@@ -433,14 +458,15 @@ touch_thread(void *arg, wait_result_t result)
+ 		}
+ check_release:
+ 		if (now_ns - last_event >= rel_ms * NSEC_PER_MSEC) {
++			if (any_active(active) && g_count++ < 80) {
++				printf("ROSEMARY TOUCH: gesture ms=%u changes=%u maxgap_ms=%u loops=%u\n",
++				    (unsigned)((g_last - g_start) / NSEC_PER_MSEC), g_changes,
++				    (unsigned)(g_maxgap / NSEC_PER_MSEC), g_loops);
++			}
+ 			for (int i = 0; i < 10; i++) {
+ 				if (active[i]) {
+ 					active[i] = false;
+ 					sweet_hid_touch(i, 0, 0, 0);
+-					if (logn > 0) {
+-						logn--;
+-						printf("ROSEMARY TOUCH: release %d by silence edges=%u\n", i, edges);
+-					}
+ 				}
+ 			}
+ 		}
+@@ -458,7 +484,7 @@ rosemary_touch_init(void)
+ 		printf("ROSEMARY TOUCH: disabled (rosetouch=0)\n");
+ 		return;
+ 	}
+-	if (kernel_thread_start(touch_thread, NULL, &thread) == KERN_SUCCESS) {
++	if (kernel_thread_start_priority(touch_thread, NULL, 92, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+ }
