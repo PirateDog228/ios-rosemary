@@ -29,17 +29,26 @@ else
 fi
 CFLAGS=(-O2 -ffreestanding -nostdlib -fno-pic -fno-builtin -mgeneral-regs-only -mstrict-align
         -fno-stack-protector -Wall -Wextra)
-for f in start.S diag.c console.c fdt.c m2.c ufs_mtk.c; do
+# The image is not relocated: no jump/pointer tables (gcc builds them from string selects).
+if command -v aarch64-linux-gnu-gcc >/dev/null; then
+  CFLAGS+=(-fno-jump-tables -fno-tree-switch-conversion -fno-tree-loop-distribute-patterns)
+else
+  CFLAGS+=(-fno-jump-tables)
+fi
+for f in start.S diag.c console.c fdt.c m2.c ufs_mtk.c i2c_diag.c; do
   "${CC[@]}" "${CFLAGS[@]}" -c "$f" -o "$OUT/${f%.*}.o"
 done
-"${LD[@]}" -T shim.ld "$OUT"/{start,diag,console,fdt,m2,ufs_mtk}.o -o "$OUT/rosemary-diag.elf"
+if command -v aarch64-linux-gnu-readelf >/dev/null; then RE=aarch64-linux-gnu-readelf; else RE=llvm-readelf; fi
+abs=$("$RE" -r "$OUT"/{diag,console,fdt,m2,ufs_mtk,i2c_diag}.o | grep -c ABS64 || true)
+[ "$abs" = 0 ] || { echo "error: $abs absolute relocations (the image is not relocated): $("$RE" -r "$OUT"/*.o | grep -B3 ABS64 | head -20)" >&2; exit 1; }
+"${LD[@]}" -T shim.ld "$OUT"/{start,diag,console,fdt,m2,ufs_mtk,i2c_diag}.o -o "$OUT/rosemary-diag.elf"
 "$OBJCOPY" -O binary "$OUT/rosemary-diag.elf" "$OUT/Image"
 size=$(( 0x$(nm "$OUT/rosemary-diag.elf" | awk '$3=="_end"{print $1}') ))
 truncate -s "$size" "$OUT/Image"
 gzip -9 -n -c "$OUT/Image" > "$OUT/Image.gz"
 
 STAGE="${STAGE:-0}"
-case "$STAGE" in 0|1|2|3|4|5|6|7|8) ;; *) echo "STAGE must be 0-8" >&2; exit 1 ;; esac
+case "$STAGE" in 0|1|2|3|4|5|6|7|8|9|10) ;; *) echo "STAGE must be 0-10" >&2; exit 1 ;; esac
 python3 ../../tools/repack_kernel.py "$STOCK" "$OUT/Image.gz" "$OUT/stage$STAGE-boot.img" \
   --cmdline-append "rdiag_stage=$STAGE ${EXTRA_CMDLINE:-}"
 ls -l "$OUT/stage$STAGE-boot.img"

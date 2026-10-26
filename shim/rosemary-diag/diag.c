@@ -10,6 +10,8 @@
  *   rdiag_stage=3  + USB (xHCI/mtu3), keypad, PWRAP   (may be clock-gated)
  *   rdiag_stage=4/5 PSCI SMP, 16K MMU, and GIC timer/SGI checks
  *   rdiag_stage=8  UFS host probe (ufshci@11270000), read-only unless rdiag_ufsinit=1
+ *   rdiag_stage=9  watchdog timing probe: idle 40 s, then reset (no drawing)
+ *   rdiag_stage=10 touch bus scan by bit-banging GPIO51/52 (rdiag_tp=<mask>, default 15)
  * Optional: rdiag_stride=<bytes> rdiag_rgba=1 rdiag_scale=<1..4>
  * Every MMIO line is drawn BEFORE the read, so on a hang the last label on
  * screen names the culprit.
@@ -19,6 +21,7 @@
 #include "fdt.h"
 #include "m2.h"
 #include "ufs_mtk.h"
+#include "i2c_diag.h"
 
 #define SYSREG(reg) ({ uint64_t v; __asm__ volatile("mrs %0, " #reg : "=r"(v)); v; })
 
@@ -402,6 +405,18 @@ void shim_main(uint64_t dtb)
 		__asm__ volatile("msr daifclr, #4");	/* unmask SError: report aborts */
 		ufs_stage8((int)parse_num(find_arg(ba, "rdiag_ufsinit="), 0),
 			   (int)parse_num(find_arg(ba, "rdiag_ufslun="), 2));
+		goto finished;
+	}
+	if (stage == 10) {
+		/* touch bus scan, controller bypassed */
+		con_clear(C_BLUE);
+		con_color_fg(C_WHITE);
+		con_hex("STAGE", stage);
+		con_heartbeat(0);
+		con_status("touch bus scan");
+		con_skip();
+		__asm__ volatile("msr daifclr, #4");
+		i2c_stage9((int)parse_num(find_arg(ba, "rdiag_tp="), 15));
 		goto finished;
 	}
 	if (stage >= 1) {

@@ -1,0 +1,238 @@
+== i2c devices
+/sys/bus/i2c/devices/0-0038 fts
+/sys/bus/i2c/devices/0-003e tps65132
+/sys/bus/i2c/devices/0-005d gt9885
+/sys/bus/i2c/devices/2-000c camera_main_af
+/sys/bus/i2c/devices/2-001a camera_main
+/sys/bus/i2c/devices/2-0033 ccu_sensor_i2c_2_hw
+/sys/bus/i2c/devices/2-003a camera_main_three
+/sys/bus/i2c/devices/2-0050 camera_main_eeprom
+/sys/bus/i2c/devices/2-0060 mtk-usb
+/sys/bus/i2c/devices/3-0008 nfc
+/sys/bus/i2c/devices/4-000c camera_main_two_af
+/sys/bus/i2c/devices/4-0010 camera_main_two
+/sys/bus/i2c/devices/4-0021 camera_sub_two
+/sys/bus/i2c/devices/4-002d camera_sub
+/sys/bus/i2c/devices/4-0036 ccu_sensor_i2c_4_hw
+/sys/bus/i2c/devices/4-0052 camera_sub_eeprom
+/sys/bus/i2c/devices/5-001a subpmic_pmic
+/sys/bus/i2c/devices/5-0034 subpmic
+/sys/bus/i2c/devices/5-004e usb_type_c
+/sys/bus/i2c/devices/5-0064 subpmic_ldo
+/sys/bus/i2c/devices/6-0028 wl2866d
+/sys/bus/i2c/devices/6-0073 i2c_lcd_bias
+/sys/bus/i2c/devices/7-0043 ccu_sensor_i2c_7_hw
+/sys/bus/i2c/devices/7-0051 ln8000
+/sys/bus/i2c/devices/7-0065 bq2597x-standalone
+/sys/bus/i2c/devices/9-0058 aw87xxx_pa
+/sys/bus/i2c/devices/9-005b aw87xxx_pa
+/sys/bus/i2c/devices/9-006b vproc_buck
+/sys/bus/i2c/devices/i2c-0 mt-i2c
+/sys/bus/i2c/devices/i2c-1 mt-i2c
+/sys/bus/i2c/devices/i2c-2 mt-i2c
+/sys/bus/i2c/devices/i2c-3 mt-i2c
+/sys/bus/i2c/devices/i2c-4 mt-i2c
+/sys/bus/i2c/devices/i2c-5 mt-i2c
+/sys/bus/i2c/devices/i2c-6 mt-i2c
+/sys/bus/i2c/devices/i2c-7 mt-i2c
+/sys/bus/i2c/devices/i2c-8 mt-i2c
+/sys/bus/i2c/devices/i2c-9 mt-i2c
+== dmesg
+[    0.117448] (6)[1:swapper/0]platform 11007000.i2c0: Linked as a consumer to 10001000.clock-reset-controller
+[    0.117465] (6)[1:swapper/0]platform 11007000.i2c0: Linked as a consumer to pinctrl
+[    0.120779] (6)[1:swapper/0]platform touch: Linked as a consumer to pinctrl
+[    0.120791] (6)[1:swapper/0]platform touch: Linked as a consumer to 11016000.i2c5
+[    0.205032] (6)[1:swapper/0][M4U] m4u_reg_init, ProtectPA = 0x196c6c100
+[    0.206697] (6)[1:swapper/0][M4U] m4u_reg_init, ProtectPA = 0x196c6c900
+[    0.209233] (6)[1:swapper/0]xiaomi_touch_probe enter
+[    0.209238] (6)[1:swapper/0]xiaomi_touch_parse_dt touch,name:xiaomi-touch
+[    0.209279] (6)[1:swapper/0]xiaomi_touch_probe over
+[    1.376078] (6)[1:swapper/0]usbcore: registered new interface driver ums-onetouch
+[    1.386637] (6)[1:swapper/0][tpd_em_log] :register device successfully
+[    1.386659] (6)[1:swapper/0][FTS_TS/I]fts_ts_init:TP info: [Vendor]samsung [IC]ft3418
+[    1.388228] (6)[1:swapper/0]mt-i2c 11007000.i2c0: cannot get mux clock
+[    1.388233] (6)[1:swapper/0]mt-i2c 11007000.i2c0: cannot get p_main clock
+[    1.388237] (6)[1:swapper/0]mt-i2c 11007000.i2c0: cannot get p_univ clock
+[    1.388243] (6)[1:swapper/0]mt-i2c 11007000.i2c0: i2c0 clock source 000000008b04574c,clock src frequency 24960000
+[    1.388792] (6)[1:swapper/0]mt-i2c 11007000.i2c0: Dropping the link to 11016000.i2c5
+[    1.449124] (6)[1:swapper/0]vtp: Failed to create debugfs directory
+[    1.714179] (1)[1:swapper/0]sctp: Hash tables configured (bind 256/256)
+[    1.720370] (1)[1:swapper/0]pd_parse_log_src_cap_ext voltage_regulation = 0, hold_time_ms = 0, compliance = 0x0, touch_current = 0x0, peak_current = 0 0 0
+[    1.720377] (1)[1:swapper/0]pd_parse_log_src_cap_ext touch_temp = 0, source_inputs = 0x0, batteries = 0x0, source_pdp = 0x7
+[    1.731700] (1)[340:kworker/1:2][FTS_TS/I]fts_ts_probe:Touch Screen(I2C BUS) driver prboe...
+[    1.731710] (1)[340:kworker/1:2][FTS_TS/I]fts_ts_probe_entry:Focaltech V3.2 20200422
+[    1.731720] (1)[340:kworker/1:2][FTS_TS/I]fts_get_dt_coords:display x(0 1079) y(0 2399)
+[    1.731747] (1)[340:kworker/1:2][FTS_TS/I]fts_parse_dt:max touch number:10, irq gpio:46, reset gpio:47
+[    1.732318] (1)[340:kworker/1:2]input: fts_ts as /devices/platform/11007000.i2c0/i2c-0/0-0038/input/input2
+[    1.748205] (1)[340:kworker/1:2]fts_ts 0-0038: Linked as a consumer to regulator.49
+[    1.748536] (1)[340:kworker/1:2]fts_ts 0-0038: 0-0038 supply vcc_i2c not found, using dummy regulator
+[    1.748560] (1)[340:kworker/1:2]fts_ts 0-0038: Linked as a consumer to regulator.0
+[    1.980544] (1)[340:kworker/1:2][FTS_TS/I]fts_get_ic_information:get ic information, chip id = 0x5452
+[    1.980562] (1)[340:kworker/1:2][FTS_TS/I]fts_create_apk_debug_channel:Create proc entry success!
+[    1.980592] (1)[340:kworker/1:2][FTS_TS/I]lct_create_procfs:create /proc/tp_info & /proc/tp_lockdown_info succeeded
+[    1.980617] (1)[340:kworker/1:2][FTS_TS/I]lct_create_procfs:init_lct_tp_grip_area Succeeded!
+[    1.980641] (1)[340:kworker/1:2][FTS_TS/I]lct_create_procfs:init_lct_tp_gesture Succeeded!
+[    1.980664] (1)[340:kworker/1:2][FTS_TS/I]lct_create_procfs:init_lct_tp_work Succeeded!
+[    1.980687] (1)[340:kworker/1:2][FTS_TS/I]lct_create_procfs:init_lct_tp_palm Succeeded!
+[    1.980719] (1)[340:kworker/1:2][FTS_TS/I]fts_create_sysfs:[EX]: sysfs_create_group() succeeded!!
+[    1.980740] (1)[340:kworker/1:2][FTS_TS][TEST]fts_test_init: Enter
+[    1.980748] (1)[340:kworker/1:2][FTS_TS/I][TEST]fts_test_func_init:init test function
+[    1.980756] (1)[340:kworker/1:2][FTS_TS/I][TEST]fts_test_func_init:match test function,type:81
+[    1.980762] (1)[340:kworker/1:2][FTS_TS][TEST]fts_tp_data_dump_proc_init: Enter
+[    1.980772] (1)[340:kworker/1:2][FTS_TS/I]fts_tp_data_dump_proc_init:create /proc/tp_data_dump
+[    1.980781] (1)[340:kworker/1:2][FTS_TS][TEST]fts_test_init:sysfs(test) create successfully
+[    1.980787] (1)[340:kworker/1:2][FTS_TS][TEST]fts_test_init: Exit(2431)
+[    1.980797] (1)[340:kworker/1:2][FTS_TS/I]fts_irq_registration:irq:165, flag:2002
+[    1.980927] (1)[340:kworker/1:2][FTS_TS/I]fts_fwupg_init:fw upgrade init function
+[    1.980947] (0)[318:kworker/u16:2]----FTS----debug4
+[    1.980965] (0)[318:kworker/u16:2][FTS_TS/I]fts_fwupg_work:fw upgrade work function
+[    1.980986] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:ENTER into
+[    1.980996] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:0, set cur:0, get cur:0, def:0 min:0 max:1
+[    1.981004] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:1, set cur:0, get cur:0, def:0 min:0 max:1
+[    1.981012] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:2, set cur:0, get cur:0, def:0 min:35 max:50
+[    1.981020] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:3, set cur:0, get cur:0, def:0 min:64 max:255
+[    1.981027] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:4, set cur:0, get cur:0, def:0 min:0 max:0
+[    1.981034] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:5, set cur:0, get cur:0, def:0 min:0 max:0
+[    1.981042] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:6, set cur:0, get cur:0, def:0 min:0 max:0
+[    1.981049] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:7, set cur:0, get cur:0, def:4 min:0 max:4
+[    1.981056] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:8, set cur:0, get cur:0, def:0 min:0 max:3
+[    1.981063] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:9, set cur:0, get cur:0, def:0 min:0 max:0
+[    1.981071] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:10, set cur:0, get cur:0, def:0 min:0 max:0
+[    1.981078] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:11, set cur:0, get cur:0, def:0 min:0 max:0
+[    1.981086] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:12, set cur:0, get cur:0, def:0 min:0 max:0
+[    1.981093] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:13, set cur:0, get cur:0, def:0 min:0 max:0
+[    1.981099] (0)[318:kworker/u16:2]fts_ts 0-0038: Direct firmware load for focaltech_ts_fw_samsung.bin failed with error -2
+[    1.981108] (0)[318:kworker/u16:2][FTS_TS/I]fts_get_fw_file_via_request_firmware:firmware(focaltech_ts_fw_samsung.bin) request fail,ret=-2
+[    1.981114] (0)[318:kworker/u16:2][FTS_TS/I]fts_fwupg_get_fw_file:upgrade fw file len:0
+[    1.981119] (0)[318:kworker/u16:2][FTS_TS/E]fts_fwupg_get_fw_file:fw file len(0) fail
+[    1.981124] (0)[318:kworker/u16:2][FTS_TS/E]fts_fwupg_work:get file fail, can't upgrade
+[    1.981132] (1)[340:kworker/1:2][FTS_TS/I]fts_init_touchmode_data:mode:14, set cur:0, get cur:0, def:0 min:0 max:0
+[    1.981138] (1)[340:kworker/1:2]xiaomitouch_register_modedata
+[    1.981145] (1)[340:kworker/1:2][FTS_TS/I]fts_ts_probe:Touch Screen(I2C BUS) driver prboe successfully
+[    1.981149] (0)[5:kworker/0:0][FTS_TS/I]lct_fts_set_charger_mode:exit charger mode 
+[    1.981176] (1)[340:kworker/1:2]BOOTPROF:      1981.172927:probe: probe=i2c_device_probe drv=fts_ts(fts_ts_driver)   249.470539ms
+[    1.981313] (0)[5:kworker/0:0][FTS_TS/I]lct_fts_set_charger_mode:charger mode:0
+[    2.014263] (6)[1:swapper/0][drivers/input/touchscreen/mediatek/mtk_tpd.c-tpd_device_init-736]
+[    2.014393] (0)[1:swapper/0][GTP-INF][goodix_ts_core_init:3069] Core layer init:v1.5.1.0
+[    2.014395] (7)[363:kworker/u16:3]mtk-tpd:[tpd_init_work_callback:729] MediaTek touch panel driver init
+[    2.014405] (0)[1:swapper/0][GTP-ERR][goodix_ts_core_init:3080] Tp info:[Vendor]unknow,[Ic]unknow
+[    2.014411] (0)[1:swapper/0][GTP-INF][goodix_gsx_gesture_init:449] gesture module init
+[    2.014417] (0)[1:swapper/0][GTP-INF][goodix_register_ext_module:249] goodix_register_ext_module IN
+[    2.014433] (0)[5:kworker/0:0][GTP-INF][goodix_register_ext_module_work:196] module register work IN
+[    2.014443] (0)[1:swapper/0][GTP-INF][goodix_register_ext_module:255] goodix_register_ext_module OUT
+[    2.015003] (7)[363:kworker/u16:3]mtk-tpd:[tpd_probe:548] enter tpd_probe, 548
+[    2.015005] (7)[363:kworker/u16:3]enter tpd_probe, 549
+[    2.015027] (7)[363:kworker/u16:3]mtk-tpd:[tpd_get_gpio_info:185] [tpd -1] mt_tpd_pinctrl+++++++++++++++++
+[    2.015031] (7)[363:kworker/u16:3]mtk-tpd touch: fwq Cannot find pinctrl1!
+[    2.015036] (7)[363:kworker/u16:3]mtk-tpd:[tpd_probe:660] no touch driver is loaded!!
+[    2.186512] (7)[48:kworker/7:0][FTS_TS/I]lct_fts_set_charger_mode:exit charger mode 
+[    2.186657] (7)[48:kworker/7:0][FTS_TS/I]lct_fts_set_charger_mode:charger mode:0
+[    3.743884] (0)[177:kworker/0:1][FTS_TS/I]lct_fts_set_charger_mode:exit charger mode 
+[    3.744098] (0)[177:kworker/0:1][FTS_TS/I]lct_fts_set_charger_mode:charger mode:0
+[    5.695340] (0)[432:recovery]-----FTS----primary_display_resume_early
+[    5.695353] (0)[432:recovery][FTS_TS/I]fb_notifier_callback:FB event:16,blank:0
+[    5.695361] (0)[432:recovery][FTS_TS/I]fb_notifier_callback:resume: event = 16, not care\x0a
+[    5.695364] (0)[432:recovery]---FTS---mt6785
+[    5.695455] (0)[432:recovery]-----FTS----primary_display_resume
+[    5.695465] (0)[432:recovery][FTS_TS/I]fb_notifier_callback:FB event:9,blank:0
+[    5.695472] (0)[432:recovery][FTS_TS/I]fb_notifier_callback:FB_DRM_EVENT resume
+[    5.695538] (1)[175:kworker/u16:1][FTS_TS/I]fts_ts_resume:Already in awake state
+[    5.728750] (0)[432:recovery]-----FTS----primary_display_suspend_early
+[    5.728758] (0)[432:recovery][FTS_TS/I]fb_notifier_callback:FB event:9,blank:1
+[    5.728764] (0)[432:recovery][FTS_TS/I]fb_notifier_callback:suspend: event = 9, not care\x0a
+[    5.964283] (6)[432:recovery]-----FTS----primary_display_suspend
+[    5.964288] (6)[432:recovery][FTS_TS/I]fb_notifier_callback:FB event:16,blank:1
+[    5.964290] (6)[432:recovery][FTS_TS/I]fb_notifier_callback:FB_DRM_EVENT 
+[    5.964294] (6)[432:recovery][FTS_TS/I]fts_ts_suspend:Enter to suspend
+[    5.976420] (3)[432:recovery][FTS_TS/I]fts_gesture_suspend:Enter into gesture(suspend) successfully
+[    5.977200] (3)[432:recovery]-----FTS----primary_display_resume_early
+[    5.977208] (3)[432:recovery][FTS_TS/I]fb_notifier_callback:FB event:16,blank:0
+[    5.977213] (3)[432:recovery][FTS_TS/I]fb_notifier_callback:resume: event = 16, not care\x0a
+[    5.977215] (3)[432:recovery]---FTS---mt6785
+[    6.124452] (6)[432:recovery]-----FTS----primary_display_resume
+[    6.124454] (6)[432:recovery][FTS_TS/I]fb_notifier_callback:FB event:9,blank:0
+[    6.124455] (6)[432:recovery][FTS_TS/I]fb_notifier_callback:FB_DRM_EVENT resume
+[    6.124469] (7)[175:kworker/u16:1][FTS_TS/I]fts_ts_resume:Enter to resume
+[    6.191743] (7)[350:irq/165-fts_ts][FTS_TS/E]fts_gesture_readdata:gesture not enable in fw, don't process gesture
+[    6.193334] (6)[350:irq/165-fts_ts][FTS_TS/I]fts_read_parse_touchdata:invalid point_num(15)
+[    6.360663] (6)[175:kworker/u16:1][FTS_TS/I]fts_wait_tp_to_valid:TP Ready,Device ID:0x5452
+[    6.372336] (1)[175:kworker/u16:1][FTS_TS/I]fts_gesture_resume:resume from gesture successfully
+[    6.372353] (1)[175:kworker/u16:1][FTS_TS/I]fts_ts_resume:reopen palm pocket mode
+[    6.372495] (6)[175:kworker/u16:1][FTS_TS/I]lct_fts_tp_palm_callback:Enable PALM success
+[    6.372513] (6)[53:kworker/6:1][FTS_TS/I]lct_fts_set_charger_mode:exit charger mode 
+[    6.372627] (6)[53:kworker/6:1][FTS_TS/I]lct_fts_set_charger_mode:charger mode:0
+[    6.524346] (0)[337:teei_log_thread][TZ_LOG] uTbtaLdr| {#H8C5Cko3ab/YxogPEb+pQGwgt0ThtpDh4WZzP7eN7KBL3KI/4dVrZ8yFSSQCrvZM#}\x0d
+[    8.292223] (0)[337:teei_log_thread][TZ_LOG] uTbtaLdr| {#B5aFDUo3ab/AnFQSEb+pQOHgZZmtnWMKmQt0xwzUIHUnjfAQo6LXqubn5tAuYPQkt4eJdhwzSII6dbRRJl+hFj2Hd+7n4UYcJDUM8Ir5iFfkxf/UFBxeFl7yA7742Qusj4GTXyTcySUKTmP8#}\x0d
+[   10.766196] (0)[316:kworker/0:2][FTS_TS/I]lct_fts_set_charger_mode:enter charger mode
+[   10.766348] (0)[316:kworker/0:2][FTS_TS/I]lct_fts_set_charger_mode:charger mode:0
+[   20.746349] (6)[53:kworker/6:1][FTS_TS/I]lct_fts_set_charger_mode:enter charger mode
+[   20.746468] (6)[53:kworker/6:1][FTS_TS/I]lct_fts_set_charger_mode:charger mode:0
+[   29.708391] (0)[5:kworker/0:0][GTP-ERR][goodix_register_ext_module_work:208] Module [Goodix_gsx_gesture] timeout
+[   30.782124] (0)[5:kworker/0:0][FTS_TS/I]lct_fts_set_charger_mode:enter charger mode
+[   30.782298] (0)[5:kworker/0:0][FTS_TS/I]lct_fts_set_charger_mode:charger mode:0
+[   40.816538] (7)[163:kworker/7:1][FTS_TS/I]lct_fts_set_charger_mode:enter charger mode
+[   40.816658] (7)[163:kworker/7:1][FTS_TS/I]lct_fts_set_charger_mode:charger mode:0
+== regulators
+cat: /sys/kernel/debug/regulator/regulator_summary: No such file or directory
+cat: /sys/class/regulator/regulator.0/state: No such file or directory
+/sys/class/regulator/regulator.0 regulator-dummy  
+/sys/class/regulator/regulator.1 vs1 enabled 2000000
+/sys/class/regulator/regulator.10 vcore_sshub disabled 400000
+/sys/class/regulator/regulator.11 vaud18 enabled 1800000
+/sys/class/regulator/regulator.12 vsim1 disabled 1800000
+/sys/class/regulator/regulator.13 vibr disabled 2800000
+/sys/class/regulator/regulator.14 vrf12 disabled 1200000
+/sys/class/regulator/regulator.15 vusb enabled 3000000
+/sys/class/regulator/regulator.16 vsram_proc2 enabled 850000
+/sys/class/regulator/regulator.17 vio18 enabled 1800000
+/sys/class/regulator/regulator.18 vcamio disabled 1800000
+/sys/class/regulator/regulator.19 vcn18 disabled 1800000
+/sys/class/regulator/regulator.2 vgpu11 disabled 400000
+/sys/class/regulator/regulator.20 vfe28 disabled 2800000
+/sys/class/regulator/regulator.21 vcn13 disabled 1300000
+/sys/class/regulator/regulator.22 vcn33_1_bt disabled 3500000
+/sys/class/regulator/regulator.23 vcn33_1_wifi disabled 3500000
+/sys/class/regulator/regulator.24 vaux18 enabled 1800000
+/sys/class/regulator/regulator.25 vsram_others enabled 875000
+/sys/class/regulator/regulator.26 vefuse disabled 1800000
+/sys/class/regulator/regulator.27 vxo22 enabled 2200000
+/sys/class/regulator/regulator.28 vrfck disabled 1600000
+/sys/class/regulator/regulator.29 vbif28 enabled 2800000
+/sys/class/regulator/regulator.3 vmodem enabled 875000
+/sys/class/regulator/regulator.30 vio28 enabled 2800000
+/sys/class/regulator/regulator.31 vemc disabled 2900000
+/sys/class/regulator/regulator.32 vcn33_2_bt disabled 3500000
+/sys/class/regulator/regulator.33 vcn33_2_wifi disabled 3500000
+/sys/class/regulator/regulator.34 va12 enabled 1200000
+/sys/class/regulator/regulator.35 va09 disabled 900000
+/sys/class/regulator/regulator.36 vrf18 enabled 1800000
+/sys/class/regulator/regulator.37 vsram_md enabled 993750
+/sys/class/regulator/regulator.38 vufs enabled 1800000
+/sys/class/regulator/regulator.39 vm18 enabled 1800000
+/sys/class/regulator/regulator.4 vpu disabled 400000
+/sys/class/regulator/regulator.40 vbbck disabled 1200000
+/sys/class/regulator/regulator.41 vsram_proc1 enabled 1037500
+/sys/class/regulator/regulator.42 vsim2 disabled 1800000
+/sys/class/regulator/regulator.43 vsram_others_sshub disabled 500000
+/sys/class/regulator/regulator.44 VMDLA enabled 550000
+/sys/class/regulator/regulator.45 VDRAM1 enabled 1125000
+/sys/class/regulator/regulator.46 VMDDR enabled 750000
+/sys/class/regulator/regulator.47 VDRAM2 enabled 600000
+/sys/class/regulator/regulator.48 VFP enabled 3300000
+/sys/class/regulator/regulator.49 vtp enabled 3000000
+/sys/class/regulator/regulator.5 vcore enabled 825000
+/sys/class/regulator/regulator.50 VMC enabled 1800000
+/sys/class/regulator/regulator.51 VMCH enabled 3500000
+/sys/class/regulator/regulator.52 wl2866d_dvdd1 disabled 1200000
+/sys/class/regulator/regulator.53 wl2866d_dvdd2 disabled 1050000
+/sys/class/regulator/regulator.54 wl2866d_avdd1 disabled 2800000
+/sys/class/regulator/regulator.55 wl2866d_avdd2 disabled 2800000
+/sys/class/regulator/regulator.6 vs2 enabled 1350000
+/sys/class/regulator/regulator.7 vpa disabled 500000
+/sys/class/regulator/regulator.8 vproc2 enabled 731250
+/sys/class/regulator/regulator.9 vproc1 enabled 937500
+== pinmux
+cat: /sys/kernel/debug/pinctrl/*/pinmux-pins: No such file or directory
+== gpio
+cat: /sys/kernel/debug/gpio: No such file or directory
+== dt i2c0

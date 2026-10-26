@@ -2,6 +2,7 @@
 backup/
 dtb/
 recovery/
+ipsw/
 # third-party/Apple sources fetched for reading
 research/
 shim/out/
@@ -9,3 +10,4 @@ xnu/out/
 xnu/out-*/
 __pycache__/
 shim/rosemary-diag/out/
+logs/
