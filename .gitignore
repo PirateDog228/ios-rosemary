@@ -12,3 +12,6 @@ __pycache__/
 shim/rosemary-diag/out/
 logs/
 shim/rosemary-diag/
+
+# Local generated shim builds and boot images
+/shim/out-*/
