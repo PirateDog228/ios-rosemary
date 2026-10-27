@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/rosemary_rtc.c b/bsd/dev/rosemary_rtc.c
 --- a/bsd/dev/rosemary_rtc.c
 +++ b/bsd/dev/rosemary_rtc.c
-@@ -1,8 +1,7 @@
+@@ -1,9 +1,8 @@
 -/*
 - * ROSEMARY (Redmi Note 10S, MT6785 + MT6359): read-only RTC probe.
 - *
@@ -17,7 +17,8 @@ diff --git a/bsd/dev/rosemary_rtc.c b/bsd/dev/rosemary_rtc.c
 + * RTC calendar registers are never written by this driver. Use
 + * rosemaryrtctime=0 to leave the XNU calendar unchanged.
 + */
-@@ -81,11 +81,61 @@
+ #if defined(ROSEMARY)
+@@ -81,11 +80,61 @@
  	return true;
  }
  
