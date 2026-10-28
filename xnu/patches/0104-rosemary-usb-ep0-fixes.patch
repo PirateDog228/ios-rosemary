@@ -1,0 +1,237 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -70,6 +70,18 @@
+ #define RU_LINK_RESET            0x2424u
+ #define RU_USB2_EPCTL_LPM        0x0828u
+ #define RU_USB2_EPCTL_LPM_FC     0x0860u
++/* Verified against the vendor mtu3 headers: the USB address lives in
++ * U3D_DEVICE_CONF (0x0800, bits 30:24), NOT in U3D_DEVICE_CONTROL (0x240c). */
++#define RU_DEVICE_CONF           0x0800u
++#define RU_EPIESR                0x0088u
++#define RU_DEV_LINK_INTR_EN      0x0850u
++#define RU_DEV_LINK_INTR         0x0854u
++#define RU_USB2_LPM_PARAM        0x2444u
++#define RU_USB2_COMMON_INTR_EN   0x2418u
++#define RU_LV1ISR                0x0000u
++#define RU_IPPC_STS1             0x010u
++#define RU_IPPC_STS2             0x014u
++#define RU_IPPC_OTG_STS          0x018u
+ 
+ #define RU_U2_COM_BASE           0x300u
+ #define RU_U2_ACR0               (RU_U2_COM_BASE + 0x000u)
+@@ -93,8 +105,13 @@
+ #define RU_DTM0_RG_SUSPENDM       RU_BIT(3)
+ #define RU_DTM0_RG_XCVRSEL        (3u << 4)
+ #define RU_DTM0_RG_DATAIN         (0xfu << 10)
+-#define RU_DTM0_PART_MASK         (RU_BIT(23) | RU_BIT(21) | RU_BIT(20) | RU_BIT(19) | RU_BIT(17) | RU_BIT(16))
++/* Same bits as the vendor tphy P2C_DTM0_PART_MASK: FORCE_DATAIN, FORCE_DM/DP_PULLDOWN,
++ * FORCE_XCVRSEL, FORCE_SUSPENDM, FORCE_TERMSEL, RG_DM/DP_PULLDOWN, RG_TERMSEL. */
++#define RU_DTM0_PART_MASK         (RU_BIT(23) | RU_BIT(21) | RU_BIT(20) | RU_BIT(19) | RU_BIT(18) | \
++	RU_BIT(17) | RU_BIT(7) | RU_BIT(6) | RU_BIT(2))
+ #define RU_DTM1_RG_UART_EN        RU_BIT(16)
++#define RU_DTM1_FORCE_IDDIG       RU_BIT(9)
++#define RU_DTM1_RG_IDDIG          RU_BIT(1)
+ #define RU_DTM1_RG_VBUSVALID      RU_BIT(5)
+ #define RU_DTM1_RG_SESSEND        RU_BIT(4)
+ #define RU_DTM1_RG_AVALID         RU_BIT(2)
+@@ -134,6 +151,13 @@
+ #define RU_EP0_W1C_BITS           (~(RU_EP0_RXPKTRDY | RU_EP0_SETUPPKTRDY | RU_EP0_SENTSTALL))
+ #define RU_USB_RESET_INTR          RU_BIT(2)
+ #define RU_DEVICE_ADDR_MASK       (0x7fu << 24)
++#define RU_DEV_SPEED(v)           ((v) & 7u)
++#define RU_LINK_SPEED_CHG         RU_BIT(0)
++#define RU_EP0ISR                 RU_BIT(0)
++#define RU_SETUPENDISR            RU_BIT(16)
++#define RU_LPM_BESL_STALL         RU_BIT(14)
++#define RU_LPM_BESLD_STALL        RU_BIT(13)
++/* The U3 MAC block (0x1400..) is deliberately not touched: it is not needed for a USB2 device. */
+ #define RU_DEVICE_ADDR(n)         (((uint32_t)(n) & 0x7fu) << 24)
+ 
+ #define RU_QMU_Q_ACTIVE           RU_BIT(15)
+@@ -173,8 +197,11 @@
+ 	uint32_t rx_hardware_version;
+ 	int rx_gen2, rx_active;
+ 	int wait_channel;
++	uint32_t setups_logged, resets, speed_changes;
+ } ru;
+ 
++#define RU_MAX_SETUP_LOGS 48u
++
+ static uint32_t ru_rd(vm_offset_t base, uint32_t off)
+ {
+ 	uint32_t v = *(volatile uint32_t *)(base + off);
+@@ -285,6 +312,10 @@
+ 	tmp |= (1u << 30);
+ 	ru_wr(ru.u2, RU_U2_ACR6, tmp);
+ 	ru_delay_us(800);
++	/* Device role: force IDDIG=1 (B-device) as the vendor driver does through
++	 * phy_set_mode(PHY_MODE_USB_DEVICE). Without it the PHY follows the real ID pin. */
++	tmp = ru_rd(ru.u2, RU_U2_DTM1) | RU_DTM1_FORCE_IDDIG | RU_DTM1_RG_IDDIG;
++	ru_wr(ru.u2, RU_U2_DTM1, tmp);
+ 
+ 	tmp = ru_rd(ru.u2, RU_U2_ACR5) | RU_ACR5_RG_HSTX_SRCAL_EN;
+ 	ru_wr(ru.u2, RU_U2_ACR5, tmp);
+@@ -384,8 +415,11 @@
+ 		i += 4u;
+ 	}
+ 	if (len - i >= 2u) {
+-		uint32_t v = (uint32_t)src[i] | ((uint32_t)src[i + 1] << 8);
+-		ru_wr(ru.mac, RU_FIFO0, v);
++		/* A 32-bit store would push four bytes into the FIFO; the MTU3 needs a
++		 * 16-bit access for a two-byte tail (vendor ep0_write_fifo: writew). */
++		uint16_t v = (uint16_t)((uint32_t)src[i] | ((uint32_t)src[i + 1] << 8));
++		__asm__ volatile("dmb oshst" ::: "memory");
++		*(volatile uint16_t *)(ru.mac + RU_FIFO0) = v;
+ 		i += 2u;
+ 	}
+ 	if (len > i) {
+@@ -496,6 +530,12 @@
+ 	uint8_t config_desc[32];
+ 	int recognized = 0;
+ 
++	if (ru.setups_logged < RU_MAX_SETUP_LOGS) {
++		ru.setups_logged++;
++		printf("ROSEMARY USB: SETUP %02x %02x v%04x i%04x l%04x (ep0csr=%08x)\n",
++		    bm, req, val, idx, wlen, ru_rd(ru.mac, RU_EP0CSR));
++	}
++
+ 	/* Modern usbmuxd probes Apple's GET_MODE request before claiming the interface.
+ 	 * Mode 1 is the ordinary initial (USBMUX-capable) configuration set. */
+ 	if (bm == 0xc0u && req == 0x45u && wlen >= 4u) {
+@@ -535,8 +575,8 @@
+ 
+ 	if ((bm & 0x60u) == 0u && !(bm & 0x80u) && wlen == 0u) {
+ 		if (bm == 0u && req == 5u && val <= 127u) {
+-			uint32_t conf = ru_rd(ru.mac, RU_DEVICE_CTRL) & ~RU_DEVICE_ADDR_MASK;
+-			ru_wr(ru.mac, RU_DEVICE_CTRL, conf | RU_DEVICE_ADDR(val));
++			uint32_t conf = ru_rd(ru.mac, RU_DEVICE_CONF) & ~RU_DEVICE_ADDR_MASK;
++			ru_wr(ru.mac, RU_DEVICE_CONF, conf | RU_DEVICE_ADDR(val));
+ 			recognized = 1;
+ 		} else if (bm == 0u && req == 9u && val <= 4u) {
+ 			ru.configuration = val;
+@@ -708,6 +748,33 @@
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++static void ru_dump(const char *tag)
++{
++	printf("ROSEMARY USB[%s]: IPPC sts1=%08x sts2=%08x otg=%08x pdn=%08x/%08x/%08x u2port=%08x\n", tag,
++	    ru_rd(ru.ippc, RU_IPPC_STS1), ru_rd(ru.ippc, RU_IPPC_STS2), ru_rd(ru.ippc, RU_IPPC_OTG_STS),
++	    ru_rd(ru.ippc, RU_IPPC_IP_PDN), ru_rd(ru.ippc, RU_IPPC_HOST_PDN),
++	    ru_rd(ru.ippc, RU_IPPC_DEV_PDN), ru_rd(ru.ippc, RU_IPPC_U2_PORT));
++	printf("ROSEMARY USB[%s]: MAC lv1=%08x episr=%08x ep0csr=%08x pm=%08x devctl=%08x devconf=%08x misc=%08x\n", tag,
++	    ru_rd(ru.mac, RU_LV1ISR), ru_rd(ru.mac, RU_EPISR), ru_rd(ru.mac, RU_EP0CSR),
++	    ru_rd(ru.mac, RU_POWER_MGMT), ru_rd(ru.mac, RU_DEVICE_CTRL), ru_rd(ru.mac, RU_DEVICE_CONF),
++	    ru_rd(ru.mac, RU_MISC_CTRL));
++	printf("ROSEMARY USB[%s]: common=%08x link=%08x PHY acr0=%08x acr1=%08x acr5=%08x acr6=%08x dtm0=%08x dtm1=%08x\n", tag,
++	    ru_rd(ru.mac, RU_USB2_COMMON_INTR), ru_rd(ru.mac, RU_DEV_LINK_INTR),
++	    ru_rd(ru.u2, RU_U2_ACR0), ru_rd(ru.u2, RU_U2_ACR1), ru_rd(ru.u2, RU_U2_ACR5),
++	    ru_rd(ru.u2, RU_U2_ACR6), ru_rd(ru.u2, RU_U2_DTM0), ru_rd(ru.u2, RU_U2_DTM1));
++}
++
++/* Vendor mtu3_ep0_setup(): MAXPKTSZ plus enabling the EP0 / SETUP-end status. */
++static void ru_ep0_setup_hw(void)
++{
++	uint32_t csr = ru_rd(ru.mac, RU_EP0CSR);
++	csr &= ~RU_EP0_MAXPKTSZ_MASK;
++	csr |= 64u;
++	csr &= RU_EP0_W1C_BITS;
++	ru_wr(ru.mac, RU_EP0CSR, csr);
++	ru_wr(ru.mac, RU_EPIESR, RU_EP0ISR | RU_SETUPENDISR);
++}
++
+ static void ru_controller_init(void)
+ {
+ 	uint32_t tmp, csr;
+@@ -731,7 +798,7 @@
+ 	tmp = ru_rd(ru.mac, RU_POWER_MGMT) | RU_MAC_HS_ENABLE | RU_MAC_SUSPENDM_ENABLE | RU_MAC_LPM_HRWE;
+ 	tmp &= ~RU_MAC_SOFT_CONN;
+ 	ru_wr(ru.mac, RU_POWER_MGMT, tmp);
+-	ru_wr(ru.mac, 0x0800u, 0);
++	ru_wr(ru.mac, RU_DEVICE_CONF, 0);
+ 	ru_wr(ru.mac, RU_LINK_RESET, ru_rd(ru.mac, RU_LINK_RESET) & ~(0x0fu << 16));
+ 	ru_wr(ru.mac, RU_USB2_EPCTL_LPM, 1u);
+ 	ru_wr(ru.mac, RU_USB2_EPCTL_LPM_FC, 0u);
+@@ -739,9 +806,13 @@
+ 	csr &= ~(RU_EP0_MAXPKTSZ_MASK | RU_EP0_RXPKTRDY | RU_EP0_SETUPPKTRDY | RU_EP0_SENTSTALL);
+ 	ru_wr(ru.mac, RU_EP0CSR, csr | 64u);
+ 	ru_wr(ru.mac, RU_EPISR, 0xffffffffu);
+-	ru_wr(ru.mac, RU_USB2_COMMON_INTR, RU_USB_RESET_INTR);
++	ru_wr(ru.mac, RU_USB2_COMMON_INTR, 0xffffffffu);
++	ru_wr(ru.mac, RU_DEV_LINK_INTR, 0xffffffffu);
++	ru_ep0_setup_hw();
++	ru_dump("before-attach");
+ 	/* Attach only after descriptors and EP0 handling are ready. */
+ 	ru_wr(ru.mac, RU_POWER_MGMT, ru_rd(ru.mac, RU_POWER_MGMT) | RU_MAC_SOFT_CONN | RU_MAC_SUSPENDM_ENABLE);
++	ru_dump("attached");
+ 	printf("ROSEMARY USB: attached as Apple iPhone (05ac:12a8), synthetic UDID 00008110-AABBCCDDEEFF1234\n");
+ }
+ 
+@@ -749,6 +820,7 @@
+ {
+ 	enum ru_ep0_state state = RU_EP0_SETUP;
+ 	uint8_t remote_wakeup = 0;
++	uint32_t ticks = 0, beats = 0;
+ 	(void)arg;
+ 	(void)result;
+ 
+@@ -759,15 +831,46 @@
+ 		uint32_t count;
+ 		uint8_t raw[8];
+ 
++		uint32_t link = ru_rd(ru.mac, RU_DEV_LINK_INTR);
++		uint32_t episr = ru_rd(ru.mac, RU_EPISR);
++
++		if (link & RU_LINK_SPEED_CHG) {
++			uint32_t speed = RU_DEV_SPEED(ru_rd(ru.mac, RU_DEVICE_CONF));
++			ru_wr(ru.mac, RU_DEV_LINK_INTR, link);
++			ru.speed_changes++;
++			printf("ROSEMARY USB: link speed change #%u: speed=%u (1=FS 3=HS) ep0csr=%08x\n",
++			    ru.speed_changes, speed, ru_rd(ru.mac, RU_EP0CSR));
++			if (speed == 1u || speed == 3u) {
++				/* Vendor mtu3_link_isr(): LPM BESL parameters, then EP0 setup. */
++				ru_wr(ru.mac, RU_USB2_LPM_PARAM, (0xfu << 4) | (4u << 8) | (0xau << 12));
++				ru_wr(ru.mac, RU_POWER_MGMT, ru_rd(ru.mac, RU_POWER_MGMT) |
++				    RU_LPM_BESL_STALL | RU_LPM_BESLD_STALL);
++				state = RU_EP0_SETUP;
++				ru_ep0_setup_hw();
++			}
++		}
++		if (episr & RU_SETUPENDISR) {
++			ru_wr(ru.mac, RU_EPISR, episr & RU_SETUPENDISR);
++			state = RU_EP0_SETUP;
++			if (ru.setups_logged < RU_MAX_SETUP_LOGS) {
++				printf("ROSEMARY USB: SETUP aborted by host (episr=%08x)\n", episr);
++			}
++		}
++
+ 		if (common & RU_USB_RESET_INTR) {
+ 			ru_wr(ru.mac, RU_USB2_COMMON_INTR, RU_USB_RESET_INTR);
++			ru.resets++;
++			if (ru.resets <= 8u) {
++				printf("ROSEMARY USB: bus reset #%u (devconf=%08x ep0csr=%08x)\n", ru.resets,
++				    ru_rd(ru.mac, RU_DEVICE_CONF), ru_rd(ru.mac, RU_EP0CSR));
++			}
+ 			if (ru.configuration != 0u || ru.seen_configuration != 0u) {
+ 				ru_qmu_shutdown();
+ 			}
+ 			ru.configuration = 0;
+ 			ru.seen_configuration = 0;
+ 			remote_wakeup = 0;
+-			ru_wr(ru.mac, RU_DEVICE_CTRL, ru_rd(ru.mac, RU_DEVICE_CTRL) & ~RU_DEVICE_ADDR_MASK);
++			ru_wr(ru.mac, RU_DEVICE_CONF, ru_rd(ru.mac, RU_DEVICE_CONF) & ~RU_DEVICE_ADDR_MASK);
+ 			uint32_t csr = ru_rd(ru.mac, RU_EP0CSR) &
+ 			    ~(RU_EP0_MAXPKTSZ_MASK | RU_EP0_RXPKTRDY | RU_EP0_SETUPPKTRDY | RU_EP0_SENTSTALL | RU_EP0_SENDSTALL);
+ 			ru_wr(ru.mac, RU_EP0CSR, csr | 64u);
+@@ -807,6 +910,10 @@
+ 			continue;
+ 		}
+ 		ru_sleep_ms(RU_USB_POLL_MS);
++		if ((++ticks % 2000u) == 0u && beats < 6u) {
++			beats++;
++			ru_dump("heartbeat");
++		}
+ 	}
+ }
+ 
