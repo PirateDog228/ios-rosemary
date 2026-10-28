@@ -1,11 +1,12 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -18,3 +18,4 @@
+@@ -18,4 +18,5 @@
  bsd/dev/rosemary_keys.c		standard
+ bsd/dev/rosemary_rtc.c		standard
  bsd/dev/rosemary_touch.c		standard
 +bsd/dev/rosemary_usb.c		standard
- bsd/dev/sweet_ufs.c		standard
+ bsd/dev/sweet_ufs.c			standard
 
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 --- a/bsd/dev/sweet_ufs.c
