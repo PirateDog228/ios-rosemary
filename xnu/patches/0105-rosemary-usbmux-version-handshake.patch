@@ -1,0 +1,396 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 7c0db19..70a1130 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -23,6 +23,7 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include "rosemary_usbmux_proto.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -198,8 +199,17 @@ static struct {
+ 	int rx_gen2, rx_active;
+ 	int wait_channel;
+ 	uint32_t setups_logged, resets, speed_changes;
++	uint32_t mux_version, mux_state;
++	uint16_t mux_tx_seq, mux_rx_seq;
++	uint32_t tx_packets, tx_errors, tx_len;
++	int tx_active;
+ } ru;
+ 
++#define RU_MUX_WAIT_VERSION 0u
++#define RU_MUX_WAIT_SETUP   1u
++#define RU_MUX_ACTIVE       2u
++#define RU_TX_CAPACITY      (RU_DMA_SIZE - RU_TX_BUFFER_OFF)
++
+ #define RU_MAX_SETUP_LOGS 48u
+ 
+ static uint32_t ru_rd(vm_offset_t base, uint32_t off)
+@@ -603,6 +613,11 @@ static struct ru_qmu_gpd *ru_rx_gpd(void)
+ 	return (struct ru_qmu_gpd *)(ru.dma + RU_GPD_RX_OFF);
+ }
+ 
++static struct ru_qmu_gpd *ru_tx_gpd(void)
++{
++	return (struct ru_qmu_gpd *)(ru.dma + RU_GPD_TX_OFF);
++}
++
+ static uint32_t ru_gpd_upper(uint64_t buffer, uint64_t next)
+ {
+ 	uint32_t b = (uint32_t)((buffer >> 32) & 0xfu);
+@@ -657,8 +672,143 @@ static int ru_rx_arm(void)
+ 	return 1;
+ }
+ 
+-/* Host USBMUX packets are accepted and drained here. The response path to
+- * lockdownd is deliberately not faked; a later patch must implement it. */
++/* Queue one bulk-IN transfer using the MTU3 QMU TX GPD. The host protocol
++ * engine and QMU share one TX buffer, so callers must not queue while busy. */
++static int ru_tx_send(const uint8_t *data, uint32_t len)
++{
++	struct ru_qmu_gpd *gpd = ru_tx_gpd();
++	uint64_t gpd_pa = ru.dma_pa + RU_GPD_TX_OFF;
++	uint64_t next_pa = gpd_pa + sizeof(*gpd);
++	uint64_t buffer_pa = ru.dma_pa + RU_TX_BUFFER_OFF;
++
++	if (!data || len == 0u || len > RU_TX_CAPACITY || ru.tx_active) {
++		ru.tx_errors++;
++		return 0;
++	}
++	if (!ru_qmu_stop(RU_TXQCSR1)) {
++		ru.tx_errors++;
++		printf("ROSEMARY USB: TX QMU stop timed out\n");
++		return 0;
++	}
++
++	bcopy(data, (void *)(ru.dma + RU_TX_BUFFER_OFF), len);
++	bzero(gpd, 2u * sizeof(*gpd));
++	gpd[0].next_gpd = (uint32_t)next_pa;
++	gpd[0].buffer = (uint32_t)buffer_pa;
++	gpd[0].dw3_info = len;
++	gpd[0].dw0_info = ru_gpd_upper(buffer_pa, next_pa);
++	gpd[1].next_gpd = (uint32_t)gpd_pa;
++
++	ru_dma_clean(RU_TX_BUFFER_OFF, len);
++	ru_dma_clean(RU_GPD_TX_OFF, 2u * sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++	/* HWO is published last so DMA never sees a partially built descriptor. */
++	gpd[0].dw0_info |= RU_QMU_GPD_IOC | RU_QMU_GPD_HWO;
++	ru_dma_clean(RU_GPD_TX_OFF, sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	ru_qmu_set_start(RU_TXQSAR1, RU_TXQHIAR1, gpd_pa);
++	ru_wr(ru.mac, RU_TX1CSR0,
++	    (ru_rd(ru.mac, RU_TX1CSR0) & ~0x7ffu) | RU_TX_DMAREQEN | RU_BULK_MPS);
++	__asm__ volatile("dsb sy" ::: "memory");
++	ru_wr(ru.mac, RU_TXQCSR1, RU_QMU_Q_START);
++	__asm__ volatile("dsb sy" ::: "memory");
++	ru.tx_active = 1;
++	ru.tx_len = len;
++	return 1;
++}
++
++static void ru_tx_poll(void)
++{
++	struct ru_qmu_gpd *gpd = ru_tx_gpd();
++	if (!ru.tx_active) return;
++	ru_dma_sync(RU_GPD_TX_OFF, 2u * sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (gpd[0].dw0_info & RU_QMU_GPD_HWO) return;
++	if (!ru_qmu_stop(RU_TXQCSR1)) {
++		ru.tx_errors++;
++		printf("ROSEMARY USB: TX QMU completion stop timed out\n");
++		return;
++	}
++	ru.tx_active = 0;
++	ru.tx_packets++;
++	if (ru.tx_packets <= 8u) {
++		printf("ROSEMARY USB: bulk IN complete #%u len=%u\n", ru.tx_packets, ru.tx_len);
++	}
++}
++
++static void ru_mux_rx_packet(const uint8_t *packet, uint32_t len)
++{
++	struct rosemary_usbmux_frame frame;
++	uint32_t wire_version = ru.mux_version;
++	int parsed = rosemary_usbmux_parse(packet, len, wire_version, &frame);
++
++	if (parsed != 0) {
++		if (ru.rx_packets <= 8u) {
++			printf("ROSEMARY USB: USBMUX malformed frame len=%u version=%u error=%d\n",
++			    len, wire_version, parsed);
++		}
++		return;
++	}
++
++	if (ru.mux_state == RU_MUX_WAIT_VERSION && frame.protocol == RUMUX_PROTO_VERSION) {
++		uint32_t requested, chosen;
++		uint8_t reply[20];
++		size_t reply_len;
++		if (frame.payload_len != 12u) {
++			printf("ROSEMARY USB: USBMUX VERSION payload len=%u (expected 12)\n",
++			    frame.payload_len);
++			return;
++		}
++		requested = rosemary_usbmux_get_be32(frame.payload);
++		if (requested != 1u && requested != 2u) {
++			printf("ROSEMARY USB: unsupported USBMUX version %u\n", requested);
++			return;
++		}
++		chosen = requested;
++		reply_len = rosemary_usbmux_build_version_reply(reply, sizeof(reply), chosen);
++		if (reply_len == 0u || !ru_tx_send(reply, (uint32_t)reply_len)) {
++			printf("ROSEMARY USB: failed to queue USBMUX VERSION reply\n");
++			return;
++		}
++		ru.mux_version = chosen;
++		ru.mux_state = (chosen >= 2u) ? RU_MUX_WAIT_SETUP : RU_MUX_ACTIVE;
++		printf("ROSEMARY USB: USBMUX VERSION %u accepted; %u-byte reply queued\n",
++		    chosen, (unsigned)reply_len);
++		return;
++	}
++
++	if (ru.mux_state == RU_MUX_WAIT_SETUP) {
++		if (frame.protocol != RUMUX_PROTO_SETUP || frame.payload_len != 1u || frame.payload[0] != 0x07u) {
++			printf("ROSEMARY USB: expected USBMUX v2 SETUP/07, got proto=%u payload=%u\n",
++			    frame.protocol, frame.payload_len);
++			return;
++		}
++		ru.mux_rx_seq = frame.tx_seq;
++		ru.mux_tx_seq = 0u;
++		ru.mux_state = RU_MUX_ACTIVE;
++		printf("ROSEMARY USB: USBMUX v2 SETUP accepted (tx_seq=%u rx_seq=%u); transport active\n",
++		    frame.tx_seq, frame.rx_seq);
++		return;
++	}
++
++	if (ru.mux_state == RU_MUX_ACTIVE && frame.protocol == RUMUX_PROTO_TCP) {
++		/* Deliberately do not fake TCP/lockdownd: this is the next transport
++		 * milestone after the real VERSION/SETUP handshake is verified. */
++		if (ru.rx_packets <= 8u) {
++			printf("ROSEMARY USB: USBMUX TCP frame received (%u payload bytes); TCP bridge pending\n",
++			    frame.payload_len);
++		}
++		return;
++	}
++
++	if (ru.rx_packets <= 8u) {
++		printf("ROSEMARY USB: ignored USBMUX proto=%u state=%u payload=%u\n",
++		    frame.protocol, ru.mux_state, frame.payload_len);
++	}
++}
++
++/* Parse each completed USB OUT transfer before re-arming the DMA buffer. */
+ static void ru_rx_poll(void)
+ {
+ 	struct ru_qmu_gpd *gpd = ru_rx_gpd();
+@@ -681,8 +831,8 @@ static void ru_rx_poll(void)
+ 	}
+ 	ru_dma_sync(RU_RX_BUFFER_OFF, RU_RX_CAPACITY);
+ 	ru.rx_packets++;
+-	if (ru.rx_packets <= 4u) {
+-		printf("ROSEMARY USB: usbmux OUT packet %u bytes (received; service bridge pending)\n", len);
++	if (len != 0u) {
++		ru_mux_rx_packet((const uint8_t *)(ru.dma + RU_RX_BUFFER_OFF), len);
+ 	}
+ 	if (!ru_rx_arm()) {
+ 		ru.rx_errors++;
+@@ -724,6 +874,11 @@ static int ru_qmu_init(void)
+ 	ru_wr(ru.mac, RU_RX1CSR0, RU_RX_DMAREQEN | RU_BULK_MPS);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	ru.rx_active = 0;
++	ru.tx_active = 0;
++	ru.mux_version = 0;
++	ru.mux_state = RU_MUX_WAIT_VERSION;
++	ru.mux_tx_seq = 0;
++	ru.mux_rx_seq = 0xffffu;
+ 	if (!ru_rx_arm()) {
+ 		ru.rx_active = 0;
+ 		printf("ROSEMARY USB: RX QMU initial arm failed\n");
+@@ -743,6 +898,11 @@ static void ru_qmu_shutdown(void)
+ 		return;
+ 	}
+ 	ru.rx_active = 0;
++	ru.tx_active = 0;
++	ru.mux_version = 0;
++	ru.mux_state = RU_MUX_WAIT_VERSION;
++	ru.mux_tx_seq = 0;
++	ru.mux_rx_seq = 0xffffu;
+ 	ru_wr(ru.mac, RU_TX1CSR0, 0); ru_wr(ru.mac, RU_TX1CSR1, 0); ru_wr(ru.mac, RU_TX1CSR2, 0);
+ 	ru_wr(ru.mac, RU_RX1CSR0, 0); ru_wr(ru.mac, RU_RX1CSR1, 0); ru_wr(ru.mac, RU_RX1CSR2, 0);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -888,6 +1048,7 @@ static void ru_usb_thread(void *arg, wait_result_t result)
+ 			}
+ 			ru.seen_configuration = ru.configuration;
+ 		}
++		ru_tx_poll();
+ 		ru_rx_poll();
+ 
+ 		/* Handle SETUP before completing any previous EP0 IN transfer. */
+diff --git a/bsd/dev/rosemary_usbmux_proto.h b/bsd/dev/rosemary_usbmux_proto.h
+new file mode 100644
+index 0000000..7383ac6
+--- /dev/null
++++ b/bsd/dev/rosemary_usbmux_proto.h
+@@ -0,0 +1,96 @@
++/*
++ * Small, allocation-free USBMUX framing helpers shared by XNU and the
++ * host-side unit test. Wire integers are big-endian, independent of CPU.
++ */
++#ifndef _BSD_DEV_ROSEMARY_USBMUX_PROTO_H_
++#define _BSD_DEV_ROSEMARY_USBMUX_PROTO_H_
++
++#include <stddef.h>
++#include <stdint.h>
++
++#define RUMUX_PROTO_VERSION 0u
++#define RUMUX_PROTO_CONTROL 1u
++#define RUMUX_PROTO_SETUP   2u
++#define RUMUX_PROTO_TCP     6u
++#define RUMUX_MAGIC_V2      0xfeedfaceu
++#define RUMUX_VERSION_FRAME_SIZE 20u
++#define RUMUX_V1_HEADER_SIZE 8u
++#define RUMUX_V2_HEADER_SIZE 16u
++
++struct rosemary_usbmux_frame {
++	uint32_t protocol;
++	uint32_t total_len;
++	uint32_t magic;
++	uint16_t tx_seq;
++	uint16_t rx_seq;
++	const uint8_t *payload;
++	uint32_t payload_len;
++};
++
++static inline uint16_t rosemary_usbmux_get_be16(const uint8_t *p)
++{
++	return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
++}
++
++static inline uint32_t rosemary_usbmux_get_be32(const uint8_t *p)
++{
++	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
++	    ((uint32_t)p[2] << 8) | (uint32_t)p[3];
++}
++
++static inline void rosemary_usbmux_put_be16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)(v >> 8);
++	p[1] = (uint8_t)v;
++}
++
++static inline void rosemary_usbmux_put_be32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)(v >> 24);
++	p[1] = (uint8_t)(v >> 16);
++	p[2] = (uint8_t)(v >> 8);
++	p[3] = (uint8_t)v;
++}
++
++/* version < 2 uses the 8-byte header; version 2 uses the 16-byte header. */
++static inline int rosemary_usbmux_parse(const uint8_t *buf, size_t len,
++    uint32_t version, struct rosemary_usbmux_frame *out)
++{
++	size_t header_len = (version >= 2u) ? RUMUX_V2_HEADER_SIZE : RUMUX_V1_HEADER_SIZE;
++	uint32_t total;
++
++	if (!buf || !out || len < header_len || len > 0xffffffffu) return -1;
++	total = rosemary_usbmux_get_be32(buf + 4);
++	if (total != len || total < header_len) return -2;
++	out->protocol = rosemary_usbmux_get_be32(buf);
++	out->total_len = total;
++	out->magic = 0;
++	out->tx_seq = 0;
++	out->rx_seq = 0;
++	if (version >= 2u) {
++		out->magic = rosemary_usbmux_get_be32(buf + 8);
++		if (out->magic != RUMUX_MAGIC_V2) return -3;
++		out->tx_seq = rosemary_usbmux_get_be16(buf + 12);
++		out->rx_seq = rosemary_usbmux_get_be16(buf + 14);
++	}
++	out->payload = buf + header_len;
++	out->payload_len = (uint32_t)(len - header_len);
++	return 0;
++}
++
++/* Reply to the host's initial VERSION request using the pre-negotiation
++ * 8-byte header. The caller queues the returned 20 bytes on bulk IN. */
++static inline size_t rosemary_usbmux_build_version_reply(uint8_t *out,
++    size_t capacity, uint32_t major)
++{
++	if (!out || capacity < RUMUX_VERSION_FRAME_SIZE || (major != 1u && major != 2u))
++		return 0;
++	rosemary_usbmux_put_be32(out + 0, RUMUX_PROTO_VERSION);
++	rosemary_usbmux_put_be32(out + 4, RUMUX_VERSION_FRAME_SIZE);
++	rosemary_usbmux_put_be32(out + 8, major);
++	rosemary_usbmux_put_be32(out + 12, 0u); /* minor */
++	rosemary_usbmux_put_be32(out + 16, 0u); /* padding */
++	return RUMUX_VERSION_FRAME_SIZE;
++}
++
++#endif /* _BSD_DEV_ROSEMARY_USBMUX_PROTO_H_ */
+diff --git a/research/rosemary-usbmux/test-host.sh b/research/rosemary-usbmux/test-host.sh
+new file mode 100755
+index 0000000..3734d51
+--- /dev/null
++++ b/research/rosemary-usbmux/test-host.sh
+@@ -0,0 +1,9 @@
++#!/bin/sh
++set -eu
++ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
++CC=${CC:-cc}
++BIN=$(mktemp "${TMPDIR:-/tmp}/rosemary-usbmux-test.XXXXXX")
++trap 'rm -f "$BIN"' EXIT HUP INT TERM
++"$CC" -std=c99 -Wall -Wextra -Werror -pedantic \
++  "$ROOT/research/rosemary-usbmux/usbmux_proto_test.c" -o "$BIN"
++"$BIN"
+diff --git a/research/rosemary-usbmux/usbmux_proto_test.c b/research/rosemary-usbmux/usbmux_proto_test.c
+new file mode 100644
+index 0000000..fc8458f
+--- /dev/null
++++ b/research/rosemary-usbmux/usbmux_proto_test.c
+@@ -0,0 +1,42 @@
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include "../../bsd/dev/rosemary_usbmux_proto.h"
++
++int main(void)
++{
++	/* usbmuxd initial MUX_PROTO_VERSION v2 request (legacy 8-byte header). */
++	static const uint8_t version_request[20] = {
++		0,0,0,0, 0,0,0,20, 0,0,0,2, 0,0,0,0, 0,0,0,0
++	};
++	/* MUX_PROTO_SETUP packet sent by usbmuxd after accepting version 2. */
++	static const uint8_t setup_v2[17] = {
++		0,0,0,2, 0,0,0,17, 0xfe,0xed,0xfa,0xce, 0,0, 0xff,0xff, 7
++	};
++	struct rosemary_usbmux_frame frame;
++	uint8_t reply[20];
++	size_t reply_len;
++
++	assert(rosemary_usbmux_parse(version_request, sizeof(version_request), 0, &frame) == 0);
++	assert(frame.protocol == RUMUX_PROTO_VERSION && frame.payload_len == 12);
++	assert(rosemary_usbmux_get_be32(frame.payload) == 2);
++	reply_len = rosemary_usbmux_build_version_reply(reply, sizeof(reply), 2);
++	assert(reply_len == 20);
++	assert(rosemary_usbmux_get_be32(reply) == 0);
++	assert(rosemary_usbmux_get_be32(reply + 4) == 20);
++	assert(rosemary_usbmux_get_be32(reply + 8) == 2);
++	assert(rosemary_usbmux_parse(reply, reply_len, 0, &frame) == 0);
++	assert(frame.payload_len == 12 && rosemary_usbmux_get_be32(frame.payload) == 2);
++
++	assert(rosemary_usbmux_parse(setup_v2, sizeof(setup_v2), 2, &frame) == 0);
++	assert(frame.protocol == RUMUX_PROTO_SETUP && frame.payload_len == 1);
++	assert(frame.payload[0] == 7 && frame.tx_seq == 0 && frame.rx_seq == 0xffff);
++
++	assert(rosemary_usbmux_parse(version_request, sizeof(version_request), 2, &frame) != 0);
++	assert(rosemary_usbmux_parse(version_request, sizeof(version_request) - 1, 0, &frame) != 0);
++	assert(rosemary_usbmux_build_version_reply(reply, 19, 2) == 0);
++	assert(rosemary_usbmux_build_version_reply(reply, sizeof(reply), 3) == 0);
++
++	puts("rosemary USBMUX host tests: PASS (v2 VERSION reply, v2 SETUP, malformed frames)");
++	return 0;
++}
