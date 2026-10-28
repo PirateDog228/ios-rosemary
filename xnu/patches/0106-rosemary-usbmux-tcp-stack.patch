@@ -1,0 +1,587 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -23,6 +23,21 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include <kern/locks.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/if_arp.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <netinet/in.h>
++#include <netinet/ip.h>
++#include <netinet/tcp.h>
+ #include "rosemary_usbmux_proto.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -176,6 +191,13 @@
+ #define RU_RX_BUFFER_OFF          0x1000u
+ #define RU_TX_BUFFER_OFF          0x10000u
+ #define RU_USB_POLL_MS            1u
++#define RU_MUX_TXQ_DEPTH          8u
++#define RU_MUX_TX_FRAME_MAX       2048u
++#define RU_MUX_HOST_IP            0xc6120001u /* 198.18.0.1: synthetic USB peer */
++#define RU_MUX_DEVICE_IP          0xc6120002u /* 198.18.0.2: local TCP services */
++
++static const uint8_t ru_mux_host_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xef, 0x01 };
++static const uint8_t ru_mux_device_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xef, 0x02 };
+ 
+ #define RU_USB_VID                0x05acu
+ #define RU_USB_PID                0x12a8u /* usbmuxd-supported Apple PID range */
+@@ -203,6 +225,15 @@
+ 	uint16_t mux_tx_seq, mux_rx_seq;
+ 	uint32_t tx_packets, tx_errors, tx_len;
+ 	int tx_active;
++	ifnet_t mux_ifp;
++	lck_mtx_t *tx_lock;
++	uint16_t mux_ip_id;
++	uint32_t mux_tcp_in_count, mux_tcp_out_count;
++	uint32_t txq_head, txq_count;
++	struct {
++		uint16_t len;
++		uint8_t data[RU_MUX_TX_FRAME_MAX];
++	} txq[RU_MUX_TXQ_DEPTH];
+ } ru;
+ 
+ #define RU_MUX_WAIT_VERSION 0u
+@@ -672,62 +703,406 @@
+ 	return 1;
+ }
+ 
+-/* Queue one bulk-IN transfer using the MTU3 QMU TX GPD. The host protocol
+- * engine and QMU share one TX buffer, so callers must not queue while busy. */
++/* Start the next queued bulk-IN packet. ru.tx_lock must be held. */
++static void ru_tx_kick_locked(void)
++{
++	while (!ru.tx_active && ru.txq_count != 0u) {
++		struct ru_qmu_gpd *gpd = ru_tx_gpd();
++		uint32_t idx = ru.txq_head;
++		uint32_t len = ru.txq[idx].len;
++		uint64_t gpd_pa = ru.dma_pa + RU_GPD_TX_OFF;
++		uint64_t next_pa = gpd_pa + sizeof(*gpd);
++		uint64_t buffer_pa = ru.dma_pa + RU_TX_BUFFER_OFF;
++
++		if (len == 0u || len > RU_MUX_TX_FRAME_MAX || !ru_qmu_stop(RU_TXQCSR1)) {
++			ru.tx_errors++;
++			printf("ROSEMARY USB: dropping queued TX packet len=%u (QMU stop/length)\n", len);
++			ru.txq_head = (ru.txq_head + 1u) % RU_MUX_TXQ_DEPTH;
++			ru.txq_count--;
++			continue;
++		}
++
++		bcopy(ru.txq[idx].data, (void *)(ru.dma + RU_TX_BUFFER_OFF), len);
++		ru.txq_head = (ru.txq_head + 1u) % RU_MUX_TXQ_DEPTH;
++		ru.txq_count--;
++		bzero(gpd, 2u * sizeof(*gpd));
++		gpd[0].next_gpd = (uint32_t)next_pa;
++		gpd[0].buffer = (uint32_t)buffer_pa;
++		gpd[0].dw3_info = len;
++		gpd[0].dw0_info = ru_gpd_upper(buffer_pa, next_pa);
++		gpd[1].next_gpd = (uint32_t)gpd_pa;
++
++		ru_dma_clean(RU_TX_BUFFER_OFF, len);
++		ru_dma_clean(RU_GPD_TX_OFF, 2u * sizeof(*gpd));
++		__asm__ volatile("dsb sy" ::: "memory");
++		/* HWO is published last so DMA never sees a partial descriptor. */
++		gpd[0].dw0_info |= RU_QMU_GPD_IOC | RU_QMU_GPD_HWO;
++		ru_dma_clean(RU_GPD_TX_OFF, sizeof(*gpd));
++		__asm__ volatile("dsb sy" ::: "memory");
++		ru_qmu_set_start(RU_TXQSAR1, RU_TXQHIAR1, gpd_pa);
++		ru_wr(ru.mac, RU_TX1CSR0,
++		    (ru_rd(ru.mac, RU_TX1CSR0) & ~0x7ffu) | RU_TX_DMAREQEN | RU_BULK_MPS);
++		__asm__ volatile("dsb sy" ::: "memory");
++		ru_wr(ru.mac, RU_TXQCSR1, RU_QMU_Q_START);
++		__asm__ volatile("dsb sy" ::: "memory");
++		ru.tx_active = 1;
++		ru.tx_len = len;
++		return;
++	}
++}
++
++/* Queue a complete USBMUX frame. The USB thread and the network stack can
++ * both produce frames, so the DMA buffer must only be filled under this lock. */
+ static int ru_tx_send(const uint8_t *data, uint32_t len)
+ {
+-	struct ru_qmu_gpd *gpd = ru_tx_gpd();
+-	uint64_t gpd_pa = ru.dma_pa + RU_GPD_TX_OFF;
+-	uint64_t next_pa = gpd_pa + sizeof(*gpd);
+-	uint64_t buffer_pa = ru.dma_pa + RU_TX_BUFFER_OFF;
++	uint32_t idx;
++	if (!data || len == 0u || len > RU_MUX_TX_FRAME_MAX || !ru.tx_lock) {
++		ru.tx_errors++;
++		return 0;
++	}
++	lck_mtx_lock(ru.tx_lock);
++	if (ru.txq_count >= RU_MUX_TXQ_DEPTH) {
++		ru.tx_errors++;
++		lck_mtx_unlock(ru.tx_lock);
++		printf("ROSEMARY USB: TX queue full; dropping frame len=%u\n", len);
++		return 0;
++	}
++	idx = (ru.txq_head + ru.txq_count) % RU_MUX_TXQ_DEPTH;
++	bcopy(data, ru.txq[idx].data, len);
++	ru.txq[idx].len = (uint16_t)len;
++	ru.txq_count++;
++	ru_tx_kick_locked();
++	lck_mtx_unlock(ru.tx_lock);
++	return 1;
++}
+ 
+-	if (!data || len == 0u || len > RU_TX_CAPACITY || ru.tx_active) {
++static uint32_t ru_checksum_add(uint32_t sum, const uint8_t *data, size_t len)
++{
++	while (len >= 2u) {
++		sum += ((uint32_t)data[0] << 8) | data[1];
++		data += 2;
++		len -= 2u;
++	}
++	if (len != 0u) sum += (uint32_t)data[0] << 8;
++	return sum;
++}
++
++static uint16_t ru_checksum_finish(uint32_t sum)
++{
++	while (sum >> 16) sum = (sum & 0xffffu) + (sum >> 16);
++	return (uint16_t)~sum;
++}
++
++/* MUX_PROTO_TCP carries a TCP segment without an IP header. Recreate an
++ * Ethernet/IPv4 packet and inject it into XNU's normal TCP stack. The host's
++ * usbmuxd leaves the TCP checksum unset, so calculate it against this stable
++ * synthetic /30 link before calling ifnet_input(). */
++static int ru_mux_tcp_input(const uint8_t *segment, uint32_t tcp_len)
++{
++	struct ether_header eh;
++	struct ip ip;
++	struct tcphdr th;
++	struct ifnet_stat_increment_param stats = {};
++	uint8_t tcp_header[60];
++	uint8_t pseudo[12];
++	mbuf_t m = NULL;
++	size_t tcp_hlen;
++	size_t full_len;
++	uint32_t sum;
++	uint16_t tcp_sum;
++
++	if (!segment || tcp_len < sizeof(struct tcphdr) || ru.mux_ifp == NULL) return 0;
++	tcp_hlen = (size_t)((segment[12] >> 4) & 0x0fu) * 4u;
++	if (tcp_hlen < sizeof(struct tcphdr) || tcp_hlen > sizeof(tcp_header) || tcp_hlen > tcp_len) {
++		printf("ROSEMARY USB: invalid TCP header len=%lu segment=%u\n", (unsigned long)tcp_hlen, tcp_len);
++		return 0;
++	}
++	bcopy(segment, tcp_header, tcp_hlen);
++	tcp_header[16] = 0;
++	tcp_header[17] = 0;
++
++	bzero(&ip, sizeof(ip));
++	ip.ip_v = IPVERSION;
++	ip.ip_hl = sizeof(ip) / 4u;
++	ip.ip_len = htons((uint16_t)(sizeof(ip) + tcp_len));
++	ip.ip_id = htons(++ru.mux_ip_id);
++	ip.ip_off = 0;
++	ip.ip_ttl = 64;
++	ip.ip_p = IPPROTO_TCP;
++	ip.ip_src.s_addr = htonl(RU_MUX_HOST_IP);
++	ip.ip_dst.s_addr = htonl(RU_MUX_DEVICE_IP);
++	ip.ip_sum = 0;
++	ip.ip_sum = htons(ru_checksum_finish(ru_checksum_add(0, (const uint8_t *)&ip, sizeof(ip))));
++
++	bcopy(&ip.ip_src.s_addr, pseudo, 4);
++	bcopy(&ip.ip_dst.s_addr, pseudo + 4, 4);
++	pseudo[8] = 0;
++	pseudo[9] = IPPROTO_TCP;
++	pseudo[10] = (uint8_t)(tcp_len >> 8);
++	pseudo[11] = (uint8_t)tcp_len;
++	sum = ru_checksum_add(0, pseudo, sizeof(pseudo));
++	/* Pseudo-header and TCP header lengths are both even, so the odd-byte
++	 * checksum rule only matters at the end of the payload. */
++	sum = ru_checksum_add(sum, tcp_header, tcp_hlen);
++	if (tcp_len > tcp_hlen) sum = ru_checksum_add(sum, segment + tcp_hlen, tcp_len - tcp_hlen);
++	tcp_sum = ru_checksum_finish(sum);
++	tcp_header[16] = (uint8_t)(tcp_sum >> 8);
++	tcp_header[17] = (uint8_t)tcp_sum;
++
++	bcopy(ru_mux_device_mac, eh.ether_dhost, ETHER_ADDR_LEN);
++	bcopy(ru_mux_host_mac, eh.ether_shost, ETHER_ADDR_LEN);
++	eh.ether_type = htons(ETHERTYPE_IP);
++	full_len = ETHER_HDR_LEN + sizeof(ip) + tcp_len;
++	if (mbuf_allocpacket(MBUF_DONTWAIT, full_len, NULL, &m) != 0 || m == NULL) {
++		printf("ROSEMARY USB: failed to allocate TCP input mbuf len=%lu\n", (unsigned long)full_len);
++		if (m != NULL) mbuf_freem(m);
++		return 0;
++	}
++	if (mbuf_copyback(m, 0, ETHER_HDR_LEN, &eh, MBUF_DONTWAIT) != 0 ||
++	    mbuf_copyback(m, ETHER_HDR_LEN, sizeof(ip), &ip, MBUF_DONTWAIT) != 0 ||
++	    mbuf_copyback(m, ETHER_HDR_LEN + sizeof(ip), tcp_hlen, tcp_header, MBUF_DONTWAIT) != 0 ||
++	    (tcp_len > tcp_hlen && mbuf_copyback(m, ETHER_HDR_LEN + sizeof(ip) + tcp_hlen,
++	        tcp_len - tcp_hlen, segment + tcp_hlen, MBUF_DONTWAIT) != 0)) {
++		mbuf_freem(m);
++		return 0;
++	}
++	{
++		void *frame_header = mbuf_data(m);
++		mbuf_pkthdr_setrcvif(m, ru.mux_ifp);
++		mbuf_pkthdr_setheader(m, frame_header);
++		mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++		(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++	}
++	stats.packets_in = 1;
++	stats.bytes_in = full_len;
++	ifnet_input(ru.mux_ifp, m, &stats);
++
++	bcopy(segment, &th, sizeof(th));
++	ru.mux_tcp_in_count++;
++	if (ru.mux_tcp_in_count <= 16u) {
++		printf("ROSEMARY USB: TCP IN #%u %u->%u flags=%02x seq=%u ack=%u bytes=%u\n",
++		    ru.mux_tcp_in_count, ntohs(th.th_sport), ntohs(th.th_dport), th.th_flags,
++		    ntohl(th.th_seq), ntohl(th.th_ack), tcp_len - (uint32_t)tcp_hlen);
++	}
++	return 1;
++}
++
++static int ru_mux_tx_tcp_mbuf(mbuf_t m, size_t offset, uint32_t tcp_len)
++{
++	uint32_t idx;
++	uint32_t header_len;
++	uint32_t total_len;
++	struct tcphdr th;
++	uint8_t *out;
++	if (!m || !ru.tx_lock || tcp_len < sizeof(struct tcphdr)) return 0;
++	lck_mtx_lock(ru.tx_lock);
++	if (ru.mux_state != RU_MUX_ACTIVE || ru.mux_version == 0u ||
++	    ru.txq_count >= RU_MUX_TXQ_DEPTH) {
+ 		ru.tx_errors++;
++		lck_mtx_unlock(ru.tx_lock);
+ 		return 0;
+ 	}
+-	if (!ru_qmu_stop(RU_TXQCSR1)) {
++	header_len = (ru.mux_version >= 2u) ? RUMUX_V2_HEADER_SIZE : RUMUX_V1_HEADER_SIZE;
++	total_len = header_len + tcp_len;
++	if (total_len > RU_MUX_TX_FRAME_MAX) {
+ 		ru.tx_errors++;
+-		printf("ROSEMARY USB: TX QMU stop timed out\n");
++		lck_mtx_unlock(ru.tx_lock);
++		printf("ROSEMARY USB: outbound TCP segment too large len=%u\n", tcp_len);
+ 		return 0;
+ 	}
++	idx = (ru.txq_head + ru.txq_count) % RU_MUX_TXQ_DEPTH;
++	out = ru.txq[idx].data;
++	rosemary_usbmux_put_be32(out, RUMUX_PROTO_TCP);
++	rosemary_usbmux_put_be32(out + 4, total_len);
++	if (ru.mux_version >= 2u) {
++		rosemary_usbmux_put_be32(out + 8, RUMUX_MAGIC_V2);
++		rosemary_usbmux_put_be16(out + 12, ru.mux_tx_seq++);
++		rosemary_usbmux_put_be16(out + 14, ru.mux_rx_seq);
++	}
++	mbuf_copydata(m, offset, tcp_len, out + header_len);
++	ru.txq[idx].len = (uint16_t)total_len;
++	ru.txq_count++;
++	ru.mux_tcp_out_count++;
++	bcopy(out + header_len, &th, sizeof(th));
++	if (ru.mux_tcp_out_count <= 16u) {
++		printf("ROSEMARY USB: TCP OUT #%u %u->%u flags=%02x seq=%u ack=%u bytes=%u\n",
++		    ru.mux_tcp_out_count, ntohs(th.th_sport), ntohs(th.th_dport), th.th_flags,
++		    ntohl(th.th_seq), ntohl(th.th_ack), tcp_len - (uint32_t)(th.th_off * 4u));
++	}
++	ru_tx_kick_locked();
++	lck_mtx_unlock(ru.tx_lock);
++	return 1;
++}
+ 
+-	bcopy(data, (void *)(ru.dma + RU_TX_BUFFER_OFF), len);
+-	bzero(gpd, 2u * sizeof(*gpd));
+-	gpd[0].next_gpd = (uint32_t)next_pa;
+-	gpd[0].buffer = (uint32_t)buffer_pa;
+-	gpd[0].dw3_info = len;
+-	gpd[0].dw0_info = ru_gpd_upper(buffer_pa, next_pa);
+-	gpd[1].next_gpd = (uint32_t)gpd_pa;
++static errno_t ru_mux_if_output(ifnet_t ifp, mbuf_t m)
++{
++	struct ether_header eh;
++	struct ip ip;
++	size_t packet_len;
++	size_t ip_hlen;
++	uint32_t ip_len, tcp_len;
++
++	if (!m) return 0;
++	packet_len = mbuf_pkthdr_len(m);
++	if (packet_len < ETHER_HDR_LEN + sizeof(ip)) goto drop;
++	mbuf_copydata(m, 0, sizeof(eh), &eh);
++	if (ntohs(eh.ether_type) != ETHERTYPE_IP) goto drop;
++	mbuf_copydata(m, ETHER_HDR_LEN, sizeof(ip), &ip);
++	ip_hlen = (size_t)ip.ip_hl * 4u;
++	ip_len = ntohs(ip.ip_len);
++	if (ip.ip_v != IPVERSION || ip.ip_p != IPPROTO_TCP ||
++	    ip_hlen < sizeof(ip) || ip_hlen > 60u ||
++	    ip_len < ip_hlen + sizeof(struct tcphdr) ||
++	    ETHER_HDR_LEN + ip_len > packet_len) goto drop;
++	tcp_len = ip_len - (uint32_t)ip_hlen;
++	if (!ru_mux_tx_tcp_mbuf(m, ETHER_HDR_LEN + ip_hlen, tcp_len)) goto drop;
++	ifnet_stat_increment_out(ifp, 1, packet_len, 0);
++	mbuf_freem(m);
++	return 0;
+ 
+-	ru_dma_clean(RU_TX_BUFFER_OFF, len);
+-	ru_dma_clean(RU_GPD_TX_OFF, 2u * sizeof(*gpd));
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	/* HWO is published last so DMA never sees a partially built descriptor. */
+-	gpd[0].dw0_info |= RU_QMU_GPD_IOC | RU_QMU_GPD_HWO;
+-	ru_dma_clean(RU_GPD_TX_OFF, sizeof(*gpd));
+-	__asm__ volatile("dsb sy" ::: "memory");
++drop:
++	ifnet_stat_increment_out(ifp, 0, 0, 1);
++	mbuf_freem(m);
++	return 0;
++}
+ 
+-	ru_qmu_set_start(RU_TXQSAR1, RU_TXQHIAR1, gpd_pa);
+-	ru_wr(ru.mac, RU_TX1CSR0,
+-	    (ru_rd(ru.mac, RU_TX1CSR0) & ~0x7ffu) | RU_TX_DMAREQEN | RU_BULK_MPS);
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	ru_wr(ru.mac, RU_TXQCSR1, RU_QMU_Q_START);
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	ru.tx_active = 1;
+-	ru.tx_len = len;
+-	return 1;
++static errno_t ru_mux_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
++{
++	switch (cmd) {
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void ru_mux_if_detach(ifnet_t ifp __unused) { }
++
++/* The private rmx0 link lets the stock XNU TCP stack serve usbmuxd's
++ * port-based connections. 198.18.0.1/30 is the synthetic host; .2 is XNU. */
++static void ru_mux_if_create(void)
++{
++	struct ifnet_init_eparams init;
++	struct ifaliasreq ifra;
++	struct arpreq areq;
++	struct sockaddr_in *a;
++	socket_t so = NULL;
++	errno_t err;
++	int arp_err = 0;
++
++	if (ru.mux_ifp != NULL) return;
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "rosemary-usbmux-tcp";
++	init.uniqueid_len = sizeof("rosemary-usbmux-tcp") - 1;
++	init.name = "rmx";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = ru_mux_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = ru_mux_if_ioctl;
++	init.detach = ru_mux_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &ru.mux_ifp) != 0) {
++		printf("ROSEMARY USB: rmx0 ifnet_allocate failed\n");
++		ru.mux_ifp = NULL;
++		return;
++	}
++	ifnet_set_addrlen(ru.mux_ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(ru.mux_ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(ru.mux_ifp, ETHERMTU);
++	ifnet_set_baudrate(ru.mux_ifp, 480000000);
++	ifnet_set_flags(ru.mux_ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(ru.mux_ifp, NULL) != 0) {
++		printf("ROSEMARY USB: rmx0 ifnet_attach failed\n");
++		ru.mux_ifp = NULL;
++		return;
++	}
++	ifnet_set_lladdr(ru.mux_ifp, ru_mux_device_mac, ETHER_ADDR_LEN);
++	err = proto_plumb(PF_INET, ru.mux_ifp);
++	if (err == 0) err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	if (err == 0) {
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "rmx0");
++		a = (struct sockaddr_in *)&ifra.ifra_addr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(RU_MUX_DEVICE_IP);
++		a = (struct sockaddr_in *)&ifra.ifra_mask;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xfffffffcu);
++		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xc6120003u);
++		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
++		if (err == 0) {
++			bzero(&areq, sizeof(areq));
++			a = (struct sockaddr_in *)&areq.arp_pa;
++			a->sin_len = sizeof(*a);
++			a->sin_family = AF_INET;
++			a->sin_addr.s_addr = htonl(RU_MUX_HOST_IP);
++			areq.arp_ha.sa_family = AF_UNSPEC;
++			bcopy(ru_mux_host_mac, areq.arp_ha.sa_data, ETHER_ADDR_LEN);
++			areq.arp_flags = ATF_COM | ATF_PERM;
++			arp_err = sock_ioctl(so, SIOCSARP, &areq);
++		}
++		sock_close(so);
++	}
++	if (err == 0) ifnet_set_flags(ru.mux_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	printf("ROSEMARY USB: rmx0 198.18.0.2/30 %s (ifaddr err=%d arp err=%d)\n",
++	    (err == 0 && arp_err == 0) ? "ready" : "degraded", err, arp_err);
++}
++
++static void ru_tx_reset_mux(void)
++{
++	if (ru.tx_lock == NULL) return;
++	lck_mtx_lock(ru.tx_lock);
++	ru.tx_active = 0;
++	ru.txq_head = 0;
++	ru.txq_count = 0;
++	ru.mux_version = 0;
++	ru.mux_state = RU_MUX_WAIT_VERSION;
++	ru.mux_tx_seq = 0;
++	ru.mux_rx_seq = 0xffffu;
++	lck_mtx_unlock(ru.tx_lock);
+ }
+ 
+ static void ru_tx_poll(void)
+ {
+ 	struct ru_qmu_gpd *gpd = ru_tx_gpd();
+-	if (!ru.tx_active) return;
++	if (!ru.tx_lock) return;
++	lck_mtx_lock(ru.tx_lock);
++	if (!ru.tx_active) {
++		ru_tx_kick_locked();
++		lck_mtx_unlock(ru.tx_lock);
++		return;
++	}
+ 	ru_dma_sync(RU_GPD_TX_OFF, 2u * sizeof(*gpd));
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	if (gpd[0].dw0_info & RU_QMU_GPD_HWO) return;
++	if (gpd[0].dw0_info & RU_QMU_GPD_HWO) {
++		lck_mtx_unlock(ru.tx_lock);
++		return;
++	}
+ 	if (!ru_qmu_stop(RU_TXQCSR1)) {
+ 		ru.tx_errors++;
+ 		printf("ROSEMARY USB: TX QMU completion stop timed out\n");
++		lck_mtx_unlock(ru.tx_lock);
+ 		return;
+ 	}
+ 	ru.tx_active = 0;
+@@ -735,6 +1110,8 @@
+ 	if (ru.tx_packets <= 8u) {
+ 		printf("ROSEMARY USB: bulk IN complete #%u len=%u\n", ru.tx_packets, ru.tx_len);
+ 	}
++	ru_tx_kick_locked();
++	lck_mtx_unlock(ru.tx_lock);
+ }
+ 
+ static void ru_mux_rx_packet(const uint8_t *packet, uint32_t len)
+@@ -771,8 +1148,10 @@
+ 			printf("ROSEMARY USB: failed to queue USBMUX VERSION reply\n");
+ 			return;
+ 		}
++		lck_mtx_lock(ru.tx_lock);
+ 		ru.mux_version = chosen;
+ 		ru.mux_state = (chosen >= 2u) ? RU_MUX_WAIT_SETUP : RU_MUX_ACTIVE;
++		lck_mtx_unlock(ru.tx_lock);
+ 		printf("ROSEMARY USB: USBMUX VERSION %u accepted; %u-byte reply queued\n",
+ 		    chosen, (unsigned)reply_len);
+ 		return;
+@@ -784,21 +1163,21 @@
+ 			    frame.protocol, frame.payload_len);
+ 			return;
+ 		}
++		lck_mtx_lock(ru.tx_lock);
+ 		ru.mux_rx_seq = frame.tx_seq;
+ 		ru.mux_tx_seq = 0u;
+ 		ru.mux_state = RU_MUX_ACTIVE;
++		lck_mtx_unlock(ru.tx_lock);
+ 		printf("ROSEMARY USB: USBMUX v2 SETUP accepted (tx_seq=%u rx_seq=%u); transport active\n",
+ 		    frame.tx_seq, frame.rx_seq);
+ 		return;
+ 	}
+ 
+ 	if (ru.mux_state == RU_MUX_ACTIVE && frame.protocol == RUMUX_PROTO_TCP) {
+-		/* Deliberately do not fake TCP/lockdownd: this is the next transport
+-		 * milestone after the real VERSION/SETUP handshake is verified. */
+-		if (ru.rx_packets <= 8u) {
+-			printf("ROSEMARY USB: USBMUX TCP frame received (%u payload bytes); TCP bridge pending\n",
+-			    frame.payload_len);
+-		}
++		lck_mtx_lock(ru.tx_lock);
++		ru.mux_rx_seq = frame.tx_seq;
++		lck_mtx_unlock(ru.tx_lock);
++		(void)ru_mux_tcp_input(frame.payload, frame.payload_len);
+ 		return;
+ 	}
+ 
+@@ -874,11 +1253,7 @@
+ 	ru_wr(ru.mac, RU_RX1CSR0, RU_RX_DMAREQEN | RU_BULK_MPS);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	ru.rx_active = 0;
+-	ru.tx_active = 0;
+-	ru.mux_version = 0;
+-	ru.mux_state = RU_MUX_WAIT_VERSION;
+-	ru.mux_tx_seq = 0;
+-	ru.mux_rx_seq = 0xffffu;
++	ru_tx_reset_mux();
+ 	if (!ru_rx_arm()) {
+ 		ru.rx_active = 0;
+ 		printf("ROSEMARY USB: RX QMU initial arm failed\n");
+@@ -898,11 +1273,7 @@
+ 		return;
+ 	}
+ 	ru.rx_active = 0;
+-	ru.tx_active = 0;
+-	ru.mux_version = 0;
+-	ru.mux_state = RU_MUX_WAIT_VERSION;
+-	ru.mux_tx_seq = 0;
+-	ru.mux_rx_seq = 0xffffu;
++	ru_tx_reset_mux();
+ 	ru_wr(ru.mac, RU_TX1CSR0, 0); ru_wr(ru.mac, RU_TX1CSR1, 0); ru_wr(ru.mac, RU_TX1CSR2, 0);
+ 	ru_wr(ru.mac, RU_RX1CSR0, 0); ru_wr(ru.mac, RU_RX1CSR1, 0); ru_wr(ru.mac, RU_RX1CSR2, 0);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -1111,6 +1482,16 @@
+ 		return;
+ 	}
+ 	printf("ROSEMARY USB: starting MTU3 EP0/USBMUX enumerator, DMA=%llx\n", ru.dma_pa);
++	{
++		static lck_grp_t *grp;
++		if (grp == NULL) grp = lck_grp_alloc_init("rosemary_usbmux_tx", LCK_GRP_ATTR_NULL);
++		if (grp != NULL) ru.tx_lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++		if (ru.tx_lock == NULL) {
++			printf("ROSEMARY USB: TX lock allocation failed; USBMUX transport disabled\n");
++			return;
++		}
++	}
++	ru_mux_if_create();
+ 	if (kernel_thread_start(ru_usb_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
