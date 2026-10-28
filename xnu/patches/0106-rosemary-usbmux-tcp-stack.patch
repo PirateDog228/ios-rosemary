@@ -53,7 +53,7 @@ diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
  } ru;
  
  #define RU_MUX_WAIT_VERSION 0u
-@@ -672,62 +703,406 @@
+@@ -672,62 +703,453 @@
  	return 1;
  }
  
@@ -152,6 +152,57 @@ diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
 +{
 +	while (sum >> 16) sum = (sum & 0xffffu) + (sum >> 16);
 +	return (uint16_t)~sum;
++}
++
++/* Answer the synthetic peer's ARP query from this private interface. XNU 8796
++ * does not expose a static-neighbor ioctl, so use normal ARP input instead. */
++static int ru_mux_arp_reply(mbuf_t request, size_t frame_len)
++{
++	struct ether_header req_eh, reply_eh;
++	uint8_t req[28];
++	uint8_t reply[28] = { 0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x02 };
++	mbuf_t m = NULL;
++	struct ifnet_stat_increment_param stats = {};
++	size_t total_len = ETHER_HDR_LEN + sizeof(reply);
++	uint32_t host_ip = htonl(RU_MUX_HOST_IP);
++
++	if (!request || frame_len < total_len || ru.mux_ifp == NULL) return 0;
++	if (mbuf_copydata(request, 0, sizeof(req_eh), &req_eh) != 0) return 0;
++	if (ntohs(req_eh.ether_type) != ETHERTYPE_ARP) return 0;
++	if (mbuf_copydata(request, ETHER_HDR_LEN, sizeof(req), req) != 0) return 0;
++	if (req[0] != 0x00 || req[1] != 0x01 || req[2] != 0x08 || req[3] != 0x00 ||
++	    req[4] != 6 || req[5] != 4 || req[6] != 0x00 || req[7] != 0x01 ||
++	    rosemary_usbmux_get_be32(req + 24) != RU_MUX_HOST_IP) return 0;
++
++	bzero(&reply_eh, sizeof(reply_eh));
++	bcopy(req + 8, reply_eh.ether_dhost, ETHER_ADDR_LEN);
++	bcopy(ru_mux_host_mac, reply_eh.ether_shost, ETHER_ADDR_LEN);
++	reply_eh.ether_type = htons(ETHERTYPE_ARP);
++	bcopy(ru_mux_host_mac, reply + 8, ETHER_ADDR_LEN);
++	bcopy(&host_ip, reply + 14, sizeof(host_ip));
++	bcopy(req + 8, reply + 18, ETHER_ADDR_LEN);
++	bcopy(req + 14, reply + 24, 4);
++
++	if (mbuf_allocpacket(MBUF_DONTWAIT, total_len, NULL, &m) != 0 || m == NULL) {
++		return 0;
++	}
++	if (mbuf_copyback(m, 0, ETHER_HDR_LEN, &reply_eh, MBUF_DONTWAIT) != 0 ||
++	    mbuf_copyback(m, ETHER_HDR_LEN, sizeof(reply), reply, MBUF_DONTWAIT) != 0) {
++		mbuf_freem(m);
++		return 0;
++	}
++	{
++		void *frame_header = mbuf_data(m);
++		mbuf_pkthdr_setrcvif(m, ru.mux_ifp);
++		mbuf_pkthdr_setheader(m, frame_header);
++		mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++		(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN,
++		    mbuf_len(m) - ETHER_HDR_LEN);
++	}
++	stats.packets_in = 1;
++	stats.bytes_in = total_len;
++	ifnet_input(ru.mux_ifp, m, &stats);
++	return 1;
 +}
 +
 +/* MUX_PROTO_TCP carries a TCP segment without an IP header. Recreate an
@@ -314,9 +365,18 @@ diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
 +
 +	if (!m) return 0;
 +	packet_len = mbuf_pkthdr_len(m);
-+	if (packet_len < ETHER_HDR_LEN + sizeof(ip)) goto drop;
++	if (packet_len < ETHER_HDR_LEN) goto drop;
 +	mbuf_copydata(m, 0, sizeof(eh), &eh);
-+	if (ntohs(eh.ether_type) != ETHERTYPE_IP) goto drop;
++	if (ntohs(eh.ether_type) == ETHERTYPE_ARP) {
++		if (ru_mux_arp_reply(m, packet_len)) {
++			ifnet_stat_increment_out(ifp, 1, packet_len, 0);
++		} else {
++			ifnet_stat_increment_out(ifp, 0, 0, 1);
++		}
++		mbuf_freem(m);
++		return 0;
++	}
++	if (ntohs(eh.ether_type) != ETHERTYPE_IP || packet_len < ETHER_HDR_LEN + sizeof(ip)) goto drop;
 +	mbuf_copydata(m, ETHER_HDR_LEN, sizeof(ip), &ip);
 +	ip_hlen = (size_t)ip.ip_hl * 4u;
 +	ip_len = ntohs(ip.ip_len);
@@ -376,11 +436,9 @@ diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
 +{
 +	struct ifnet_init_eparams init;
 +	struct ifaliasreq ifra;
-+	struct arpreq areq;
 +	struct sockaddr_in *a;
 +	socket_t so = NULL;
 +	errno_t err;
-+	int arp_err = 0;
 +
 +	if (ru.mux_ifp != NULL) return;
 +	bzero(&init, sizeof(init));
@@ -437,22 +495,11 @@ diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
 +		a->sin_family = AF_INET;
 +		a->sin_addr.s_addr = htonl(0xc6120003u);
 +		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
-+		if (err == 0) {
-+			bzero(&areq, sizeof(areq));
-+			a = (struct sockaddr_in *)&areq.arp_pa;
-+			a->sin_len = sizeof(*a);
-+			a->sin_family = AF_INET;
-+			a->sin_addr.s_addr = htonl(RU_MUX_HOST_IP);
-+			areq.arp_ha.sa_family = AF_UNSPEC;
-+			bcopy(ru_mux_host_mac, areq.arp_ha.sa_data, ETHER_ADDR_LEN);
-+			areq.arp_flags = ATF_COM | ATF_PERM;
-+			arp_err = sock_ioctl(so, SIOCSARP, &areq);
-+		}
 +		sock_close(so);
 +	}
 +	if (err == 0) ifnet_set_flags(ru.mux_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
-+	printf("ROSEMARY USB: rmx0 198.18.0.2/30 %s (ifaddr err=%d arp err=%d)\n",
-+	    (err == 0 && arp_err == 0) ? "ready" : "degraded", err, arp_err);
++	printf("ROSEMARY USB: rmx0 198.18.0.2/30 %s (ifaddr err=%d)\n",
++	    err == 0 ? "ready" : "degraded", err);
 +}
 +
 +static void ru_tx_reset_mux(void)
