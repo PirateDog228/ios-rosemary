@@ -1,0 +1,892 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -18,3 +18,4 @@
+ bsd/dev/rosemary_keys.c		standard
+ bsd/dev/rosemary_touch.c		standard
++bsd/dev/rosemary_usb.c		standard
+ bsd/dev/sweet_ufs.c		standard
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -659,6 +659,8 @@
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++#if !defined(ROSEMARY)
+ 	sweet_usb_probe();
++#endif
+ 	return 0;
+ }
+
+diff --git a/bsd/dev/rosemary_ufs.c b/bsd/dev/rosemary_ufs.c
+--- a/bsd/dev/rosemary_ufs.c
++++ b/bsd/dev/rosemary_ufs.c
+@@ -21,4 +21,8 @@
+ 		extern void rosemary_touch_init(void);
+ 		rosemary_touch_init();
+ 	}
++	{
++		extern void rosemary_usb_init(void);
++		rosemary_usb_init();
++	}
+ 	uint32_t pause = 0;
+
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/rosemary_usb.c
+@@ -0,0 +1,852 @@
++/*
++ * ROSEMARY (Redmi Note 10S / MT6785) USB device-mode enumeration bring-up.
++ *
++ * This is a first kernel-side milestone, not a complete USBMUX service:
++ *   - initializes the verified MTU3 USB2 peripheral path;
++ *   - enumerates with Apple VID/PID and a synthetic project UDID;
++ *   - exposes the Apple USBMUX interface and keeps its OUT endpoint drained;
++ *   - leaves IN reads pending/NAKed until a later patch connects USBMUX to
++ *     lockdownd. idevice_id may therefore list this device, while ideviceinfo,
++ *     pairing and backups are not expected to work yet.
++ *
++ * Enable explicitly with the boot-arg rosemaryusb=1. This avoids taking over
++ * the USB peripheral while the user is booting a diagnostic/recovery image.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) && defined(ROSEMARY)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++#define RU_MAC_PA               0x11201000u
++#define RU_MAC_SIZE             0x3000u
++#define RU_IPPC_PA              0x11203e00u
++#define RU_IPPC_SIZE            0x0200u
++#define RU_U2_PA                0x11e40000u
++#define RU_U2_SIZE              0x0400u
++
++#define RU_IPPC_IP_PDN           0x000u
++#define RU_IPPC_HOST_PDN         0x004u
++#define RU_IPPC_DEV_PDN          0x008u
++#define RU_IPPC_U2_PORT           0x050u
++#define RU_IPPC_DEV_CAP           0x028u
++#define RU_IPPC_TRUNK             0x0a4u
++
++#define RU_EP0CSR                0x0100u
++#define RU_RXCOUNT0              0x0108u
++#define RU_TX1CSR0               0x0110u
++#define RU_TX1CSR1               0x0114u
++#define RU_TX1CSR2               0x0118u
++#define RU_RX1CSR0               0x0210u
++#define RU_RX1CSR1               0x0214u
++#define RU_RX1CSR2               0x0218u
++#define RU_FIFO0                 0x0300u
++#define RU_TXQHIAR1              0x0484u
++#define RU_TXQCSR1               0x0510u
++#define RU_TXQSAR1               0x0514u
++#define RU_RXQHIAR1              0x04c4u
++#define RU_RXQCSR1               0x0610u
++#define RU_RXQSAR1               0x0614u
++#define RU_EPISR                 0x0080u
++#define RU_QISAR0                0x0700u
++#define RU_TXQERRIR0             0x0780u
++#define RU_RXQERRIR0             0x07c0u
++#define RU_CAP_EPNTXFFSZ         0x0c08u
++#define RU_CAP_EPNRXFFSZ         0x0c0cu
++#define RU_CAP_EPINFO            0x0c10u
++#define RU_MISC_CTRL             0x0c84u
++#define RU_POWER_MGMT            0x2404u
++#define RU_DEVICE_CTRL           0x240cu
++#define RU_USB2_COMMON_INTR      0x241cu
++#define RU_LINK_RESET            0x2424u
++#define RU_USB2_EPCTL_LPM        0x0828u
++#define RU_USB2_EPCTL_LPM_FC     0x0860u
++
++#define RU_U2_COM_BASE           0x300u
++#define RU_U2_ACR0               (RU_U2_COM_BASE + 0x000u)
++#define RU_U2_ACR1               (RU_U2_COM_BASE + 0x004u)
++#define RU_U2_ACR5               (RU_U2_COM_BASE + 0x014u)
++#define RU_U2_ACR6               (RU_U2_COM_BASE + 0x018u)
++#define RU_U2_ACR4               (RU_U2_COM_BASE + 0x020u)
++#define RU_U2_DTM0               (RU_U2_COM_BASE + 0x068u)
++#define RU_U2_DTM1               (RU_U2_COM_BASE + 0x06cu)
++#define RU_U2_FREQ               0x100u
++
++#define RU_BIT(n)                (1u << (n))
++#define RU_U2_PORT_DIS            RU_BIT(0)
++#define RU_U2_PORT_PDN            RU_BIT(1)
++#define RU_U2_PORT_HOST           RU_BIT(2)
++#define RU_U2_PORT_VBUSVALID      RU_BIT(9)
++#define RU_U2_PORT_OTG_SEL        RU_BIT(7)
++#define RU_U2_PORT_TEST_MASK      (RU_U2_PORT_DIS | RU_U2_PORT_PDN | RU_U2_PORT_HOST | RU_U2_PORT_VBUSVALID | RU_U2_PORT_OTG_SEL)
++#define RU_DTM0_FORCE_UART_EN     RU_BIT(26)
++#define RU_DTM0_FORCE_SUSPENDM    RU_BIT(18)
++#define RU_DTM0_RG_SUSPENDM       RU_BIT(3)
++#define RU_DTM0_RG_XCVRSEL        (3u << 4)
++#define RU_DTM0_RG_DATAIN         (0xfu << 10)
++#define RU_DTM0_PART_MASK         (RU_BIT(23) | RU_BIT(21) | RU_BIT(20) | RU_BIT(19) | RU_BIT(17) | RU_BIT(16))
++#define RU_DTM1_RG_UART_EN        RU_BIT(16)
++#define RU_DTM1_RG_VBUSVALID      RU_BIT(5)
++#define RU_DTM1_RG_SESSEND        RU_BIT(4)
++#define RU_DTM1_RG_AVALID         RU_BIT(2)
++#define RU_ACR0_RG_USB20_INTR_EN  RU_BIT(5)
++#define RU_ACR1_RG_VRT_SEL        (7u << 12)
++#define RU_ACR1_RG_TERM_SEL       (7u << 8)
++#define RU_ACR5_RG_HSTX_SRCAL_EN  RU_BIT(15)
++#define RU_ACR5_RG_HSTX_SRCTRL    (7u << 12)
++#define RU_ACR5_RG_HS_100U_U3_EN  RU_BIT(11)
++#define RU_ACR6_RG_PHY_REV6       (3u << 30)
++#define RU_ACR6_RG_BC11_SW_EN     RU_BIT(23)
++#define RU_ACR6_RG_OTG_VBUSCMP_EN RU_BIT(20)
++#define RU_ACR6_RG_DISCTH         (0xfu << 4)
++#define RU_ACR6_RG_SQTH           0xfu
++#define RU_ACR4_GPIO_CTRL_MASK    (RU_BIT(9) | RU_BIT(8))
++#define RU_FREQ_RG_FREQDET_EN     RU_BIT(24)
++#define RU_FREQ_RG_CYCLECNT       0x00ffffffu
++#define RU_FMMON_RG_FRCK_EN       RU_BIT(8)
++#define RU_FMMON_USB_FM_VALID     RU_BIT(0)
++
++#define RU_MAC_SOFT_CONN          RU_BIT(6)
++#define RU_MAC_HS_ENABLE          RU_BIT(5)
++#define RU_MAC_SUSPENDM_ENABLE    RU_BIT(0)
++#define RU_MAC_LPM_HRWE           RU_BIT(10)
++#define RU_MAC_VBUS_FRC_EN        RU_BIT(0)
++#define RU_MAC_VBUS_ON            RU_BIT(1)
++#define RU_MAC_FRC_VBUS_BITS      (RU_MAC_VBUS_FRC_EN | RU_MAC_VBUS_ON)
++#define RU_EP0_SENDSTALL          RU_BIT(25)
++#define RU_EP0_FIFOFULL           RU_BIT(23)
++#define RU_EP0_SENTSTALL          RU_BIT(22)
++#define RU_EP0_DPHTX              RU_BIT(20)
++#define RU_EP0_DATAEND            RU_BIT(19)
++#define RU_EP0_TXPKTRDY           RU_BIT(18)
++#define RU_EP0_SETUPPKTRDY        RU_BIT(17)
++#define RU_EP0_RXPKTRDY           RU_BIT(16)
++#define RU_EP0_MAXPKTSZ_MASK      0x3ffu
++#define RU_EP0_W1C_BITS           (~(RU_EP0_RXPKTRDY | RU_EP0_SETUPPKTRDY | RU_EP0_SENTSTALL))
++#define RU_USB_RESET_INTR          RU_BIT(2)
++#define RU_DEVICE_ADDR_MASK       (0x7fu << 24)
++#define RU_DEVICE_ADDR(n)         (((uint32_t)(n) & 0x7fu) << 24)
++
++#define RU_QMU_Q_ACTIVE           RU_BIT(15)
++#define RU_QMU_Q_STOP             RU_BIT(2)
++#define RU_QMU_Q_START            RU_BIT(0)
++#define RU_QMU_GPD_HWO            RU_BIT(0)
++#define RU_QMU_GPD_IOC            RU_BIT(7)
++#define RU_TX_DMAREQEN            RU_BIT(29)
++#define RU_RX_DMAREQEN            RU_BIT(29)
++#define RU_BULK_MPS               512u
++#define RU_RX_CAPACITY            49152u
++#define RU_DMA_SIZE               0x20000u
++#define RU_GPD_TX_OFF             0x0000u
++#define RU_GPD_RX_OFF             0x0040u
++#define RU_RX_BUFFER_OFF          0x1000u
++#define RU_TX_BUFFER_OFF          0x10000u
++#define RU_USB_POLL_MS            1u
++
++#define RU_USB_VID                0x05acu
++#define RU_USB_PID                0x12a8u /* usbmuxd-supported Apple PID range */
++
++struct ru_qmu_gpd {
++	uint32_t dw0_info;
++	uint32_t next_gpd;
++	uint32_t buffer;
++	uint32_t dw3_info;
++} __attribute__((packed));
++
++enum ru_ep0_state { RU_EP0_SETUP, RU_EP0_TX_END };
++
++static struct {
++	vm_offset_t mac, ippc, u2;
++	vm_offset_t dma;
++	uint64_t dma_pa;
++	uint32_t configuration, seen_configuration;
++	uint32_t rx_packets, rx_errors;
++	uint32_t rx_hardware_version;
++	int rx_gen2, rx_active;
++	int wait_channel;
++} ru;
++
++static uint32_t ru_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void ru_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static uint64_t ru_counter(void)
++{
++	uint64_t v;
++	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(v));
++	return v;
++}
++
++static uint64_t ru_counter_freq(void)
++{
++	uint64_t v;
++	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
++	return v;
++}
++
++static void ru_delay_us(uint32_t us)
++{
++	uint64_t hz = ru_counter_freq();
++	uint64_t start = ru_counter();
++	uint64_t ticks = (hz * us) / 1000000ULL;
++	if (ticks == 0) ticks = 1;
++	while ((ru_counter() - start) < ticks) {
++		__asm__ volatile("yield");
++	}
++}
++
++static void ru_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&ru.wait_channel, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void ru_dma_clean(uint32_t off, uint32_t len)
++{
++	clean_dcache64((addr64_t)(ru.dma_pa + off), len, TRUE);
++}
++
++static void ru_dma_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(ru.dma_pa + off), len, TRUE);
++}
++
++static uint32_t ru_u2_phy_init(void)
++{
++	uint32_t tmp, fm_out, cal, fm_valid = 0;
++	uint64_t start, timeout_ticks;
++
++	tmp = ru_rd(ru.u2, RU_U2_DTM0);
++	tmp &= ~(RU_DTM0_FORCE_UART_EN | RU_DTM0_FORCE_SUSPENDM);
++	tmp |= (1u << 4);
++	ru_wr(ru.u2, RU_U2_DTM0, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_DTM1) & ~RU_DTM1_RG_UART_EN;
++	ru_wr(ru.u2, RU_U2_DTM1, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_ACR0) | RU_ACR0_RG_USB20_INTR_EN;
++	ru_wr(ru.u2, RU_U2_ACR0, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_ACR5) & ~RU_ACR5_RG_HS_100U_U3_EN;
++	ru_wr(ru.u2, RU_U2_ACR5, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_ACR4) & ~RU_ACR4_GPIO_CTRL_MASK;
++	ru_wr(ru.u2, RU_U2_ACR4, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_ACR6) & ~(RU_ACR6_RG_BC11_SW_EN | RU_ACR6_RG_SQTH);
++	tmp |= 2u;
++	ru_wr(ru.u2, RU_U2_ACR6, tmp);
++
++	tmp = ru_rd(ru.u2, RU_U2_DTM0) | RU_DTM0_FORCE_SUSPENDM;
++	ru_wr(ru.u2, RU_U2_DTM0, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_DTM0) & ~RU_DTM0_RG_SUSPENDM;
++	ru_wr(ru.u2, RU_U2_DTM0, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_DTM0) | RU_DTM0_RG_SUSPENDM;
++	ru_wr(ru.u2, RU_U2_DTM0, tmp);
++	ru_delay_us(30);
++	tmp = ru_rd(ru.u2, RU_U2_DTM0) & ~RU_DTM0_FORCE_SUSPENDM;
++	ru_wr(ru.u2, RU_U2_DTM0, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_DTM0) & ~RU_DTM0_RG_SUSPENDM;
++	ru_wr(ru.u2, RU_U2_DTM0, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_DTM0) & ~RU_DTM0_FORCE_UART_EN;
++	ru_wr(ru.u2, RU_U2_DTM0, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_DTM1) & ~RU_DTM1_RG_UART_EN;
++	ru_wr(ru.u2, RU_U2_DTM1, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_ACR4) & ~RU_ACR4_GPIO_CTRL_MASK;
++	ru_wr(ru.u2, RU_U2_ACR4, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_DTM0) & ~RU_DTM0_FORCE_SUSPENDM;
++	ru_wr(ru.u2, RU_U2_DTM0, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_DTM0) & ~(RU_DTM0_RG_XCVRSEL | RU_DTM0_RG_DATAIN | RU_DTM0_PART_MASK);
++	ru_wr(ru.u2, RU_U2_DTM0, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_ACR6) & ~RU_ACR6_RG_BC11_SW_EN;
++	ru_wr(ru.u2, RU_U2_ACR6, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_ACR6) | RU_ACR6_RG_OTG_VBUSCMP_EN;
++	ru_wr(ru.u2, RU_U2_ACR6, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_DTM1) | RU_DTM1_RG_VBUSVALID | RU_DTM1_RG_AVALID;
++	tmp &= ~RU_DTM1_RG_SESSEND;
++	ru_wr(ru.u2, RU_U2_DTM1, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_ACR6) & ~RU_ACR6_RG_PHY_REV6;
++	tmp |= (1u << 30);
++	ru_wr(ru.u2, RU_U2_ACR6, tmp);
++	ru_delay_us(800);
++
++	tmp = ru_rd(ru.u2, RU_U2_ACR5) | RU_ACR5_RG_HSTX_SRCAL_EN;
++	ru_wr(ru.u2, RU_U2_ACR5, tmp);
++	ru_delay_us(1);
++	tmp = ru_rd(ru.u2, RU_U2_FREQ + 0x10u) | RU_FMMON_RG_FRCK_EN;
++	ru_wr(ru.u2, RU_U2_FREQ + 0x10u, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_FREQ) & ~(RU_FREQ_RG_CYCLECNT | (3u << 26));
++	tmp |= 1024u;
++	ru_wr(ru.u2, RU_U2_FREQ, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_FREQ) | RU_FREQ_RG_FREQDET_EN;
++	ru_wr(ru.u2, RU_U2_FREQ, tmp);
++	start = ru_counter();
++	timeout_ticks = ru_counter_freq() / 5000ULL;
++	while ((ru_counter() - start) < timeout_ticks) {
++		if (ru_rd(ru.u2, RU_U2_FREQ + 0x10u) & RU_FMMON_USB_FM_VALID) {
++			fm_valid = 1;
++			break;
++		}
++		ru_delay_us(10);
++	}
++	fm_out = ru_rd(ru.u2, RU_U2_FREQ + 0x0cu);
++	tmp = ru_rd(ru.u2, RU_U2_FREQ) & ~RU_FREQ_RG_FREQDET_EN;
++	ru_wr(ru.u2, RU_U2_FREQ, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_FREQ + 0x10u) & ~RU_FMMON_RG_FRCK_EN;
++	ru_wr(ru.u2, RU_U2_FREQ + 0x10u, tmp);
++	if (fm_out) {
++		tmp = (26u * 28u * 1024u) / fm_out;
++		cal = (tmp + 500u) / 1000u;
++	} else {
++		cal = 4u;
++	}
++	cal &= 7u;
++	tmp = ru_rd(ru.u2, RU_U2_ACR5) & ~RU_ACR5_RG_HSTX_SRCTRL;
++	tmp |= cal << 12;
++	ru_wr(ru.u2, RU_U2_ACR5, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_ACR5) & ~RU_ACR5_RG_HSTX_SRCAL_EN;
++	ru_wr(ru.u2, RU_U2_ACR5, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_ACR1) & ~(RU_ACR1_RG_VRT_SEL | RU_ACR1_RG_TERM_SEL);
++	tmp |= (6u << 12) | (6u << 8);
++	ru_wr(ru.u2, RU_U2_ACR1, tmp);
++	tmp = ru_rd(ru.u2, RU_U2_ACR6) & ~(RU_ACR6_RG_PHY_REV6 | RU_ACR6_RG_DISCTH);
++	tmp |= (1u << 30) | (7u << 4);
++	ru_wr(ru.u2, RU_U2_ACR6, tmp);
++	printf("ROSEMARY USB: U2 PHY calibration valid=%u FM=%u SR=%u\n", fm_valid, fm_out, cal);
++	return fm_valid;
++}
++
++/* These are 24 hexadecimal digits only for host-side usbmuxd enumeration.
++ * The later Lockdown service must report the same synthetic project UDID. */
++static const uint8_t ru_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
++	0xac, 0x05, 0xa8, 0x12, 0x00, 0x16, 1, 2, 3, 4
++};
++static const uint8_t ru_qual_desc[10] = {
++	10, 6, 0x00, 0x02, 0x00, 0x00, 0x00, 64, 4, 0
++};
++static const uint8_t ru_lang_desc[] = { 4, 3, 0x09, 0x04 };
++static const uint8_t ru_maker_desc[] = {
++	22, 3, 'A',0, 'p',0, 'p',0, 'l',0, 'e',0, ' ',0, 'I',0, 'n',0, 'c',0, '.',0
++};
++static const uint8_t ru_product_desc[] = {
++	14, 3, 'i',0, 'P',0, 'h',0, 'o',0, 'n',0, 'e',0
++};
++static const uint8_t ru_serial_desc[] = {
++	50, 3,
++	'0',0,'0',0,'0',0,'0',0,'8',0,'1',0,'1',0,'0',0,
++	'A',0,'A',0,'B',0,'B',0,'C',0,'C',0,'D',0,'D',0,
++	'E',0,'E',0,'F',0,'F',0,'1',0,'2',0,'3',0,'4',0
++};
++
++static void ru_fifo_read(uint8_t *dst, uint32_t len)
++{
++	uint32_t i = 0;
++	while (len - i >= 4u) {
++		uint32_t v = ru_rd(ru.mac, RU_FIFO0);
++		dst[i++] = (uint8_t)v;
++		dst[i++] = (uint8_t)(v >> 8);
++		dst[i++] = (uint8_t)(v >> 16);
++		dst[i++] = (uint8_t)(v >> 24);
++	}
++	if (len > i) {
++		uint32_t v = ru_rd(ru.mac, RU_FIFO0);
++		while (i < len) {
++			dst[i] = (uint8_t)(v >> (8u * (i & 3u)));
++			i++;
++		}
++	}
++}
++
++static void ru_fifo_write(const uint8_t *src, uint32_t len)
++{
++	uint32_t i = 0;
++	while (len - i >= 4u) {
++		uint32_t v = (uint32_t)src[i] | ((uint32_t)src[i + 1] << 8) |
++		    ((uint32_t)src[i + 2] << 16) | ((uint32_t)src[i + 3] << 24);
++		ru_wr(ru.mac, RU_FIFO0, v);
++		i += 4u;
++	}
++	if (len - i >= 2u) {
++		uint32_t v = (uint32_t)src[i] | ((uint32_t)src[i + 1] << 8);
++		ru_wr(ru.mac, RU_FIFO0, v);
++		i += 2u;
++	}
++	if (len > i) {
++		*(volatile uint8_t *)(ru.mac + RU_FIFO0) = src[i];
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void ru_ep0_ack_setup_in(void)
++{
++	uint32_t csr = ru_rd(ru.mac, RU_EP0CSR) & RU_EP0_W1C_BITS;
++	ru_wr(ru.mac, RU_EP0CSR, csr | RU_EP0_SETUPPKTRDY | RU_EP0_DPHTX);
++}
++
++static void ru_ep0_send_in(const uint8_t *data, uint32_t descriptor_len,
++    uint32_t requested_len, enum ru_ep0_state *state)
++{
++	uint32_t len = MIN(descriptor_len, requested_len);
++	uint32_t csr;
++	if (len > 64u) len = 64u;
++	ru_ep0_ack_setup_in();
++	if (len) ru_fifo_write(data, len);
++	csr = ru_rd(ru.mac, RU_EP0CSR) & RU_EP0_W1C_BITS;
++	ru_wr(ru.mac, RU_EP0CSR, csr | RU_EP0_TXPKTRDY);
++	*state = RU_EP0_TX_END;
++}
++
++static void ru_ep0_send_status(enum ru_ep0_state *state)
++{
++	uint32_t csr = ru_rd(ru.mac, RU_EP0CSR) & RU_EP0_W1C_BITS;
++	ru_wr(ru.mac, RU_EP0CSR, csr | RU_EP0_SETUPPKTRDY | RU_EP0_DATAEND);
++	*state = RU_EP0_SETUP;
++}
++
++static void ru_ep0_stall(int no_data, enum ru_ep0_state *state)
++{
++	uint32_t csr = ru_rd(ru.mac, RU_EP0CSR) & RU_EP0_W1C_BITS;
++	csr |= RU_EP0_SENDSTALL;
++	if (no_data) csr |= RU_EP0_SETUPPKTRDY;
++	ru_wr(ru.mac, RU_EP0CSR, csr);
++	*state = RU_EP0_SETUP;
++}
++
++static uint16_t ru_le16(const uint8_t *p)
++{
++	return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
++}
++
++/* USBMUX must be endpoint OUT first, then endpoint IN: usbmuxd relies on it. */
++static void ru_build_config(uint8_t index, int other_speed, uint8_t out[32])
++{
++	static const uint8_t template_desc[32] = {
++		9, 2, 32, 0, 1, 1, 0, 0x80, 50,
++		9, 4, 0, 0, 2, 0xff, 0xfe, 0x02, 0,
++		7, 5, 0x01, 0x02, 0x00, 0x02, 0,
++		7, 5, 0x81, 0x02, 0x00, 0x02, 0
++	};
++	memcpy(out, template_desc, sizeof(template_desc));
++	out[1] = other_speed ? 7 : 2;
++	out[5] = (uint8_t)(index + 1u); /* configuration value follows its index */
++	if (other_speed) {
++		out[22] = 64; out[23] = 0;
++		out[29] = 64; out[30] = 0;
++	}
++}
++
++static int ru_get_descriptor(uint8_t type, uint8_t index,
++    const uint8_t **data, uint16_t *len, uint8_t config_scratch[32])
++{
++	switch (type) {
++	case 1:
++		if (index) return 0;
++		*data = ru_dev_desc; *len = sizeof(ru_dev_desc); return 1;
++	case 2:
++		if (index > 3) return 0;
++		ru_build_config(index, 0, config_scratch);
++		*data = config_scratch; *len = 32; return 1;
++	case 3:
++		switch (index) {
++		case 0: *data = ru_lang_desc; *len = sizeof(ru_lang_desc); return 1;
++		case 1: *data = ru_maker_desc; *len = sizeof(ru_maker_desc); return 1;
++		case 2: *data = ru_product_desc; *len = sizeof(ru_product_desc); return 1;
++		case 3: *data = ru_serial_desc; *len = sizeof(ru_serial_desc); return 1;
++		default: return 0;
++		}
++	case 6:
++		if (index) return 0;
++		*data = ru_qual_desc; *len = sizeof(ru_qual_desc); return 1;
++	case 7:
++		if (index > 3) return 0;
++		ru_build_config(index, 1, config_scratch);
++		*data = config_scratch; *len = 32; return 1;
++	default:
++		return 0;
++	}
++}
++
++static void ru_handle_setup(const uint8_t raw[8], enum ru_ep0_state *state,
++    uint8_t *remote_wakeup)
++{
++	uint8_t bm = raw[0], req = raw[1];
++	uint16_t val = ru_le16(&raw[2]);
++	uint16_t idx = ru_le16(&raw[4]);
++	uint16_t wlen = ru_le16(&raw[6]);
++	const uint8_t *desc = NULL;
++	uint16_t desc_len = 0;
++	uint8_t small[2] = { 0, 0 }, one = 0;
++	uint8_t config_desc[32];
++	int recognized = 0;
++
++	/* Modern usbmuxd probes Apple's GET_MODE request before claiming the interface.
++	 * Mode 1 is the ordinary initial (USBMUX-capable) configuration set. */
++	if (bm == 0xc0u && req == 0x45u && wlen >= 4u) {
++		static const uint8_t mode[4] = { 3, 3, 3, 0 };
++		ru_ep0_send_in(mode, sizeof(mode), wlen, state);
++		return;
++	}
++	if (bm == 0xc0u && req == 0x52u && wlen >= 1u) {
++		/* Decline a mode switch and ask usbmuxd to keep using the current config. */
++		one = 1;
++		ru_ep0_send_in(&one, 1, wlen, state);
++		return;
++	}
++
++	if ((bm & 0x60u) == 0u && (bm & 0x80u)) {
++		if (req == 6u && (bm & 0x1fu) == 0u &&
++		    ru_get_descriptor((uint8_t)(val >> 8), (uint8_t)val, &desc, &desc_len, config_desc)) {
++			ru_ep0_send_in(desc, desc_len, wlen, state);
++			return;
++		}
++		if (req == 0u && wlen >= 2u && (bm & 0x1fu) <= 2u) {
++			small[0] = ((bm & 0x1fu) == 0u && *remote_wakeup) ? 2u : 0u;
++			ru_ep0_send_in(small, 2, wlen, state);
++			return;
++		}
++		if (req == 8u && (bm & 0x1fu) == 0u && wlen >= 1u) {
++			one = (uint8_t)ru.configuration;
++			ru_ep0_send_in(&one, 1, wlen, state);
++			return;
++		}
++		if (req == 10u && (bm & 0x1fu) == 1u && idx == 0u && wlen >= 1u) {
++			one = 0;
++			ru_ep0_send_in(&one, 1, wlen, state);
++			return;
++		}
++	}
++
++	if ((bm & 0x60u) == 0u && !(bm & 0x80u) && wlen == 0u) {
++		if (bm == 0u && req == 5u && val <= 127u) {
++			uint32_t conf = ru_rd(ru.mac, RU_DEVICE_CTRL) & ~RU_DEVICE_ADDR_MASK;
++			ru_wr(ru.mac, RU_DEVICE_CTRL, conf | RU_DEVICE_ADDR(val));
++			recognized = 1;
++		} else if (bm == 0u && req == 9u && val <= 4u) {
++			ru.configuration = val;
++			recognized = 1;
++		} else if (bm == 1u && req == 11u && idx == 0u && val == 0u) {
++			recognized = 1;
++		} else if (bm == 0u && (req == 1u || req == 3u) && val == 1u) {
++			*remote_wakeup = (uint8_t)(req == 3u);
++			recognized = 1;
++		} else if (bm == 2u && (req == 1u || req == 3u) && val == 0u &&
++		    (idx == 0x01u || idx == 0x81u)) {
++			recognized = 1; /* endpoint halt feature; there is no halted data queue */
++		}
++	}
++	if (recognized) {
++		ru_ep0_send_status(state);
++	} else {
++		ru_ep0_stall(wlen == 0u, state);
++	}
++}
++
++static struct ru_qmu_gpd *ru_rx_gpd(void)
++{
++	return (struct ru_qmu_gpd *)(ru.dma + RU_GPD_RX_OFF);
++}
++
++static uint32_t ru_gpd_upper(uint64_t buffer, uint64_t next)
++{
++	uint32_t b = (uint32_t)((buffer >> 32) & 0xfu);
++	uint32_t n = (uint32_t)((next >> 32) & 0xfu);
++	return ru.rx_gen2 ? ((b << 24) | (n << 28)) : ((b << 16) | (n << 20));
++}
++
++static int ru_qmu_stop(uint32_t csr_off)
++{
++	if (!(ru_rd(ru.mac, csr_off) & RU_QMU_Q_ACTIVE)) return 1;
++	ru_wr(ru.mac, csr_off, RU_QMU_Q_STOP);
++	for (unsigned i = 0; i < 20000u; i++) {
++		if (!(ru_rd(ru.mac, csr_off) & RU_QMU_Q_ACTIVE)) return 1;
++		ru_delay_us(1);
++	}
++	return 0;
++}
++
++static void ru_qmu_set_start(uint32_t sar_off, uint32_t hiar_off, uint64_t gpd_pa)
++{
++	uint32_t hi = ru_rd(ru.mac, hiar_off);
++	ru_wr(ru.mac, sar_off, (uint32_t)gpd_pa);
++	ru_wr(ru.mac, hiar_off, (hi & ~0xfu) | (uint32_t)((gpd_pa >> 32) & 0xfu));
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int ru_rx_arm(void)
++{
++	struct ru_qmu_gpd *gpd = ru_rx_gpd();
++	uint64_t gpd_pa = ru.dma_pa + RU_GPD_RX_OFF;
++	uint64_t next_pa = gpd_pa + sizeof(*gpd);
++	uint64_t buffer_pa = ru.dma_pa + RU_RX_BUFFER_OFF;
++	if (!ru_qmu_stop(RU_RXQCSR1)) return 0;
++	bzero(gpd, 2u * sizeof(*gpd));
++	gpd[0].next_gpd = (uint32_t)next_pa;
++	gpd[0].buffer = (uint32_t)buffer_pa;
++	gpd[0].dw3_info = ru_gpd_upper(buffer_pa, next_pa);
++	gpd[1].next_gpd = (uint32_t)gpd_pa;
++	ru_dma_sync(RU_RX_BUFFER_OFF, RU_RX_CAPACITY);
++	ru_dma_clean(RU_GPD_RX_OFF, 2u * sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++	gpd[0].dw0_info = (ru.rx_gen2 ? (RU_RX_CAPACITY << 12) : (RU_RX_CAPACITY << 16)) |
++	    RU_QMU_GPD_IOC | RU_QMU_GPD_HWO;
++	ru_dma_clean(RU_GPD_RX_OFF, sizeof(*gpd));
++	ru_qmu_set_start(RU_RXQSAR1, RU_RXQHIAR1, gpd_pa);
++	ru_wr(ru.mac, RU_RX1CSR0, (ru_rd(ru.mac, RU_RX1CSR0) & ~0x7ffu) |
++	    RU_RX_DMAREQEN | RU_BULK_MPS);
++	__asm__ volatile("dsb sy" ::: "memory");
++	ru_wr(ru.mac, RU_RXQCSR1, RU_QMU_Q_START);
++	__asm__ volatile("dsb sy" ::: "memory");
++	ru.rx_active = 1;
++	return 1;
++}
++
++/* Host USBMUX packets are accepted and drained here. The response path to
++ * lockdownd is deliberately not faked; a later patch must implement it. */
++static void ru_rx_poll(void)
++{
++	struct ru_qmu_gpd *gpd = ru_rx_gpd();
++	uint32_t actual_len_mask = ru.rx_gen2 ? 0xfffffu : 0xffffu;
++	uint32_t len;
++	if (!ru.rx_active) return;
++	ru_dma_sync(RU_GPD_RX_OFF, 2u * sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (gpd[0].dw0_info & RU_QMU_GPD_HWO) return;
++	if (!ru_qmu_stop(RU_RXQCSR1)) {
++		ru.rx_errors++;
++		ru.rx_active = 0;
++		printf("ROSEMARY USB: RX QMU stop timed out\n");
++		return;
++	}
++	len = gpd[0].dw3_info & actual_len_mask;
++	if (len > RU_RX_CAPACITY) {
++		ru.rx_errors++;
++		len = RU_RX_CAPACITY;
++	}
++	ru_dma_sync(RU_RX_BUFFER_OFF, RU_RX_CAPACITY);
++	ru.rx_packets++;
++	if (ru.rx_packets <= 4u) {
++		printf("ROSEMARY USB: usbmux OUT packet %u bytes (received; service bridge pending)\n", len);
++	}
++	if (!ru_rx_arm()) {
++		ru.rx_errors++;
++		ru.rx_active = 0;
++		printf("ROSEMARY USB: RX QMU re-arm failed\n");
++	}
++}
++
++static int ru_qmu_init(void)
++{
++	uint32_t tx_cap = ru_rd(ru.mac, RU_CAP_EPNTXFFSZ);
++	uint32_t rx_cap = ru_rd(ru.mac, RU_CAP_EPNRXFFSZ);
++	uint32_t ep_info = ru_rd(ru.mac, RU_CAP_EPINFO);
++	uint32_t dev_cap = ru_rd(ru.ippc, RU_IPPC_DEV_CAP) & 0xffu;
++	uint32_t tx_fifo_addr = 0, rx_fifo_addr = 0;
++	uint32_t slot = dev_cap ? 2u : 1u;
++
++	ru.rx_hardware_version = (ru_rd(ru.ippc, RU_IPPC_TRUNK) >> 16) & 0xffffu;
++	ru.rx_gen2 = ru.rx_hardware_version >= 0x1003u;
++	if (((ep_info >> 8) & 0x1fu) < 1u || (ep_info & 0x1fu) < 1u ||
++	    tx_cap < RU_BULK_MPS || rx_cap < RU_BULK_MPS) {
++		printf("ROSEMARY USB: MTU3 has no usable EP1 TX/RX FIFO (EPINFO=%#x TX=%u RX=%u)\n",
++		    ep_info, tx_cap, rx_cap);
++		return 0;
++	}
++	if (!dev_cap) {
++		uint32_t half_units = (tx_cap / RU_BULK_MPS) >> 1;
++		if (!half_units) return 0;
++		tx_fifo_addr = 64u;
++		rx_fifo_addr = 64u + half_units * RU_BULK_MPS;
++	}
++	ru_wr(ru.mac, RU_TX1CSR0, 0); ru_wr(ru.mac, RU_TX1CSR1, 0); ru_wr(ru.mac, RU_TX1CSR2, 0);
++	ru_wr(ru.mac, RU_RX1CSR0, 0); ru_wr(ru.mac, RU_RX1CSR1, 0); ru_wr(ru.mac, RU_RX1CSR2, 0);
++	ru_wr(ru.mac, RU_TX1CSR1, slot << 8);
++	ru_wr(ru.mac, RU_RX1CSR1, slot << 8);
++	ru_wr(ru.mac, RU_TX1CSR2, ((tx_fifo_addr >> 4) & 0x1fffu) | (9u << 16));
++	ru_wr(ru.mac, RU_RX1CSR2, ((rx_fifo_addr >> 4) & 0x1fffu) | (9u << 16));
++	ru_wr(ru.mac, RU_TX1CSR0, RU_TX_DMAREQEN | RU_BULK_MPS);
++	ru_wr(ru.mac, RU_RX1CSR0, RU_RX_DMAREQEN | RU_BULK_MPS);
++	__asm__ volatile("dsb sy" ::: "memory");
++	ru.rx_active = 0;
++	if (!ru_rx_arm()) {
++		ru.rx_active = 0;
++		printf("ROSEMARY USB: RX QMU initial arm failed\n");
++		return 0;
++	}
++	printf("ROSEMARY USB: USBMUX endpoints active; OUT=01 IN=81 MPS=%u\n", RU_BULK_MPS);
++	return 1;
++}
++
++static void ru_qmu_shutdown(void)
++{
++	int tx_stopped = ru_qmu_stop(RU_TXQCSR1);
++	int rx_stopped = ru_qmu_stop(RU_RXQCSR1);
++	if (!tx_stopped || !rx_stopped) {
++		printf("ROSEMARY USB: QMU stop timeout; leave endpoint registers intact\n");
++		ru.rx_active = 0;
++		return;
++	}
++	ru.rx_active = 0;
++	ru_wr(ru.mac, RU_TX1CSR0, 0); ru_wr(ru.mac, RU_TX1CSR1, 0); ru_wr(ru.mac, RU_TX1CSR2, 0);
++	ru_wr(ru.mac, RU_RX1CSR0, 0); ru_wr(ru.mac, RU_RX1CSR1, 0); ru_wr(ru.mac, RU_RX1CSR2, 0);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void ru_controller_init(void)
++{
++	uint32_t tmp, csr;
++
++	/* These same reset/PHY settings passed the standalone Stage 20 hardware test. */
++	ru_wr(ru.mac, RU_POWER_MGMT, ru_rd(ru.mac, RU_POWER_MGMT) & ~RU_MAC_SOFT_CONN);
++	tmp = ru_rd(ru.ippc, RU_IPPC_IP_PDN) | RU_BIT(0);
++	ru_wr(ru.ippc, RU_IPPC_IP_PDN, tmp);
++	ru_delay_us(2);
++	ru_wr(ru.ippc, RU_IPPC_IP_PDN, ru_rd(ru.ippc, RU_IPPC_IP_PDN) & ~RU_BIT(0));
++	ru_delay_us(10);
++	ru_wr(ru.ippc, RU_IPPC_DEV_PDN, ru_rd(ru.ippc, RU_IPPC_DEV_PDN) & ~RU_BIT(0));
++	ru_delay_us(100);
++	tmp = ru_rd(ru.ippc, RU_IPPC_U2_PORT) & ~RU_U2_PORT_TEST_MASK;
++	ru_wr(ru.ippc, RU_IPPC_U2_PORT, tmp);
++	ru_delay_us(1000);
++	(void)ru_u2_phy_init();
++	tmp = ru_rd(ru.ippc, RU_IPPC_U2_PORT) & ~RU_U2_PORT_OTG_SEL;
++	ru_wr(ru.ippc, RU_IPPC_U2_PORT, tmp);
++	ru_wr(ru.mac, RU_MISC_CTRL, ru_rd(ru.mac, RU_MISC_CTRL) | RU_MAC_FRC_VBUS_BITS);
++	tmp = ru_rd(ru.mac, RU_POWER_MGMT) | RU_MAC_HS_ENABLE | RU_MAC_SUSPENDM_ENABLE | RU_MAC_LPM_HRWE;
++	tmp &= ~RU_MAC_SOFT_CONN;
++	ru_wr(ru.mac, RU_POWER_MGMT, tmp);
++	ru_wr(ru.mac, 0x0800u, 0);
++	ru_wr(ru.mac, RU_LINK_RESET, ru_rd(ru.mac, RU_LINK_RESET) & ~(0x0fu << 16));
++	ru_wr(ru.mac, RU_USB2_EPCTL_LPM, 1u);
++	ru_wr(ru.mac, RU_USB2_EPCTL_LPM_FC, 0u);
++	csr = ru_rd(ru.mac, RU_EP0CSR);
++	csr &= ~(RU_EP0_MAXPKTSZ_MASK | RU_EP0_RXPKTRDY | RU_EP0_SETUPPKTRDY | RU_EP0_SENTSTALL);
++	ru_wr(ru.mac, RU_EP0CSR, csr | 64u);
++	ru_wr(ru.mac, RU_EPISR, 0xffffffffu);
++	ru_wr(ru.mac, RU_USB2_COMMON_INTR, RU_USB_RESET_INTR);
++	/* Attach only after descriptors and EP0 handling are ready. */
++	ru_wr(ru.mac, RU_POWER_MGMT, ru_rd(ru.mac, RU_POWER_MGMT) | RU_MAC_SOFT_CONN | RU_MAC_SUSPENDM_ENABLE);
++	printf("ROSEMARY USB: attached as Apple iPhone (05ac:12a8), synthetic UDID 00008110-AABBCCDDEEFF1234\n");
++}
++
++static void ru_usb_thread(void *arg, wait_result_t result)
++{
++	enum ru_ep0_state state = RU_EP0_SETUP;
++	uint8_t remote_wakeup = 0;
++	(void)arg;
++	(void)result;
++
++	ru_controller_init();
++	for (;;) {
++		uint32_t common = ru_rd(ru.mac, RU_USB2_COMMON_INTR);
++		uint32_t ep0 = ru_rd(ru.mac, RU_EP0CSR);
++		uint32_t count;
++		uint8_t raw[8];
++
++		if (common & RU_USB_RESET_INTR) {
++			ru_wr(ru.mac, RU_USB2_COMMON_INTR, RU_USB_RESET_INTR);
++			if (ru.configuration != 0u || ru.seen_configuration != 0u) {
++				ru_qmu_shutdown();
++			}
++			ru.configuration = 0;
++			ru.seen_configuration = 0;
++			remote_wakeup = 0;
++			ru_wr(ru.mac, RU_DEVICE_CTRL, ru_rd(ru.mac, RU_DEVICE_CTRL) & ~RU_DEVICE_ADDR_MASK);
++			uint32_t csr = ru_rd(ru.mac, RU_EP0CSR) &
++			    ~(RU_EP0_MAXPKTSZ_MASK | RU_EP0_RXPKTRDY | RU_EP0_SETUPPKTRDY | RU_EP0_SENTSTALL | RU_EP0_SENDSTALL);
++			ru_wr(ru.mac, RU_EP0CSR, csr | 64u);
++			state = RU_EP0_SETUP;
++			continue; /* re-read EP0 after bus reset */
++		}
++
++		if (ru.configuration != ru.seen_configuration) {
++			if (ru.configuration != 0u) {
++				if (!ru_qmu_init()) {
++					printf("ROSEMARY USB: QMU endpoint startup failed\n");
++				}
++			} else if (ru.rx_active) {
++				ru_qmu_shutdown();
++			}
++			ru.seen_configuration = ru.configuration;
++		}
++		ru_rx_poll();
++
++		/* Handle SETUP before completing any previous EP0 IN transfer. */
++		if (ep0 & RU_EP0_SETUPPKTRDY) {
++			count = ru_rd(ru.mac, RU_RXCOUNT0) & 0xffffu;
++			if (count == 8u) {
++				ru_fifo_read(raw, sizeof(raw));
++				ru_handle_setup(raw, &state, &remote_wakeup);
++			} else {
++				uint8_t discard[64];
++				ru_fifo_read(discard, MIN(count, (uint32_t)sizeof(discard)));
++				ru_ep0_stall(0, &state);
++			}
++			continue;
++		}
++		if (state == RU_EP0_TX_END && !(ep0 & RU_EP0_TXPKTRDY) && !(ep0 & RU_EP0_FIFOFULL)) {
++			uint32_t csr = ru_rd(ru.mac, RU_EP0CSR) & RU_EP0_W1C_BITS;
++			ru_wr(ru.mac, RU_EP0CSR, csr | RU_EP0_DATAEND);
++			state = RU_EP0_SETUP;
++			continue;
++		}
++		ru_sleep_ms(RU_USB_POLL_MS);
++	}
++}
++
++void rosemary_usb_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	ppnum_t pn;
++	PE_parse_boot_argn("rosemaryusb", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("ROSEMARY USB: disabled (pass rosemaryusb=1 to enable)\n");
++		return;
++	}
++	ru.mac = ml_io_map(RU_MAC_PA, RU_MAC_SIZE);
++	ru.ippc = ml_io_map(RU_IPPC_PA, RU_IPPC_SIZE);
++	ru.u2 = ml_io_map(RU_U2_PA, RU_U2_SIZE);
++	if (!ru.mac || !ru.ippc || !ru.u2) {
++		printf("ROSEMARY USB: MTU3/IPPc/U2 PHY mapping failed\n");
++		return;
++	}
++	if (kmem_alloc_contig(kernel_map, &ru.dma, RU_DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("ROSEMARY USB: no contiguous QMU DMA memory\n");
++		return;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)ru.dma);
++	if (!pn) {
++		printf("ROSEMARY USB: QMU DMA address lookup failed\n");
++		return;
++	}
++	ru.dma_pa = ptoa_64(pn);
++	if ((ru.dma_pa + RU_DMA_SIZE - 1u) >> 36) {
++		printf("ROSEMARY USB: QMU DMA memory above 36-bit MTU3 address range (%llx)\n", ru.dma_pa);
++		return;
++	}
++	printf("ROSEMARY USB: starting MTU3 EP0/USBMUX enumerator, DMA=%llx\n", ru.dma_pa);
++	if (kernel_thread_start(ru_usb_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("ROSEMARY USB: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET && ROSEMARY */
