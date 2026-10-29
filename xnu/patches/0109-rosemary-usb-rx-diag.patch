@@ -1,0 +1,27 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -1382,6 +1382,23 @@ static void ru_rx_poll(void)
+ 	ru_dma_sync(RU_RX_BUFFER_OFF, RU_RX_CAPACITY);
+ 	ru.rx_packets++;
+ 	/* Preserve the completed data, then re-arm OUT before parsing/stack input. */
+ 	if (len != 0u) bcopy((const void *)(ru.dma + RU_RX_BUFFER_OFF), ru.rx_packet_copy, len);
++	/* Temporary diagnostic: show what the RX QMU actually completed before
++	 * re-arming the descriptor. No protocol or networking behavior is changed. */
++	if (ru.rx_packets <= 12u) {
++		const uint8_t *p = ru.rx_packet_copy;
++		if (len >= 16u) {
++			printf("ROSEMARY USB: RX QMU #%u len=%u dw0=%08x dw3=%08x raw16="
++			    "%02x %02x %02x %02x %02x %02x %02x %02x "
++			    "%02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    ru.rx_packets, len, gpd[0].dw0_info, gpd[0].dw3_info,
++			    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
++			    p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
++		} else {
++			printf("ROSEMARY USB: RX QMU #%u len=%u dw0=%08x dw3=%08x (short)\n",
++			    ru.rx_packets, len, gpd[0].dw0_info, gpd[0].dw3_info);
++		}
++	}
+ 	if (!ru_rx_arm()) {
+ 		ru.rx_errors++;
+ 		ru.rx_active = 0;
