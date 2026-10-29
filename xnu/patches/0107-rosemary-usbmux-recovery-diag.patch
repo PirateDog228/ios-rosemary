@@ -1,0 +1,61 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -1075,4 +1075,5 @@ static void ru_tx_poll(void)
+ {
++	static uint32_t stuck_polls;
+ 	struct ru_qmu_gpd *gpd = ru_tx_gpd();
+ 	if (!ru.tx_lock) return;
+ 	lck_mtx_lock(ru.tx_lock);
+@@ -1087,9 +1088,16 @@ static void ru_tx_poll(void)
+ 	ru_dma_sync(RU_GPD_TX_OFF, 2u * sizeof(*gpd));
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	if (gpd[0].dw0_info & RU_QMU_GPD_HWO) {
++		if (++stuck_polls >= 1000u) {
++			printf("ROSEMARY USB: TX still HWO dw0=%08x qcsr=%08x txcsr=%08x\n",
++			    gpd[0].dw0_info, ru_rd(ru.mac, RU_TXQCSR1),
++			    ru_rd(ru.mac, RU_TX1CSR0));
++			stuck_polls = 0;
++		}
+ 		lck_mtx_unlock(ru.tx_lock);
+ 		return;
+ 	}
++	stuck_polls = 0;
+ 	if (!ru_qmu_stop(RU_TXQCSR1)) {
+ 		ru.tx_errors++;
+ 		printf("ROSEMARY USB: TX QMU completion stop timed out\n");
+@@ -1154,6 +1162,34 @@ static void ru_mux_rx_packet(const uint8_t *packet, uint32_t len)
+ 		return;
+ 	}
+ 
++	/* QMU can occasionally miss the first short OUT transfer after VERSION.
++	 * usbmuxd normally sends v2 SETUP (tx_seq 0) before opening Lockdown, so
++	 * recover only if the next observed frame is a valid SYN to port 62078.
++	 * This is a guarded diagnostic recovery path, not a replacement for fixing
++	 * the underlying OUT-queue handoff. */
++	if (ru.mux_state == RU_MUX_WAIT_SETUP &&
++	    frame.protocol == RUMUX_PROTO_TCP &&
++	    frame.payload_len >= sizeof(struct tcphdr)) {
++		struct tcphdr first_tcp;
++		uint32_t first_tcp_hlen = (uint32_t)((frame.payload[12] >> 4) & 0x0fu) * 4u;
++		bcopy(frame.payload, &first_tcp, sizeof(first_tcp));
++		if ((first_tcp.th_flags & TH_SYN) != 0u &&
++		    (first_tcp.th_flags & (TH_ACK | TH_RST)) == 0u &&
++		    ntohs(first_tcp.th_dport) == 62078u &&
++		    first_tcp_hlen >= sizeof(struct tcphdr) &&
++		    first_tcp_hlen <= frame.payload_len) {
++			lck_mtx_lock(ru.tx_lock);
++			ru.mux_rx_seq = frame.tx_seq;
++			ru.mux_tx_seq = 0u;
++			ru.mux_state = RU_MUX_ACTIVE;
++			lck_mtx_unlock(ru.tx_lock);
++			printf("ROSEMARY USB: USBMUX SETUP not observed; resync on Lockdown SYN %u->%u muxseq=%u\n",
++			    ntohs(first_tcp.th_sport), ntohs(first_tcp.th_dport), frame.tx_seq);
++			(void)ru_mux_tcp_input(frame.payload, frame.payload_len);
++			return;
++		}
++	}
++
+ 	if (ru.mux_state == RU_MUX_WAIT_SETUP) {
+ 		if (frame.protocol != RUMUX_PROTO_SETUP || frame.payload_len != 1u || frame.payload[0] != 0x07u) {
+ 			printf("ROSEMARY USB: expected USBMUX v2 SETUP/07, got proto=%u payload=%u\n",
