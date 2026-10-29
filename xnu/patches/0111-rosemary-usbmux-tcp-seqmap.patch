@@ -1,0 +1,234 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 6354f9b..b5ad5c9 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -195,6 +195,7 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ #define RU_MUX_TXQ_DEPTH          8u
+ #define RU_MUX_RX_ACCUM_MAX       65536u
+ #define RU_MUX_TX_FRAME_MAX       2048u
++#define RU_MUX_TCP_MAP_DEPTH      16u
+ #if (RU_RX_BUFFER_OFF + RU_RX_RING_DEPTH * RU_RX_CAPACITY) > RU_TX_BUFFER_OFF
+ #error "Rosemary USB RX DMA ring overlaps TX DMA buffer"
+ #endif
+@@ -242,6 +243,13 @@ static struct {
+ 	uint32_t mux_rx_accum_len;
+ 	uint8_t mux_rx_accum[RU_MUX_RX_ACCUM_MAX];
+ 	uint8_t rx_packet_copy[RU_RX_RING_DEPTH][RU_RX_CAPACITY];
++	struct {
++		uint16_t local_port;  /* TCP port on rmx0 / XNU */
++		uint16_t peer_port;   /* usbmuxd's synthetic client port */
++		uint32_t server_isn;  /* XNU sequence space base */
++		uint8_t valid;
++	} mux_tcp_map[RU_MUX_TCP_MAP_DEPTH];
++	uint32_t mux_tcp_map_next;
+ 	struct {
+ 		uint16_t len;
+ 		uint8_t data[RU_MUX_TX_FRAME_MAX];
+@@ -837,6 +845,72 @@ static uint16_t ru_checksum_finish(uint32_t sum)
+ 	return (uint16_t)~sum;
+ }
+ 
++/* usbmuxd implements a small TCP-like state machine with zero-based counters:
++ * after a SYN-ACK it sends ACK=1 rather than acknowledging XNU's randomized
++ * server ISN. Normalize the server sequence space and translate peer ACKs back
++ * to XNU's real sequence space per TCP tuple. tx_lock is held by *_locked helpers. */
++static int ru_mux_tcp_map_find_locked(uint16_t local_port, uint16_t peer_port)
++{
++	for (uint32_t i = 0; i < RU_MUX_TCP_MAP_DEPTH; i++) {
++		if (ru.mux_tcp_map[i].valid &&
++		    ru.mux_tcp_map[i].local_port == local_port &&
++		    ru.mux_tcp_map[i].peer_port == peer_port) return (int)i;
++	}
++	return -1;
++}
++
++static void ru_mux_tcp_map_set_locked(uint16_t local_port, uint16_t peer_port,
++    uint32_t server_isn)
++{
++	int idx = ru_mux_tcp_map_find_locked(local_port, peer_port);
++	if (idx < 0) {
++		for (uint32_t i = 0; i < RU_MUX_TCP_MAP_DEPTH; i++) {
++			if (!ru.mux_tcp_map[i].valid) { idx = (int)i; break; }
++		}
++	}
++	if (idx < 0) {
++		idx = (int)(ru.mux_tcp_map_next++ % RU_MUX_TCP_MAP_DEPTH);
++	}
++	ru.mux_tcp_map[idx].valid = 0;
++	ru.mux_tcp_map[idx].local_port = local_port;
++	ru.mux_tcp_map[idx].peer_port = peer_port;
++	ru.mux_tcp_map[idx].server_isn = server_isn;
++	ru.mux_tcp_map[idx].valid = 1;
++	printf("ROSEMARY USB: TCP SEQMAP learn local=%u peer=%u server_isn=%u\n",
++	    local_port, peer_port, server_isn);
++}
++
++static void ru_mux_tcp_map_clear_locked(uint16_t local_port, uint16_t peer_port)
++{
++	int idx = ru_mux_tcp_map_find_locked(local_port, peer_port);
++	if (idx >= 0) ru.mux_tcp_map[idx].valid = 0;
++}
++
++static uint32_t ru_mux_tcp_map_get(uint16_t local_port, uint16_t peer_port,
++    int *found)
++{
++	uint32_t server_isn = 0;
++	int idx = -1;
++	*found = 0;
++	if (ru.tx_lock == NULL) return 0;
++	lck_mtx_lock(ru.tx_lock);
++	idx = ru_mux_tcp_map_find_locked(local_port, peer_port);
++	if (idx >= 0) {
++		server_isn = ru.mux_tcp_map[idx].server_isn;
++		*found = 1;
++	}
++	lck_mtx_unlock(ru.tx_lock);
++	return server_isn;
++}
++
++static void ru_mux_tcp_map_clear(uint16_t local_port, uint16_t peer_port)
++{
++	if (ru.tx_lock == NULL) return;
++	lck_mtx_lock(ru.tx_lock);
++	ru_mux_tcp_map_clear_locked(local_port, peer_port);
++	lck_mtx_unlock(ru.tx_lock);
++}
++
+ /* Answer the synthetic peer's ARP query from this private interface. XNU 8796
+  * does not expose a static-neighbor ioctl, so use normal ARP input instead. */
+ static int ru_mux_arp_reply(mbuf_t request, size_t frame_len)
+@@ -905,6 +979,9 @@ static int ru_mux_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ 	size_t full_len;
+ 	uint32_t sum;
+ 	uint16_t tcp_sum;
++	uint16_t local_port, peer_port;
++	uint32_t server_isn, wire_ack, translated_ack;
++	int map_found;
+ 
+ 	if (!segment || tcp_len < sizeof(struct tcphdr) || ru.mux_ifp == NULL) return 0;
+ 	tcp_hlen = (size_t)((segment[12] >> 4) & 0x0fu) * 4u;
+@@ -912,10 +989,28 @@ static int ru_mux_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ 		printf("ROSEMARY USB: invalid TCP header len=%lu segment=%u\n", (unsigned long)tcp_hlen, tcp_len);
+ 		return 0;
+ 	}
++	bcopy(segment, &th, sizeof(th));
++	local_port = ntohs(th.th_dport);
++	peer_port = ntohs(th.th_sport);
+ 	bcopy(segment, tcp_header, tcp_hlen);
+ 	tcp_header[16] = 0;
+ 	tcp_header[17] = 0;
+ 
++	/* ACKs from usbmuxd are in its synthetic sequence space. Translate them
++	 * into the real XNU sequence space before recomputing the TCP checksum. */
++	if ((th.th_flags & TH_ACK) != 0u) {
++		server_isn = ru_mux_tcp_map_get(local_port, peer_port, &map_found);
++		if (map_found) {
++			uint32_t net_ack;
++			wire_ack = ntohl(th.th_ack);
++			translated_ack = wire_ack + server_isn;
++			net_ack = htonl(translated_ack);
++			bcopy(&net_ack, tcp_header + 8, sizeof(net_ack));
++			printf("ROSEMARY USB: TCP SEQMAP IN %u->%u ack=%u->%u isn=%u\n",
++			    peer_port, local_port, wire_ack, translated_ack, server_isn);
++		}
++	}
++
+ 	bzero(&ip, sizeof(ip));
+ 	ip.ip_v = IPVERSION;
+ 	ip.ip_hl = sizeof(ip) / 4u;
+@@ -971,8 +1066,12 @@ static int ru_mux_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ 	stats.packets_in = 1;
+ 	stats.bytes_in = full_len;
+ 	ifnet_input(ru.mux_ifp, m, &stats);
++	if ((th.th_flags & TH_RST) != 0u) {
++		ru_mux_tcp_map_clear(local_port, peer_port);
++	}
+ 
+-	bcopy(segment, &th, sizeof(th));
++	/* Log the packet as injected into XNU (including its translated ACK). */
++	bcopy(tcp_header, &th, sizeof(th));
+ 	ru.mux_tcp_in_count++;
+ 	if (ru.mux_tcp_in_count <= 16u) {
+ 		printf("ROSEMARY USB: TCP IN #%u %u->%u flags=%02x seq=%u ack=%u bytes=%u\n",
+@@ -989,6 +1088,11 @@ static int ru_mux_tx_tcp_mbuf(mbuf_t m, size_t offset, uint32_t tcp_len)
+ 	uint32_t total_len;
+ 	struct tcphdr th;
+ 	uint8_t *out;
++	uint8_t pseudo[12];
++	uint8_t *tcp_segment;
++	uint16_t local_port, peer_port, tcp_sum;
++	uint32_t server_isn, original_seq, translated_seq, sum;
++	int map_idx;
+ 	if (!m || !ru.tx_lock || tcp_len < sizeof(struct tcphdr)) return 0;
+ 	lck_mtx_lock(ru.tx_lock);
+ 	if (ru.mux_state != RU_MUX_ACTIVE || ru.mux_version == 0u ||
+@@ -1014,11 +1118,58 @@ static int ru_mux_tx_tcp_mbuf(mbuf_t m, size_t offset, uint32_t tcp_len)
+ 		rosemary_usbmux_put_be16(out + 12, ru.mux_tx_seq++);
+ 		rosemary_usbmux_put_be16(out + 14, ru.mux_rx_seq);
+ 	}
+-	mbuf_copydata(m, offset, tcp_len, out + header_len);
++	if (mbuf_copydata(m, offset, tcp_len, out + header_len) != 0) {
++		ru.tx_errors++;
++		lck_mtx_unlock(ru.tx_lock);
++		return 0;
++	}
++	tcp_segment = out + header_len;
++	bcopy(tcp_segment, &th, sizeof(th));
++	local_port = ntohs(th.th_sport);
++	peer_port = ntohs(th.th_dport);
++
++	/* Learn XNU's randomized ISN at SYN-ACK time. The usbmuxd TCP shim
++	 * expects the device-side SYN-ACK sequence to be zero and sends ACK=1. */
++	if ((th.th_flags & (TH_SYN | TH_ACK)) == (TH_SYN | TH_ACK)) {
++		ru_mux_tcp_map_set_locked(local_port, peer_port, ntohl(th.th_seq));
++	}
++	map_idx = ru_mux_tcp_map_find_locked(local_port, peer_port);
++	if (map_idx >= 0) {
++		server_isn = ru.mux_tcp_map[map_idx].server_isn;
++		original_seq = ntohl(th.th_seq);
++		translated_seq = original_seq - server_isn;
++		th.th_seq = htonl(translated_seq);
++		bcopy(&th.th_seq, tcp_segment + 4, sizeof(th.th_seq));
++
++		/* Recompute checksum after changing TCP sequence space. */
++		tcp_segment[16] = 0;
++		tcp_segment[17] = 0;
++		{
++			uint32_t src_ip = htonl(RU_MUX_DEVICE_IP);
++			uint32_t dst_ip = htonl(RU_MUX_HOST_IP);
++			bcopy(&src_ip, pseudo, 4);
++			bcopy(&dst_ip, pseudo + 4, 4);
++		}
++		pseudo[8] = 0;
++		pseudo[9] = IPPROTO_TCP;
++		pseudo[10] = (uint8_t)(tcp_len >> 8);
++		pseudo[11] = (uint8_t)tcp_len;
++		sum = ru_checksum_add(0, pseudo, sizeof(pseudo));
++		sum = ru_checksum_add(sum, tcp_segment, tcp_len);
++		tcp_sum = ru_checksum_finish(sum);
++		tcp_segment[16] = (uint8_t)(tcp_sum >> 8);
++		tcp_segment[17] = (uint8_t)tcp_sum;
++		printf("ROSEMARY USB: TCP SEQMAP OUT %u->%u seq=%u->%u isn=%u flags=%02x\n",
++		    local_port, peer_port, original_seq, translated_seq, server_isn, th.th_flags);
++		if ((th.th_flags & TH_RST) != 0u) {
++			ru_mux_tcp_map_clear_locked(local_port, peer_port);
++		}
++	}
++	/* Reflect the rewritten segment in the ordinary TCP trace. */
++	bcopy(tcp_segment, &th, sizeof(th));
+ 	ru.txq[idx].len = (uint16_t)total_len;
+ 	ru.txq_count++;
+ 	ru.mux_tcp_out_count++;
+-	bcopy(out + header_len, &th, sizeof(th));
+ 	if (ru.mux_tcp_out_count <= 16u) {
+ 		printf("ROSEMARY USB: TCP OUT #%u %u->%u flags=%02x seq=%u ack=%u bytes=%u\n",
+ 		    ru.mux_tcp_out_count, ntohs(th.th_sport), ntohs(th.th_dport), th.th_flags,
+@@ -1172,6 +1323,8 @@ static void ru_tx_reset_mux(void)
+ 	ru.mux_tx_seq = 0;
+ 	ru.mux_rx_seq = 0xffffu;
+ 	ru.mux_rx_accum_len = 0;
++	bzero(ru.mux_tcp_map, sizeof(ru.mux_tcp_map));
++	ru.mux_tcp_map_next = 0;
+ 	lck_mtx_unlock(ru.tx_lock);
+ }
+ 
