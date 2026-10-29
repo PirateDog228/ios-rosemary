@@ -1,0 +1,234 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 8ac8f76..6354f9b 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -184,16 +184,23 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ #define RU_TX_DMAREQEN            RU_BIT(29)
+ #define RU_RX_DMAREQEN            RU_BIT(29)
+ #define RU_BULK_MPS               512u
+-#define RU_RX_CAPACITY            49152u
++#define RU_RX_CAPACITY            12288u
++#define RU_RX_RING_DEPTH          8u
+ #define RU_DMA_SIZE               0x20000u
+ #define RU_GPD_TX_OFF             0x0000u
+ #define RU_GPD_RX_OFF             0x0040u
+ #define RU_RX_BUFFER_OFF          0x1000u
+-#define RU_TX_BUFFER_OFF          0x10000u
++#define RU_TX_BUFFER_OFF          0x1a000u
+ #define RU_USB_POLL_MS            1u
+ #define RU_MUX_TXQ_DEPTH          8u
+ #define RU_MUX_RX_ACCUM_MAX       65536u
+ #define RU_MUX_TX_FRAME_MAX       2048u
++#if (RU_RX_BUFFER_OFF + RU_RX_RING_DEPTH * RU_RX_CAPACITY) > RU_TX_BUFFER_OFF
++#error "Rosemary USB RX DMA ring overlaps TX DMA buffer"
++#endif
++#if (RU_TX_BUFFER_OFF + RU_MUX_TX_FRAME_MAX) > RU_DMA_SIZE
++#error "Rosemary USB TX DMA buffer exceeds DMA allocation"
++#endif
+ #define RU_MUX_HOST_IP            0xc6120001u /* 198.18.0.1: synthetic USB peer */
+ #define RU_MUX_DEVICE_IP          0xc6120002u /* 198.18.0.2: local TCP services */
+ 
+@@ -219,6 +226,7 @@ static struct {
+ 	uint32_t configuration, seen_configuration;
+ 	uint32_t rx_packets, rx_errors;
+ 	uint32_t rx_hardware_version;
++	uint32_t rx_consumer;
+ 	int rx_gen2, rx_active;
+ 	int wait_channel;
+ 	uint32_t setups_logged, resets, speed_changes;
+@@ -233,7 +241,7 @@ static struct {
+ 	uint32_t txq_head, txq_count;
+ 	uint32_t mux_rx_accum_len;
+ 	uint8_t mux_rx_accum[RU_MUX_RX_ACCUM_MAX];
+-	uint8_t rx_packet_copy[RU_RX_CAPACITY];
++	uint8_t rx_packet_copy[RU_RX_RING_DEPTH][RU_RX_CAPACITY];
+ 	struct {
+ 		uint16_t len;
+ 		uint8_t data[RU_MUX_TX_FRAME_MAX];
+@@ -679,24 +687,56 @@ static void ru_qmu_set_start(uint32_t sar_off, uint32_t hiar_off, uint64_t gpd_p
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++static void ru_rx_rearm_slot(uint32_t slot)
++{
++	struct ru_qmu_gpd *gpd = ru_rx_gpd() + slot;
++	uint32_t next_slot = (slot + 1u) % RU_RX_RING_DEPTH;
++	uint64_t gpd_pa = ru.dma_pa + RU_GPD_RX_OFF + (uint64_t)slot * sizeof(*gpd);
++	uint64_t next_pa = ru.dma_pa + RU_GPD_RX_OFF + (uint64_t)next_slot * sizeof(*gpd);
++	uint32_t buffer_off = RU_RX_BUFFER_OFF + slot * RU_RX_CAPACITY;
++	uint64_t buffer_pa = ru.dma_pa + buffer_off;
++
++	/* The slot is owned by software (HWO=0); publish all fields before HWO. */
++	gpd->next_gpd = (uint32_t)next_pa;
++	gpd->buffer = (uint32_t)buffer_pa;
++	gpd->dw3_info = ru_gpd_upper(buffer_pa, next_pa);
++	gpd->dw0_info = (ru.rx_gen2 ? (RU_RX_CAPACITY << 12) : (RU_RX_CAPACITY << 16)) |
++	    RU_QMU_GPD_IOC;
++	ru_dma_sync(buffer_off, RU_RX_CAPACITY);
++	ru_dma_clean(RU_GPD_RX_OFF + slot * sizeof(*gpd), sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++	gpd->dw0_info |= RU_QMU_GPD_HWO;
++	ru_dma_clean(RU_GPD_RX_OFF + slot * sizeof(*gpd), sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ static int ru_rx_arm(void)
+ {
+ 	struct ru_qmu_gpd *gpd = ru_rx_gpd();
+ 	uint64_t gpd_pa = ru.dma_pa + RU_GPD_RX_OFF;
+-	uint64_t next_pa = gpd_pa + sizeof(*gpd);
+-	uint64_t buffer_pa = ru.dma_pa + RU_RX_BUFFER_OFF;
+ 	if (!ru_qmu_stop(RU_RXQCSR1)) return 0;
+-	bzero(gpd, 2u * sizeof(*gpd));
+-	gpd[0].next_gpd = (uint32_t)next_pa;
+-	gpd[0].buffer = (uint32_t)buffer_pa;
+-	gpd[0].dw3_info = ru_gpd_upper(buffer_pa, next_pa);
+-	gpd[1].next_gpd = (uint32_t)gpd_pa;
+-	ru_dma_sync(RU_RX_BUFFER_OFF, RU_RX_CAPACITY);
+-	ru_dma_clean(RU_GPD_RX_OFF, 2u * sizeof(*gpd));
++	bzero(gpd, RU_RX_RING_DEPTH * sizeof(*gpd));
++	for (uint32_t i = 0; i < RU_RX_RING_DEPTH; i++) {
++		uint32_t next_slot = (i + 1u) % RU_RX_RING_DEPTH;
++		uint64_t next_pa = ru.dma_pa + RU_GPD_RX_OFF + (uint64_t)next_slot * sizeof(*gpd);
++		uint32_t buffer_off = RU_RX_BUFFER_OFF + i * RU_RX_CAPACITY;
++		uint64_t buffer_pa = ru.dma_pa + buffer_off;
++		gpd[i].next_gpd = (uint32_t)next_pa;
++		gpd[i].buffer = (uint32_t)buffer_pa;
++		gpd[i].dw3_info = ru_gpd_upper(buffer_pa, next_pa);
++		gpd[i].dw0_info = (ru.rx_gen2 ? (RU_RX_CAPACITY << 12) : (RU_RX_CAPACITY << 16)) |
++		    RU_QMU_GPD_IOC;
++		ru_dma_sync(buffer_off, RU_RX_CAPACITY);
++	}
++	ru_dma_clean(RU_GPD_RX_OFF, RU_RX_RING_DEPTH * sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++	/* Publish all entries only after every descriptor and buffer is ready. */
++	for (uint32_t i = 0; i < RU_RX_RING_DEPTH; i++) {
++		gpd[i].dw0_info |= RU_QMU_GPD_HWO;
++	}
++	ru_dma_clean(RU_GPD_RX_OFF, RU_RX_RING_DEPTH * sizeof(*gpd));
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	gpd[0].dw0_info = (ru.rx_gen2 ? (RU_RX_CAPACITY << 12) : (RU_RX_CAPACITY << 16)) |
+-	    RU_QMU_GPD_IOC | RU_QMU_GPD_HWO;
+-	ru_dma_clean(RU_GPD_RX_OFF, sizeof(*gpd));
++	ru.rx_consumer = 0;
+ 	ru_qmu_set_start(RU_RXQSAR1, RU_RXQHIAR1, gpd_pa);
+ 	ru_wr(ru.mac, RU_RX1CSR0, (ru_rd(ru.mac, RU_RX1CSR0) & ~0x7ffu) |
+ 	    RU_RX_DMAREQEN | RU_BULK_MPS);
+@@ -1388,49 +1428,83 @@ static void ru_mux_rx_feed(const uint8_t *packet, uint32_t len)
+ }
+ 
+ 
+-/* Parse each completed USB OUT transfer before re-arming the DMA buffer. */
++/* Drain completed entries from the cyclic RX GPD ring. Each descriptor has
++ * its own DMA buffer, so the controller can receive subsequent USBMUX frames
++ * while software handles the earlier ones. */
+ static void ru_rx_poll(void)
+ {
+ 	struct ru_qmu_gpd *gpd = ru_rx_gpd();
+ 	uint32_t actual_len_mask = ru.rx_gen2 ? 0xfffffu : 0xffffu;
+-	uint32_t len;
++	uint32_t staged_slots[RU_RX_RING_DEPTH];
++	uint32_t staged_lens[RU_RX_RING_DEPTH];
++	uint32_t staged_dw0[RU_RX_RING_DEPTH];
++	uint32_t staged_dw3[RU_RX_RING_DEPTH];
++	uint32_t staged_packets[RU_RX_RING_DEPTH];
++	uint32_t staged_count = 0;
++
+ 	if (!ru.rx_active) return;
+-	ru_dma_sync(RU_GPD_RX_OFF, 2u * sizeof(*gpd));
++	ru_dma_sync(RU_GPD_RX_OFF, RU_RX_RING_DEPTH * sizeof(*gpd));
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	if (gpd[0].dw0_info & RU_QMU_GPD_HWO) return;
+-	if (!ru_qmu_stop(RU_RXQCSR1)) {
+-		ru.rx_errors++;
+-		ru.rx_active = 0;
+-		printf("ROSEMARY USB: RX QMU stop timed out\n");
+-		return;
+-	}
+-	len = gpd[0].dw3_info & actual_len_mask;
+-	if (len > RU_RX_CAPACITY) {
+-		ru.rx_errors++;
+-		len = RU_RX_CAPACITY;
+-	}
+-	ru_dma_sync(RU_RX_BUFFER_OFF, RU_RX_CAPACITY);
+-	ru.rx_packets++;
+-	/* Preserve the completed data, then re-arm OUT before parsing/stack input. */
+-	if (len != 0u) bcopy((const void *)(ru.dma + RU_RX_BUFFER_OFF), ru.rx_packet_copy, len);
+-	/* 0109 diagnostic: dump bytes actually completed by RX QMU, before parsing. */
+-	if (ru.rx_packets <= 16u) {
+-		const uint8_t *raw = ru.rx_packet_copy;
+-		uint32_t dump_len = MIN(len, 36u);
+-		printf("ROSEMARY USB: RX QMU #%u len=%u gpd0=%08x gpd3=%08x raw=",
+-		    ru.rx_packets, len, gpd[0].dw0_info, gpd[0].dw3_info);
+-		for (uint32_t i = 0; i < dump_len; i++) {
+-			printf("%s%02x", i ? " " : "", raw[i]);
++
++	/* Process completed entries in wire order, rearming each before parsing. */
++	while (staged_count < RU_RX_RING_DEPTH) {
++		uint32_t slot = ru.rx_consumer;
++		uint32_t buffer_off = RU_RX_BUFFER_OFF + slot * RU_RX_CAPACITY;
++		uint32_t len;
++		if (gpd[slot].dw0_info & RU_QMU_GPD_HWO) break;
++		staged_dw0[staged_count] = gpd[slot].dw0_info;
++		staged_dw3[staged_count] = gpd[slot].dw3_info;
++		len = gpd[slot].dw3_info & actual_len_mask;
++		if (len > RU_RX_CAPACITY) {
++			ru.rx_errors++;
++			len = RU_RX_CAPACITY;
+ 		}
+-		printf("\n");
++		ru_dma_sync(buffer_off, RU_RX_CAPACITY);
++		ru.rx_packets++;
++		staged_packets[staged_count] = ru.rx_packets;
++		staged_slots[staged_count] = slot;
++		staged_lens[staged_count] = len;
++		if (len != 0u) {
++			bcopy((const void *)(ru.dma + buffer_off), ru.rx_packet_copy[slot], len);
++		}
++		ru_rx_rearm_slot(slot);
++		ru.rx_consumer = (slot + 1u) % RU_RX_RING_DEPTH;
++		staged_count++;
+ 	}
+-	if (!ru_rx_arm()) {
+-		ru.rx_errors++;
+-		ru.rx_active = 0;
+-		printf("ROSEMARY USB: RX QMU re-arm failed\n");
+-		return;
++	if (staged_count == 0u) return;
++
++	/* The queue stops only if it ran out of HWO-owned entries. Resume at the
++	 * first software-consumer slot, but never restart over an unprocessed GPD. */
++	ru_dma_sync(RU_GPD_RX_OFF + ru.rx_consumer * sizeof(*gpd), sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (!(ru_rd(ru.mac, RU_RXQCSR1) & RU_QMU_Q_ACTIVE) &&
++	    (gpd[ru.rx_consumer].dw0_info & RU_QMU_GPD_HWO)) {
++		uint64_t next_gpd_pa = ru.dma_pa + RU_GPD_RX_OFF +
++		    (uint64_t)ru.rx_consumer * sizeof(*gpd);
++		ru_qmu_set_start(RU_RXQSAR1, RU_RXQHIAR1, next_gpd_pa);
++		ru_wr(ru.mac, RU_RX1CSR0, (ru_rd(ru.mac, RU_RX1CSR0) & ~0x7ffu) |
++		    RU_RX_DMAREQEN | RU_BULK_MPS);
++		__asm__ volatile("dsb sy" ::: "memory");
++		ru_wr(ru.mac, RU_RXQCSR1, RU_QMU_Q_START);
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++
++	/* Diagnostic output and parser/network work happen after RX is available. */
++	for (uint32_t n = 0; n < staged_count; n++) {
++		uint32_t slot = staged_slots[n];
++		uint32_t len = staged_lens[n];
++		if (staged_packets[n] <= 16u) {
++			const uint8_t *raw = ru.rx_packet_copy[slot];
++			uint32_t dump_len = MIN(len, 36u);
++			printf("ROSEMARY USB: RX QMU #%u slot=%u len=%u gpd0=%08x gpd3=%08x raw=",
++			    staged_packets[n], slot, len, staged_dw0[n], staged_dw3[n]);
++			for (uint32_t i = 0; i < dump_len; i++) {
++				printf("%s%02x", i ? " " : "", raw[i]);
++			}
++			printf("\n");
++		}
++		if (len != 0u) ru_mux_rx_feed(ru.rx_packet_copy[slot], len);
+ 	}
+-	if (len != 0u) ru_mux_rx_feed(ru.rx_packet_copy, len);
+ }
+ 
+ static int ru_qmu_init(void)
