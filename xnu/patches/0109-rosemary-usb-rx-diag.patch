@@ -1,26 +1,86 @@
 diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 50d5c35..8ac8f76 100644
 --- a/bsd/dev/rosemary_usb.c
 +++ b/bsd/dev/rosemary_usb.c
-@@ -1382,6 +1382,23 @@ static void ru_rx_poll(void)
- 	ru_dma_sync(RU_RX_BUFFER_OFF, RU_RX_CAPACITY);
+@@ -1178,12 +1178,27 @@ static void ru_mux_rx_packet(const uint8_t *packet, uint32_t len)
+ {
+ 	struct rosemary_usbmux_frame frame;
+ 	uint32_t wire_version = ru.mux_version;
++	static uint32_t rx_decode_logs;
+ 	int parsed;
+ 	/* QMU can restart after SET_CONFIGURATION while the host remains on v2.
+ 	 * The v2 magic identifies the wire header even if local state was reset. */
+ 	if (wire_version < 2u && len >= RUMUX_V2_HEADER_SIZE &&
+ 	    rosemary_usbmux_get_be32(packet + 8) == RUMUX_MAGIC_V2) wire_version = 2u;
+ 	parsed = rosemary_usbmux_parse(packet, len, wire_version, &frame);
++	/* 0109 diagnostic: distinguish bad framing from a packet rejected by parser. */
++	if (rx_decode_logs < 24u) {
++		rx_decode_logs++;
++		printf("ROSEMARY USB: RX DECODE #%u len=%u wire=%u parse=%d state=%u raw=%08x/%08x/%08x\n",
++		    rx_decode_logs, len, wire_version, parsed, ru.mux_state,
++		    len >= 4u ? rosemary_usbmux_get_be32(packet) : 0u,
++		    len >= 8u ? rosemary_usbmux_get_be32(packet + 4) : 0u,
++		    len >= 12u ? rosemary_usbmux_get_be32(packet + 8) : 0u);
++		if (parsed == 0) {
++			printf("ROSEMARY USB: RX FRAME #%u proto=%u total=%u payload=%u tx=%u rx=%u state=%u\n",
++			    rx_decode_logs, frame.protocol, len, frame.payload_len,
++			    frame.tx_seq, frame.rx_seq, ru.mux_state);
++		}
++	}
+ 
+ 	if (parsed != 0) {
+ 		if (ru.rx_packets <= 8u) {
+@@ -1301,6 +1316,8 @@ static void ru_mux_rx_packet(const uint8_t *packet, uint32_t len)
+  * even if endpoint reconfiguration reset the negotiated-version variable. */
+ static void ru_mux_rx_feed(const uint8_t *packet, uint32_t len)
+ {
++	static uint32_t rx_feed_logs;
++	uint32_t accum_before = ru.mux_rx_accum_len;
+ 	if (packet == NULL || len == 0u) return;
+ 	if (ru.mux_rx_accum_len > RU_MUX_RX_ACCUM_MAX ||
+ 	    len > RU_MUX_RX_ACCUM_MAX - ru.mux_rx_accum_len) {
+@@ -1311,6 +1328,12 @@ static void ru_mux_rx_feed(const uint8_t *packet, uint32_t len)
+ 	}
+ 	bcopy(packet, ru.mux_rx_accum + ru.mux_rx_accum_len, len);
+ 	ru.mux_rx_accum_len += len;
++	if (rx_feed_logs < 24u) {
++		rx_feed_logs++;
++		printf("ROSEMARY USB: RX FEED #%u chunk=%u accum=%u->%u version=%u state=%u\n",
++		    rx_feed_logs, len, accum_before, ru.mux_rx_accum_len,
++		    ru.mux_version, ru.mux_state);
++	}
+ 
+ 	while (ru.mux_rx_accum_len >= RUMUX_V1_HEADER_SIZE) {
+ 		const uint8_t *buf = ru.mux_rx_accum;
+@@ -1349,7 +1372,13 @@ static void ru_mux_rx_feed(const uint8_t *packet, uint32_t len)
+ 			    ru.mux_rx_accum_len);
+ 			continue;
+ 		}
+-		if (ru.mux_rx_accum_len < total) return;
++		if (ru.mux_rx_accum_len < total) {
++			if (rx_feed_logs < 24u) {
++				printf("ROSEMARY USB: RX WAIT proto=%u need=%u have=%u header=%u\n",
++				    protocol, total, ru.mux_rx_accum_len, header_len);
++			}
++			return;
++		}
+ 		ru_mux_rx_packet(buf, total);
+ 		ru.mux_rx_accum_len -= total;
+ 		if (ru.mux_rx_accum_len != 0u) {
+@@ -1384,6 +1413,17 @@ static void ru_rx_poll(void)
  	ru.rx_packets++;
  	/* Preserve the completed data, then re-arm OUT before parsing/stack input. */
  	if (len != 0u) bcopy((const void *)(ru.dma + RU_RX_BUFFER_OFF), ru.rx_packet_copy, len);
-+	/* Temporary diagnostic: show what the RX QMU actually completed before
-+	 * re-arming the descriptor. No protocol or networking behavior is changed. */
-+	if (ru.rx_packets <= 12u) {
-+		const uint8_t *p = ru.rx_packet_copy;
-+		if (len >= 16u) {
-+			printf("ROSEMARY USB: RX QMU #%u len=%u dw0=%08x dw3=%08x raw16="
-+			    "%02x %02x %02x %02x %02x %02x %02x %02x "
-+			    "%02x %02x %02x %02x %02x %02x %02x %02x\n",
-+			    ru.rx_packets, len, gpd[0].dw0_info, gpd[0].dw3_info,
-+			    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
-+			    p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
-+		} else {
-+			printf("ROSEMARY USB: RX QMU #%u len=%u dw0=%08x dw3=%08x (short)\n",
-+			    ru.rx_packets, len, gpd[0].dw0_info, gpd[0].dw3_info);
++	/* 0109 diagnostic: dump bytes actually completed by RX QMU, before parsing. */
++	if (ru.rx_packets <= 16u) {
++		const uint8_t *raw = ru.rx_packet_copy;
++		uint32_t dump_len = MIN(len, 36u);
++		printf("ROSEMARY USB: RX QMU #%u len=%u gpd0=%08x gpd3=%08x raw=",
++		    ru.rx_packets, len, gpd[0].dw0_info, gpd[0].dw3_info);
++		for (uint32_t i = 0; i < dump_len; i++) {
++			printf("%s%02x", i ? " " : "", raw[i]);
 +		}
++		printf("\n");
 +	}
  	if (!ru_rx_arm()) {
  		ru.rx_errors++;
