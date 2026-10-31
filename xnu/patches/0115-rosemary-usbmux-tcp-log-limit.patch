@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 05a273f..d23fdce 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -1075,7 +1075,7 @@ static int ru_mux_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ 	/* Log the packet as injected into XNU (including its translated ACK). */
+ 	bcopy(tcp_header, &th, sizeof(th));
+ 	ru.mux_tcp_in_count++;
+-	if (ru.mux_tcp_in_count <= 16u) {
++	if (ru.mux_tcp_in_count <= 128u) {
+ 		printf("ROSEMARY USB: TCP IN #%u %u->%u flags=%02x seq=%u ack=%u bytes=%u\n",
+ 		    ru.mux_tcp_in_count, ntohs(th.th_sport), ntohs(th.th_dport), th.th_flags,
+ 		    ntohl(th.th_seq), ntohl(th.th_ack), tcp_len - (uint32_t)tcp_hlen);
+@@ -1174,7 +1174,7 @@ static int ru_mux_tx_tcp_mbuf(mbuf_t m, size_t offset, uint32_t tcp_len)
+ 	ru.txq[idx].len = (uint16_t)total_len;
+ 	ru.txq_count++;
+ 	ru.mux_tcp_out_count++;
+-	if (ru.mux_tcp_out_count <= 16u) {
++	if (ru.mux_tcp_out_count <= 128u) {
+ 		printf("ROSEMARY USB: TCP OUT #%u %u->%u flags=%02x seq=%u ack=%u bytes=%u\n",
+ 		    ru.mux_tcp_out_count, ntohs(th.th_sport), ntohs(th.th_dport), th.th_flags,
+ 		    ntohl(th.th_seq), ntohl(th.th_ack), tcp_len - (uint32_t)(th.th_off * 4u));

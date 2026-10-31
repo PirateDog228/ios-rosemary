@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index cb2494b..05a273f 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -1508,6 +1508,27 @@ static void ru_mux_rx_packet(const uint8_t *packet, uint32_t len)
+ 	}
+ }
+ 
++/* 0114: usbmuxd can start a new mux session without any USB-level event
++ * (e.g. "systemctl restart usbmuxd" while the cable stays plugged in): the
++ * configuration is already active, so no bus reset or SET_CONFIGURATION reaches
++ * us and the old v2 state would make the new VERSION request unparsable.
++ * Reset only the protocol state here; the RX accumulator still holds the frame
++ * that triggered the reset, and an in-flight bulk-IN transfer is left alone. */
++static void ru_mux_reset_session(void)
++{
++	if (ru.tx_lock == NULL) return;
++	lck_mtx_lock(ru.tx_lock);
++	ru.txq_head = 0;
++	ru.txq_count = 0;
++	ru.mux_version = 0;
++	ru.mux_state = RU_MUX_WAIT_VERSION;
++	ru.mux_tx_seq = 0;
++	ru.mux_rx_seq = 0xffffu;
++	bzero(ru.mux_tcp_map, sizeof(ru.mux_tcp_map));
++	ru.mux_tcp_map_next = 0;
++	lck_mtx_unlock(ru.tx_lock);
++}
++
+ /* Treat bulk OUT completions as a byte stream rather than assuming each QMU
+  * completion contains one whole USBMUX frame. This also recognizes v2 magic
+  * even if endpoint reconfiguration reset the negotiated-version variable. */
+@@ -1538,6 +1559,17 @@ static void ru_mux_rx_feed(const uint8_t *packet, uint32_t len)
+ 		uint32_t total = rosemary_usbmux_get_be32(buf + 4);
+ 		uint32_t header_len;
+ 
++		/* 0114: a VERSION request (v1 header, 20 bytes, major in the word where
++		 * v2 frames carry the 0xfeedface magic) always starts a new session. */
++		if ((ru.mux_version != 0u || ru.mux_state != RU_MUX_WAIT_VERSION) &&
++		    ru.mux_rx_accum_len >= RUMUX_VERSION_FRAME_SIZE &&
++		    protocol == RUMUX_PROTO_VERSION && total == RUMUX_VERSION_FRAME_SIZE &&
++		    rosemary_usbmux_get_be32(buf + 8) != RUMUX_MAGIC_V2) {
++			printf("ROSEMARY USB: new USBMUX VERSION request in state=%u version=%u; restarting mux session\n",
++			    ru.mux_state, ru.mux_version);
++			ru_mux_reset_session();
++		}
++
+ 		if (ru.mux_version >= 2u ||
+ 		    (ru.mux_rx_accum_len >= RUMUX_V2_HEADER_SIZE &&
+ 		     rosemary_usbmux_get_be32(buf + 8) == RUMUX_MAGIC_V2)) {

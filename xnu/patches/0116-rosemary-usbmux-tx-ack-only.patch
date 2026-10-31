@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index d23fdce..b712bef 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -1169,6 +1169,33 @@ static int ru_mux_tx_tcp_mbuf(mbuf_t m, size_t offset, uint32_t tcp_len)
+ 			ru_mux_tcp_map_clear_locked(local_port, peer_port);
+ 		}
+ 	}
++	/* 0116: usbmuxd accepts only a bare ACK on an established connection. Any
++	 * other flag combination (XNU sets PSH on data segments) is logged as
++	 * "Connection reset by device" and the connection is torn down with an RST.
++	 * SYN/FIN/RST segments are left alone. */
++	if ((tcp_segment[13] & (TH_SYN | TH_FIN | TH_RST)) == 0u &&
++	    tcp_segment[13] != TH_ACK) {
++		printf("ROSEMARY USB: TCP OUT flags %02x -> %02x for usbmuxd\n",
++		    tcp_segment[13], TH_ACK);
++		tcp_segment[13] = TH_ACK;
++		tcp_segment[16] = 0;
++		tcp_segment[17] = 0;
++		{
++			uint32_t src_ip = htonl(RU_MUX_DEVICE_IP);
++			uint32_t dst_ip = htonl(RU_MUX_HOST_IP);
++			bcopy(&src_ip, pseudo, 4);
++			bcopy(&dst_ip, pseudo + 4, 4);
++		}
++		pseudo[8] = 0;
++		pseudo[9] = IPPROTO_TCP;
++		pseudo[10] = (uint8_t)(tcp_len >> 8);
++		pseudo[11] = (uint8_t)tcp_len;
++		sum = ru_checksum_add(0, pseudo, sizeof(pseudo));
++		sum = ru_checksum_add(sum, tcp_segment, tcp_len);
++		tcp_sum = ru_checksum_finish(sum);
++		tcp_segment[16] = (uint8_t)(tcp_sum >> 8);
++		tcp_segment[17] = (uint8_t)tcp_sum;
++	}
+ 	/* Reflect the rewritten segment in the ordinary TCP trace. */
+ 	bcopy(tcp_segment, &th, sizeof(th));
+ 	ru.txq[idx].len = (uint16_t)total_len;
