@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 495e072..4adfb70 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -967,6 +967,31 @@ static int ru_mux_arp_reply(mbuf_t request, size_t frame_len)
+ 	return 1;
+ }
+ 
++/* 0119: allocate ONE packet-header mbuf with a single contiguous cluster and
++ * set both lengths explicitly. mbuf_allocpacket() returns, for sizes between
++ * MHLEN and MINCLSIZE, a chain of mbufs with m_len == 0; the following
++ * mbuf_len(m) - ETHER_HDR_LEN then became -14 and ifnet_input() panicked with
++ * "Failed mbuf validity check ... len -14". */
++static mbuf_t ru_mbuf_alloc_contig(size_t len)
++{
++	mbuf_t m = NULL;
++	size_t csize;
++	if (len == 0u || len > 16384u) return NULL;
++	csize = (len <= 2048u) ? 2048u : ((len <= 4096u) ? 4096u : 16384u);
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || m == NULL) return NULL;
++	if (mbuf_getcluster(MBUF_DONTWAIT, MBUF_TYPE_DATA, csize, &m) != 0 || m == NULL) {
++		if (m != NULL) mbuf_freem(m);
++		return NULL;
++	}
++	if (mbuf_trailingspace(m) < len) {
++		mbuf_freem(m);
++		return NULL;
++	}
++	mbuf_setlen(m, len);
++	mbuf_pkthdr_setlen(m, len);
++	return m;
++}
++
+ /* MUX_PROTO_TCP carries a TCP segment without an IP header. Recreate an
+  * Ethernet/IPv4 packet and inject it into XNU's normal TCP stack. The host's
+  * usbmuxd leaves the TCP checksum unset, so calculate it against this stable
+@@ -1057,18 +1082,20 @@ static int ru_mux_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ 	bcopy(ru_mux_host_mac, eh.ether_shost, ETHER_ADDR_LEN);
+ 	eh.ether_type = htons(ETHERTYPE_IP);
+ 	full_len = ETHER_HDR_LEN + sizeof(ip) + tcp_len;
+-	if (mbuf_allocpacket(MBUF_DONTWAIT, full_len, NULL, &m) != 0 || m == NULL) {
++	m = ru_mbuf_alloc_contig(full_len);
++	if (m == NULL) {
+ 		printf("ROSEMARY USB: failed to allocate TCP input mbuf len=%lu\n", (unsigned long)full_len);
+-		if (m != NULL) mbuf_freem(m);
+ 		return 0;
+ 	}
+-	if (mbuf_copyback(m, 0, ETHER_HDR_LEN, &eh, MBUF_DONTWAIT) != 0 ||
+-	    mbuf_copyback(m, ETHER_HDR_LEN, sizeof(ip), &ip, MBUF_DONTWAIT) != 0 ||
+-	    mbuf_copyback(m, ETHER_HDR_LEN + sizeof(ip), tcp_hlen, tcp_header, MBUF_DONTWAIT) != 0 ||
+-	    (tcp_len > tcp_hlen && mbuf_copyback(m, ETHER_HDR_LEN + sizeof(ip) + tcp_hlen,
+-	        tcp_len - tcp_hlen, segment + tcp_hlen, MBUF_DONTWAIT) != 0)) {
+-		mbuf_freem(m);
+-		return 0;
++	{
++		uint8_t *pkt = (uint8_t *)mbuf_data(m);
++		bcopy(&eh, pkt, ETHER_HDR_LEN);
++		bcopy(&ip, pkt + ETHER_HDR_LEN, sizeof(ip));
++		bcopy(tcp_header, pkt + ETHER_HDR_LEN + sizeof(ip), tcp_hlen);
++		if (tcp_len > tcp_hlen) {
++			bcopy(segment + tcp_hlen, pkt + ETHER_HDR_LEN + sizeof(ip) + tcp_hlen,
++			    tcp_len - tcp_hlen);
++		}
+ 	}
+ 	{
+ 		void *frame_header = mbuf_data(m);
