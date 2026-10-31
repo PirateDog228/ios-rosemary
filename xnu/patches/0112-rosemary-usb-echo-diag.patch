@@ -1,0 +1,140 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index b5ad5c9..7a1e46c 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -26,6 +26,8 @@
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
++#include <sys/socket.h>
++#include <sys/uio.h>
+ #include <sys/sockio.h>
+ #include <net/if.h>
+ #include <net/if_types.h>
+@@ -1098,6 +1100,8 @@ static int ru_mux_tx_tcp_mbuf(mbuf_t m, size_t offset, uint32_t tcp_len)
+ 	if (ru.mux_state != RU_MUX_ACTIVE || ru.mux_version == 0u ||
+ 	    ru.txq_count >= RU_MUX_TXQ_DEPTH) {
+ 		ru.tx_errors++;
++		printf("ROSEMARY USB: TCP OUT dropped state=%u ver=%u txq=%u\n",
++		    ru.mux_state, ru.mux_version, ru.txq_count);
+ 		lck_mtx_unlock(ru.tx_lock);
+ 		return 0;
+ 	}
+@@ -1889,6 +1893,109 @@ static void ru_usb_thread(void *arg, wait_result_t result)
+ 	}
+ }
+ 
++/* 0112 diagnostic: in-kernel TCP banner/echo server on port 2222. It proves
++ * the USB <-> usbmux <-> rmx0 <-> XNU TCP path works in both directions
++ * without launchd/lockdownd. Test from the host: iproxy 2222 2222; nc 127.0.0.1 2222 */
++#define RU_ECHO_PORT 2222
++
++static void ru_echo_conn(socket_t cs)
++{
++	static const char banner[] = "ROSEMARY ECHO OK\n";
++	char buf[256];
++	struct iovec iov;
++	struct msghdr msg;
++	size_t n = 0;
++	errno_t e;
++
++	bzero(&msg, sizeof(msg));
++	iov.iov_base = (void *)(uintptr_t)banner;
++	iov.iov_len = sizeof(banner) - 1;
++	msg.msg_iov = &iov;
++	msg.msg_iovlen = 1;
++	e = sock_send(cs, &msg, 0, &n);
++	printf("ROSEMARY ECHO: banner send err=%d sent=%lu\n", e, (unsigned long)n);
++
++	for (;;) {
++		bzero(&msg, sizeof(msg));
++		iov.iov_base = buf;
++		iov.iov_len = sizeof(buf);
++		msg.msg_iov = &iov;
++		msg.msg_iovlen = 1;
++		n = 0;
++		e = sock_receive(cs, &msg, 0, &n);
++		if (e != 0 || n == 0) {
++			printf("ROSEMARY ECHO: recv end err=%d n=%lu\n", e, (unsigned long)n);
++			break;
++		}
++		printf("ROSEMARY ECHO: recv %lu bytes\n", (unsigned long)n);
++		bzero(&msg, sizeof(msg));
++		iov.iov_base = buf;
++		iov.iov_len = n;
++		msg.msg_iov = &iov;
++		msg.msg_iovlen = 1;
++		e = sock_send(cs, &msg, 0, &n);
++		printf("ROSEMARY ECHO: send err=%d sent=%lu\n", e, (unsigned long)n);
++		if (e != 0) break;
++	}
++	sock_close(cs);
++}
++
++static void ru_echo_thread(void *arg __unused, wait_result_t w __unused)
++{
++	socket_t ls = NULL;
++	struct sockaddr_in sin;
++	errno_t e;
++
++	/* Give launchd time to bring the network stack and rmx0 up. */
++	ru_sleep_ms(5000);
++
++	e = sock_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &ls);
++	if (e != 0) {
++		printf("ROSEMARY ECHO: sock_socket err=%d\n", e);
++		for (;;) ru_sleep_ms(60000); /* kernel threads must not return */
++	}
++	bzero(&sin, sizeof(sin));
++	sin.sin_len = sizeof(sin);
++	sin.sin_family = AF_INET;
++	sin.sin_port = htons(RU_ECHO_PORT);
++	sin.sin_addr.s_addr = htonl(INADDR_ANY);
++	e = sock_bind(ls, (struct sockaddr *)&sin);
++	if (e != 0) {
++		printf("ROSEMARY ECHO: bind err=%d\n", e);
++		sock_close(ls);
++		for (;;) ru_sleep_ms(60000); /* kernel threads must not return */
++	}
++	e = sock_listen(ls, 4);
++	if (e != 0) {
++		printf("ROSEMARY ECHO: listen err=%d\n", e);
++		sock_close(ls);
++		for (;;) ru_sleep_ms(60000); /* kernel threads must not return */
++	}
++	printf("ROSEMARY ECHO: listening on port %d\n", RU_ECHO_PORT);
++
++	for (;;) {
++		socket_t cs = NULL;
++		e = sock_accept(ls, NULL, 0, 0, NULL, NULL, &cs);
++		if (e != 0) {
++			printf("ROSEMARY ECHO: accept err=%d\n", e);
++			ru_sleep_ms(1000);
++			continue;
++		}
++		printf("ROSEMARY ECHO: accepted\n");
++		ru_echo_conn(cs);
++	}
++}
++
++static void ru_echo_start(void)
++{
++	thread_t th = THREAD_NULL;
++	if (kernel_thread_start(ru_echo_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		printf("ROSEMARY ECHO: kernel_thread_start failed\n");
++	}
++}
++
+ void rosemary_usb_init(void)
+ {
+ 	int enabled = 0;
+@@ -1932,6 +2039,7 @@ void rosemary_usb_init(void)
+ 		}
+ 	}
+ 	ru_mux_if_create();
++	ru_echo_start();
+ 	if (kernel_thread_start(ru_usb_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
