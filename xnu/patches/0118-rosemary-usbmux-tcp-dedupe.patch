@@ -1,0 +1,86 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index b712bef..495e072 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -249,6 +249,7 @@ static struct {
+ 		uint16_t local_port;  /* TCP port on rmx0 / XNU */
+ 		uint16_t peer_port;   /* usbmuxd's synthetic client port */
+ 		uint32_t server_isn;  /* XNU sequence space base */
++		uint32_t snd_max;     /* highest XNU-space seq (+len) already sent to the host */
+ 		uint8_t valid;
+ 	} mux_tcp_map[RU_MUX_TCP_MAP_DEPTH];
+ 	uint32_t mux_tcp_map_next;
+@@ -877,6 +878,7 @@ static void ru_mux_tcp_map_set_locked(uint16_t local_port, uint16_t peer_port,
+ 	ru.mux_tcp_map[idx].local_port = local_port;
+ 	ru.mux_tcp_map[idx].peer_port = peer_port;
+ 	ru.mux_tcp_map[idx].server_isn = server_isn;
++	ru.mux_tcp_map[idx].snd_max = server_isn + 1u; /* the SYN consumed one */
+ 	ru.mux_tcp_map[idx].valid = 1;
+ 	printf("ROSEMARY USB: TCP SEQMAP learn local=%u peer=%u server_isn=%u\n",
+ 	    local_port, peer_port, server_isn);
+@@ -889,7 +891,7 @@ static void ru_mux_tcp_map_clear_locked(uint16_t local_port, uint16_t peer_port)
+ }
+ 
+ static uint32_t ru_mux_tcp_map_get(uint16_t local_port, uint16_t peer_port,
+-    int *found)
++    int *found, uint32_t *snd_max)
+ {
+ 	uint32_t server_isn = 0;
+ 	int idx = -1;
+@@ -899,6 +901,7 @@ static uint32_t ru_mux_tcp_map_get(uint16_t local_port, uint16_t peer_port,
+ 	idx = ru_mux_tcp_map_find_locked(local_port, peer_port);
+ 	if (idx >= 0) {
+ 		server_isn = ru.mux_tcp_map[idx].server_isn;
++		if (snd_max != NULL) *snd_max = ru.mux_tcp_map[idx].snd_max;
+ 		*found = 1;
+ 	}
+ 	lck_mtx_unlock(ru.tx_lock);
+@@ -1001,11 +1004,20 @@ static int ru_mux_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ 	/* ACKs from usbmuxd are in its synthetic sequence space. Translate them
+ 	 * into the real XNU sequence space before recomputing the TCP checksum. */
+ 	if ((th.th_flags & TH_ACK) != 0u) {
+-		server_isn = ru_mux_tcp_map_get(local_port, peer_port, &map_found);
++		uint32_t snd_max = 0;
++		server_isn = ru_mux_tcp_map_get(local_port, peer_port, &map_found, &snd_max);
+ 		if (map_found) {
+ 			uint32_t net_ack;
+ 			wire_ack = ntohl(th.th_ack);
+ 			translated_ack = wire_ack + server_isn;
++			/* 0118: never acknowledge more than XNU actually sent. usbmuxd counts
++			 * every copy of a duplicated segment, and XNU drops (together with any
++			 * data they carry) segments whose ACK is beyond snd_max. */
++			if ((int32_t)(translated_ack - snd_max) > 0) {
++				printf("ROSEMARY USB: TCP IN %u->%u ack %u beyond snd_max %u; clamped\n",
++				    peer_port, local_port, translated_ack, snd_max);
++				translated_ack = snd_max;
++			}
+ 			net_ack = htonl(translated_ack);
+ 			bcopy(&net_ack, tcp_header + 8, sizeof(net_ack));
+ 			printf("ROSEMARY USB: TCP SEQMAP IN %u->%u ack=%u->%u isn=%u\n",
+@@ -1142,6 +1154,26 @@ static int ru_mux_tx_tcp_mbuf(mbuf_t m, size_t offset, uint32_t tcp_len)
+ 		server_isn = ru.mux_tcp_map[map_idx].server_isn;
+ 		original_seq = ntohl(th.th_seq);
+ 		translated_seq = original_seq - server_isn;
++
++		/* 0118: the USB link is reliable and usbmuxd does not check sequence
++		 * numbers, so a TCP retransmission is delivered to the client a second
++		 * time and breaks the stream. Drop segments that carry nothing new. */
++		{
++			uint32_t seq_len = tcp_len - (uint32_t)(th.th_off * 4u);
++			uint32_t seg_end;
++			if ((th.th_flags & TH_FIN) != 0u) seq_len++;
++			if (seq_len != 0u && (th.th_flags & (TH_SYN | TH_RST)) == 0u) {
++				seg_end = original_seq + seq_len;
++				if ((int32_t)(seg_end - ru.mux_tcp_map[map_idx].snd_max) <= 0) {
++					printf("ROSEMARY USB: TCP OUT %u->%u retransmit seq=%u len=%u dropped\n",
++					    local_port, peer_port, translated_seq, seq_len);
++					if (ru.mux_version >= 2u) ru.mux_tx_seq--; /* frame was never sent */
++					lck_mtx_unlock(ru.tx_lock);
++					return 1;
++				}
++				ru.mux_tcp_map[map_idx].snd_max = seg_end;
++			}
++		}
+ 		th.th_seq = htonl(translated_seq);
+ 		bcopy(&th.th_seq, tcp_segment + 4, sizeof(th.th_seq));
+ 

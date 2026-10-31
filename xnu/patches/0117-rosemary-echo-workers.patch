@@ -1,0 +1,61 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index b712bef..44c164d 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -2019,6 +2019,33 @@ static void ru_echo_conn(socket_t cs)
+ 	sock_close(cs);
+ }
+ 
++/* 0117: several workers accept on the same listening socket, so one stuck or
++ * idle connection (e.g. a client that vanished without an RST) cannot block
++ * every later connection behind it. */
++#define RU_ECHO_WORKERS 4
++static volatile uint32_t ru_echo_accepts;
++
++static void ru_echo_accept_loop(socket_t ls)
++{
++	for (;;) {
++		socket_t cs = NULL;
++		errno_t e = sock_accept(ls, NULL, 0, 0, NULL, NULL, &cs);
++		if (e != 0) {
++			printf("ROSEMARY ECHO: accept err=%d\n", e);
++			ru_sleep_ms(1000);
++			continue;
++		}
++		printf("ROSEMARY ECHO: accepted #%u\n", ++ru_echo_accepts);
++		ru_echo_conn(cs);
++		printf("ROSEMARY ECHO: connection closed\n");
++	}
++}
++
++static void ru_echo_worker(void *arg, wait_result_t w __unused)
++{
++	ru_echo_accept_loop((socket_t)arg);
++}
++
+ static void ru_echo_thread(void *arg __unused, wait_result_t w __unused)
+ {
+ 	socket_t ls = NULL;
+@@ -2056,17 +2083,13 @@ static void ru_echo_thread(void *arg __unused, wait_result_t w __unused)
+ 	printf("ROSEMARY ECHO: listening on port %d\n", RU_ECHO_PORT);
+ 	ru_net_ready = 1;
+ 
+-	for (;;) {
+-		socket_t cs = NULL;
+-		e = sock_accept(ls, NULL, 0, 0, NULL, NULL, &cs);
+-		if (e != 0) {
+-			printf("ROSEMARY ECHO: accept err=%d\n", e);
+-			ru_sleep_ms(1000);
+-			continue;
++	for (int i = 1; i < RU_ECHO_WORKERS; i++) {
++		thread_t wt = THREAD_NULL;
++		if (kernel_thread_start(ru_echo_worker, (void *)ls, &wt) == KERN_SUCCESS) {
++			thread_deallocate(wt);
+ 		}
+-		printf("ROSEMARY ECHO: accepted\n");
+-		ru_echo_conn(cs);
+ 	}
++	ru_echo_accept_loop(ls);
+ }
+ 
+ static void ru_echo_start(void)
