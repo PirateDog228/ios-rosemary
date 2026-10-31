@@ -1,0 +1,73 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 7a1e46c..cb2494b 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -1791,6 +1791,10 @@ static void ru_controller_init(void)
+ 	printf("ROSEMARY USB: attached as Apple iPhone (05ac:12a8), synthetic UDID 00008110-AABBCCDDEEFF1234\n");
+ }
+ 
++/* 0113: set by the in-kernel echo thread once its TCP listener is up (or the
++ * thread could not start), so USB attach never waits forever. */
++static volatile int ru_net_ready;
++
+ static void ru_usb_thread(void *arg, wait_result_t result)
+ {
+ 	enum ru_ep0_state state = RU_EP0_SETUP;
+@@ -1799,6 +1803,22 @@ static void ru_usb_thread(void *arg, wait_result_t result)
+ 	(void)arg;
+ 	(void)result;
+ 
++	/* 0113: do not connect D+ to the host until XNU's network stack has a
++	 * listener and userland had time to bind lockdownd's port. usbmuxd sends
++	 * its preflight SYN to 62078 immediately after the VERSION/SETUP handshake;
++	 * during early boot nothing listens, so XNU answers RST and the host gives
++	 * up on the device. boot-arg rosemaryusbwait=<seconds> (default 20, 0 =
++	 * attach immediately like before) is the extra delay after the listener. */
++	{
++		int wait_s = 20;
++		PE_parse_boot_argn("rosemaryusbwait", &wait_s, sizeof(wait_s));
++		if (wait_s > 0) {
++			printf("ROSEMARY USB: attach delayed until network ready + %d s\n", wait_s);
++			while (!ru_net_ready) ru_sleep_ms(100);
++			for (int i = 0; i < wait_s; i++) ru_sleep_ms(1000);
++			printf("ROSEMARY USB: network ready, attaching to host\n");
++		}
++	}
+ 	ru_controller_init();
+ 	for (;;) {
+ 		uint32_t common = ru_rd(ru.mac, RU_USB2_COMMON_INTR);
+@@ -1952,6 +1972,7 @@ static void ru_echo_thread(void *arg __unused, wait_result_t w __unused)
+ 	e = sock_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &ls);
+ 	if (e != 0) {
+ 		printf("ROSEMARY ECHO: sock_socket err=%d\n", e);
++		ru_net_ready = 1; /* do not block USB attach forever */
+ 		for (;;) ru_sleep_ms(60000); /* kernel threads must not return */
+ 	}
+ 	bzero(&sin, sizeof(sin));
+@@ -1963,15 +1984,18 @@ static void ru_echo_thread(void *arg __unused, wait_result_t w __unused)
+ 	if (e != 0) {
+ 		printf("ROSEMARY ECHO: bind err=%d\n", e);
+ 		sock_close(ls);
++		ru_net_ready = 1; /* do not block USB attach forever */
+ 		for (;;) ru_sleep_ms(60000); /* kernel threads must not return */
+ 	}
+ 	e = sock_listen(ls, 4);
+ 	if (e != 0) {
+ 		printf("ROSEMARY ECHO: listen err=%d\n", e);
+ 		sock_close(ls);
++		ru_net_ready = 1; /* do not block USB attach forever */
+ 		for (;;) ru_sleep_ms(60000); /* kernel threads must not return */
+ 	}
+ 	printf("ROSEMARY ECHO: listening on port %d\n", RU_ECHO_PORT);
++	ru_net_ready = 1;
+ 
+ 	for (;;) {
+ 		socket_t cs = NULL;
+@@ -1993,6 +2017,7 @@ static void ru_echo_start(void)
+ 		thread_deallocate(th);
+ 	} else {
+ 		printf("ROSEMARY ECHO: kernel_thread_start failed\n");
++		ru_net_ready = 1;
+ 	}
+ }
+ 
