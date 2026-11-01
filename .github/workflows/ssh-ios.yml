@@ -1,0 +1,24 @@
+name: ssh-ios
+
+# Builds dropbear + dash for iOS arm64 (ad-hoc signed). The artifact goes with
+# the root image step on the host:  sudo tools/sweet-add-ssh.py /mnt/root ssh-ios/
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tools/build-ssh-ios.sh"
+      - ".github/workflows/ssh-ios.yml"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: bash tools/build-ssh-ios.sh out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssh-ios
+          path: out/
+          if-no-files-found: error
