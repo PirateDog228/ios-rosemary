@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 4adfb70..cf0c74c 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -785,6 +785,17 @@ static void ru_tx_kick_locked(void)
+ 		gpd[0].buffer = (uint32_t)buffer_pa;
+ 		gpd[0].dw3_info = len;
+ 		gpd[0].dw0_info = ru_gpd_upper(buffer_pa, next_pa);
++		/* 0120: a bulk-IN transfer whose length is a multiple of the 512-byte
++		 * packet size is not terminated for the host (no short packet), so
++		 * usbmuxd read it together with the next frame ("Incoming packet size
++		 * mismatch ... expected 512, got 1060"). Ask the QMU to append a
++		 * zero-length packet, as the vendor mtu3 driver does for req->zero:
++		 * GPD_FLAGS_ZLP (dw0 bit 6) on gen2cp, GPD_EXT_FLAG_ZLP (dw3 bit 29)
++		 * on the older layout. */
++		if ((len % RU_BULK_MPS) == 0u) {
++			if (ru.rx_gen2) gpd[0].dw0_info |= RU_BIT(6);
++			else gpd[0].dw3_info |= RU_BIT(29);
++		}
+ 		gpd[1].next_gpd = (uint32_t)gpd_pa;
+ 
+ 		ru_dma_clean(RU_TX_BUFFER_OFF, len);

@@ -1,0 +1,31 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index cf0c74c..1d52bc3 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -1209,6 +1209,26 @@ static int ru_mux_tx_tcp_mbuf(mbuf_t m, size_t offset, uint32_t tcp_len)
+ 					lck_mtx_unlock(ru.tx_lock);
+ 					return 1;
+ 				}
++				/* 0121: a retransmission that also carries new data (XNU
++				 * re-segments: bootusb22 sent seq 4075 len 476, then seq 4075
++				 * len 512). usbmuxd does not check sequence numbers and would
++				 * deliver the first bytes twice, corrupting the stream: cut
++				 * the part the host already has. */
++				{
++					int32_t overlap = (int32_t)(ru.mux_tcp_map[map_idx].snd_max - original_seq);
++					uint32_t hl = (uint32_t)th.th_off * 4u;
++					if (overlap > 0 && (uint32_t)overlap <= tcp_len - hl) {
++						printf("ROSEMARY USB: TCP OUT %u->%u trim %d overlapping bytes seq=%u\n",
++						    local_port, peer_port, overlap, translated_seq);
++						bcopy(tcp_segment + hl + overlap, tcp_segment + hl,
++						    tcp_len - hl - (uint32_t)overlap);
++						tcp_len -= (uint32_t)overlap;
++						total_len -= (uint32_t)overlap;
++						original_seq += (uint32_t)overlap;
++						translated_seq = original_seq - server_isn;
++						rosemary_usbmux_put_be32(out + 4, total_len);
++					}
++				}
+ 				ru.mux_tcp_map[map_idx].snd_max = seg_end;
+ 			}
+ 		}
