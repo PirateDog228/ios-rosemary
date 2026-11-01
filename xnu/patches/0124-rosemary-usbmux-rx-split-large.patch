@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
-index 280b3dd..fceb5b2 100644
+index 280b3dd..a9686b5 100644
 --- a/bsd/dev/rosemary_usb.c
 +++ b/bsd/dev/rosemary_usb.c
 @@ -1007,7 +1007,7 @@ static mbuf_t ru_mbuf_alloc_contig(size_t len)
@@ -50,7 +50,7 @@ index 280b3dd..fceb5b2 100644
 +		buf[7] = (uint8_t)s2;
 +		buf[16] = 0;
 +		buf[17] = 0;
-+		if (off + n < payload) buf[13] &= (uint8_t)~(TH_FIN | TH_PSH);
++		if (off + n < payload) buf[13] &= (uint8_t)~(TH_FIN | 0x08u /* PSH */);
 +		bcopy(segment + hl + off, buf + hl, n);
 +		(void)ru_mux_tcp_input_one(buf, (uint32_t)hl + n);
 +		off += n;
