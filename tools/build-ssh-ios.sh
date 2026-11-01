@@ -26,14 +26,15 @@ sdk=$(xcrun --sdk iphoneos --show-sdk-path)
 cc_real=$(xcrun --sdk iphoneos --find clang)
 echo "SDK: $sdk"
 
-# Some SDKs mark fork()/system()/... as unavailable on iOS. Shadow the few
-# headers with copies that have the markers removed (-isystem is searched
-# before the sysroot).
+# The iOS SDK marks fork()/system()/... as unavailable. Shadow the few headers
+# involved with copies without the markers (-isystem is searched before the
+# sysroot; stdlib.h pulls in _stdlib.h, where system() is declared).
 overlay="$work/overlay"
 mkdir -p "$overlay"
-for h in unistd.h stdlib.h spawn.h; do
+for h in unistd.h _unistd.h stdlib.h _stdlib.h spawn.h; do
 	[[ -f "$sdk/usr/include/$h" ]] || continue
-	sed -E 's/__IOS_PROHIBITED//g; s/__API_UNAVAILABLE\(ios[^)]*\)//g' \
+	sed -E 's/__IOS_PROHIBITED//g; s/__TVOS_PROHIBITED//g; s/__WATCHOS_PROHIBITED//g;
+	        s/__API_UNAVAILABLE\([^)]*ios[^)]*\)//g; s/__OS_AVAILABILITY\(ios, *unavailable\)//g' \
 		"$sdk/usr/include/$h" >"$overlay/$h"
 done
 
@@ -41,14 +42,16 @@ CC="$cc_real -arch arm64 -isysroot $sdk -miphoneos-version-min=$MIN_IOS -isystem
 CFLAGS="-O2 -Wno-implicit-function-declaration -Wno-int-conversion"
 
 # fork() must compile for the target, or nothing below can work.
-cat >"$work/t.c" <<'EOF'
-#include <unistd.h>
-#include <stdlib.h>
-int main(void) { if (fork() == 0) return system("true"); return 0; }
-EOF
+printf '#include <unistd.h>\nint main(void){return fork();}\n' >"$work/t.c"
 $CC $CFLAGS -c "$work/t.c" -o "$work/t.o" || {
-	echo "error: the iOS SDK headers still reject fork()/system()" >&2
+	echo "error: the iOS SDK headers still reject fork()" >&2
 	exit 1
+}
+# system() is not needed by dropbear's server path; report, do not stop.
+printf '#include <stdlib.h>\nint main(void){return system("true");}\n' >"$work/t2.c"
+$CC $CFLAGS -c "$work/t2.c" -o "$work/t2.o" || {
+	echo "warning: system() still unavailable; the declaration is:" >&2
+	grep -n -B4 'int system' "$overlay/_stdlib.h" "$sdk/usr/include/_stdlib.h" >&2 || true
 }
 
 fetch() { # URL... DEST : first working URL wins
