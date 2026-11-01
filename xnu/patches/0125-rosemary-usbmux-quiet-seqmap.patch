@@ -1,0 +1,39 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index fceb5b2..7b39e75 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -1056,8 +1056,15 @@ static int ru_mux_tcp_input_one(const uint8_t *segment, uint32_t tcp_len)
+ 			}
+ 			net_ack = htonl(translated_ack);
+ 			bcopy(&net_ack, tcp_header + 8, sizeof(net_ack));
+-			printf("ROSEMARY USB: TCP SEQMAP IN %u->%u ack=%u->%u isn=%u\n",
+-			    peer_port, local_port, wire_ack, translated_ack, server_isn);
++			/* 0125: kernel printf is slow; trace only the first frames. */
++			{
++				static uint32_t seqmap_in_logs;
++				if (seqmap_in_logs < 400u) {
++					seqmap_in_logs++;
++					printf("ROSEMARY USB: TCP SEQMAP IN %u->%u ack=%u->%u isn=%u\n",
++					    peer_port, local_port, wire_ack, translated_ack, server_isn);
++				}
++			}
+ 		}
+ 	}
+ 
+@@ -1344,8 +1351,14 @@ static int ru_mux_tx_tcp_mbuf(mbuf_t m, size_t offset, uint32_t tcp_len)
+ 		tcp_sum = ru_checksum_finish(sum);
+ 		tcp_segment[16] = (uint8_t)(tcp_sum >> 8);
+ 		tcp_segment[17] = (uint8_t)tcp_sum;
+-		printf("ROSEMARY USB: TCP SEQMAP OUT %u->%u seq=%u->%u isn=%u flags=%02x\n",
+-		    local_port, peer_port, original_seq, translated_seq, server_isn, th.th_flags);
++		{
++			static uint32_t seqmap_out_logs;
++			if (seqmap_out_logs < 400u || (th.th_flags & (TH_SYN | TH_FIN | TH_RST)) != 0u) {
++				seqmap_out_logs++;
++				printf("ROSEMARY USB: TCP SEQMAP OUT %u->%u seq=%u->%u isn=%u flags=%02x\n",
++				    local_port, peer_port, original_seq, translated_seq, server_isn, th.th_flags);
++			}
++		}
+ 		if ((th.th_flags & TH_RST) != 0u) {
+ 			ru_mux_tcp_map_clear_locked(local_port, peer_port);
+ 		}
