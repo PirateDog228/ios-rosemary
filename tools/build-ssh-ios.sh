@@ -63,6 +63,21 @@ fetch() { # URL... DEST : first working URL wins
 	return 1
 }
 
+# The SDK (iOS 18.x) declares functions that iOS 16 does not have (strchrnul,
+# ...) as weak imports: configure finds them, the code calls them, and on the
+# phone the call goes to NULL (SIGSEGV pc=0, seen in the first dash). A binary
+# with weak imports is therefore refused here, with the list.
+check_weak() {
+	local w
+	w=$(nm -mu "$1" 2>/dev/null | grep -i 'weak' || true)
+	if [[ -n $w ]]; then
+		echo "error: $1 has weak imports (NULL on iOS 16 => crash):" >&2
+		echo "$w" >&2
+		exit 1
+	fi
+	echo "ok: no weak imports in $(basename "$1")"
+}
+
 sign() {
 	codesign --force -s - --digest-algorithm=sha256 --identifier "org.sweet.$(basename "$1")" "$1" ||
 		codesign --force -s - "$1"
@@ -95,9 +110,11 @@ EOF
 	--disable-zlib --disable-pam --disable-lastlog --disable-utmp --disable-utmpx \
 	--disable-wtmp --disable-wtmpx --disable-loginfunc --disable-pututline \
 	--disable-pututxline \
-	CC="$CC" CFLAGS="$CFLAGS" LDFLAGS="-Wl,-dead_strip"
+	CC="$CC" CFLAGS="$CFLAGS" LDFLAGS="-Wl,-dead_strip" \
+	ac_cv_func_strchrnul=no ac_cv_func_mempcpy=no ac_cv_func_memmem=no
 make -j"$(sysctl -n hw.ncpu)" PROGRAMS="dropbear"
 cp dropbear "$out/dropbear"
+check_weak "$out/dropbear"
 strip -x "$out/dropbear" || true
 sign "$out/dropbear"
 
@@ -112,9 +129,11 @@ cd dash-src
 # the generators (mkinit, mknodes, ...) run on the build machine
 ./configure --host=aarch64-apple-darwin --build="$(./config.guess 2>/dev/null || echo arm64-apple-darwin)" \
 	CC="$CC" CFLAGS="$CFLAGS" CC_FOR_BUILD="clang" CFLAGS_FOR_BUILD="-O1" \
-	LDFLAGS="-Wl,-dead_strip"
+	LDFLAGS="-Wl,-dead_strip" \
+	ac_cv_func_strchrnul=no ac_cv_func_mempcpy=no ac_cv_func_memmem=no
 make -j"$(sysctl -n hw.ncpu)"
 cp src/dash "$out/dash"
+check_weak "$out/dash"
 strip -x "$out/dash" || true
 sign "$out/dash"
 
