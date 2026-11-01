@@ -1,0 +1,88 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 1d52bc3..7b9b23a 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -1133,8 +1133,32 @@ static int ru_mux_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ 	return 1;
+ }
+ 
++/* 0122: recompute the TCP checksum of a device->host segment (10.x pseudo header). */
++static void ru_mux_tcp_fix_checksum(uint8_t *seg, uint32_t len)
++{
++	uint8_t pseudo[12];
++	uint32_t src_ip = htonl(RU_MUX_DEVICE_IP);
++	uint32_t dst_ip = htonl(RU_MUX_HOST_IP);
++	uint32_t sum;
++	uint16_t cs;
++	bcopy(&src_ip, pseudo, 4);
++	bcopy(&dst_ip, pseudo + 4, 4);
++	pseudo[8] = 0;
++	pseudo[9] = IPPROTO_TCP;
++	pseudo[10] = (uint8_t)(len >> 8);
++	pseudo[11] = (uint8_t)len;
++	seg[16] = 0;
++	seg[17] = 0;
++	sum = ru_checksum_add(0, pseudo, sizeof(pseudo));
++	sum = ru_checksum_add(sum, seg, len);
++	cs = ru_checksum_finish(sum);
++	seg[16] = (uint8_t)(cs >> 8);
++	seg[17] = (uint8_t)cs;
++}
++
+ static int ru_mux_tx_tcp_mbuf(mbuf_t m, size_t offset, uint32_t tcp_len)
+ {
++	uint32_t split2 = 0u, idx2 = 0u;
+ 	uint32_t idx;
+ 	uint32_t header_len;
+ 	uint32_t total_len;
+@@ -1286,10 +1310,50 @@ static int ru_mux_tx_tcp_mbuf(mbuf_t m, size_t offset, uint32_t tcp_len)
+ 		tcp_segment[16] = (uint8_t)(tcp_sum >> 8);
+ 		tcp_segment[17] = (uint8_t)tcp_sum;
+ 	}
++	/* 0122: a USB bulk transfer whose length is a multiple of the 512-byte
++	 * packet size is only ended by a zero-length packet; the host otherwise
++	 * glues it to the next frame ("Incoming packet size mismatch, expected
++	 * 512, got 584") and usbmuxd drops both. Do not rely on the controller's
++	 * ZLP: move the last payload byte of such a plain-ACK data segment into a
++	 * second TCP segment, so no frame is exactly 512 (or 1024, ...) bytes. */
++	if ((total_len % RU_BULK_MPS) == 0u && tcp_segment[13] == TH_ACK &&
++	    ru.txq_count + 1u < RU_MUX_TXQ_DEPTH) {
++		uint32_t hl = (uint32_t)(tcp_segment[12] >> 4) * 4u;
++		if (tcp_len >= hl + 2u) {
++			uint8_t *out2;
++			uint32_t paylen = tcp_len - hl;
++			uint32_t seq2 = ((uint32_t)tcp_segment[4] << 24) | ((uint32_t)tcp_segment[5] << 16) |
++			    ((uint32_t)tcp_segment[6] << 8) | tcp_segment[7];
++			uint32_t tcp_len2 = hl + 1u;
++			idx2 = (idx + 1u) % RU_MUX_TXQ_DEPTH;
++			out2 = ru.txq[idx2].data;
++			bcopy(out, out2, header_len + hl);
++			out2[header_len + hl] = tcp_segment[tcp_len - 1u];
++			seq2 += paylen - 1u;
++			out2[header_len + 4] = (uint8_t)(seq2 >> 24);
++			out2[header_len + 5] = (uint8_t)(seq2 >> 16);
++			out2[header_len + 6] = (uint8_t)(seq2 >> 8);
++			out2[header_len + 7] = (uint8_t)seq2;
++			split2 = header_len + tcp_len2;
++			rosemary_usbmux_put_be32(out2 + 4, split2);
++			if (ru.mux_version >= 2u) rosemary_usbmux_put_be16(out2 + 12, ru.mux_tx_seq++);
++			ru_mux_tcp_fix_checksum(out2 + header_len, tcp_len2);
++			tcp_len -= 1u;
++			total_len -= 1u;
++			rosemary_usbmux_put_be32(out + 4, total_len);
++			ru_mux_tcp_fix_checksum(tcp_segment, tcp_len);
++			printf("ROSEMARY USB: TCP OUT split frame (was %u bytes) into %u + %u\n",
++			    total_len + 1u, total_len, split2);
++		}
++	}
+ 	/* Reflect the rewritten segment in the ordinary TCP trace. */
+ 	bcopy(tcp_segment, &th, sizeof(th));
+ 	ru.txq[idx].len = (uint16_t)total_len;
+ 	ru.txq_count++;
++	if (split2 != 0u) {
++		ru.txq[idx2].len = (uint16_t)split2;
++		ru.txq_count++;
++	}
+ 	ru.mux_tcp_out_count++;
+ 	if (ru.mux_tcp_out_count <= 128u) {
+ 		printf("ROSEMARY USB: TCP OUT #%u %u->%u flags=%02x seq=%u ack=%u bytes=%u\n",
