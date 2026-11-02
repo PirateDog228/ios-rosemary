@@ -1,0 +1,136 @@
+diff --git a/iokit/Kernel/arm/RosemaryUSBHost.cpp b/iokit/Kernel/arm/RosemaryUSBHost.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/RosemaryUSBHost.cpp
+@@ -0,0 +1,95 @@
++/*
++ * ROSEMARY: tell userspace that a USB host is attached.
++ *
++ * lockdownd (iOS 16) treats every TCP connection to port 62078 as a Wi-Fi
++ * connection and kills it ("socket_accept_callback: Killing the WiFi
++ * connection immediately") unless its IOKit view says that a USB host is
++ * connected. That view comes from the com.apple.iokit.matching events in its
++ * launchd job (IOPortTransportState with Active/DataRole 1/TransportType 2
++ * or 3, IOResources with AppleUSBCableType = USBHost) and, in older code
++ * paths still present in the binary, from the services AppleUSBDeviceMux and
++ * AppleUSBMux (property IsActive). ROSEMARY's USB runs behind the BSD-level
++ * driver in bsd/dev/rosemary_usb.c, which has no IOKit objects, so this file
++ * publishes them: the host is always "attached" (the link is a cable to the
++ * development PC; a phone without a host is not what this build is for).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSString.h>
++
++class IOPortTransportState : public IOService {
++	OSDeclareDefaultStructors(IOPortTransportState);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOPortTransportState, IOService);
++
++bool
++IOPortTransportState::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	/* what the "com.apple.lockdown.USB2.Device" matching event asks for */
++	setProperty("Active", kOSBooleanTrue);
++	setProperty("DataRole", 1ULL, 32);
++	setProperty("TransportType", 2ULL, 32);
++	registerService();
++
++	/* the "com.apple.lockdown.USBHost" event: a property of IOResources */
++	OSString *cable = OSString::withCString("USBHost");
++	if (cable != NULL) {
++		IOService::publishResource("AppleUSBCableType", cable);
++		cable->release();
++	}
++	IOLog("ROSEMARY USB: IOPortTransportState (USB2 device, host attached) published\n");
++	return true;
++}
++
++class AppleUSBDeviceMux : public IOService {
++	OSDeclareDefaultStructors(AppleUSBDeviceMux);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleUSBDeviceMux, IOService);
++
++bool
++AppleUSBDeviceMux::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	registerService();
++	IOLog("ROSEMARY USB: AppleUSBDeviceMux published\n");
++	return true;
++}
++
++class AppleUSBMux : public IOService {
++	OSDeclareDefaultStructors(AppleUSBMux);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleUSBMux, IOService);
++
++bool
++AppleUSBMux::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty("IsActive", kOSBooleanTrue);
++	registerService();
++	IOLog("ROSEMARY USB: AppleUSBMux published (IsActive)\n");
++	return true;
++}
++#endif /* SWEET */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -53,6 +53,21 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = AppleKeyStore;"
+     "   },"
+     "   {"
++    "     'IOClass'         = IOPortTransportState;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOPortTransportState;"
++    "   },"
++    "   {"
++    "     'IOClass'         = AppleUSBDeviceMux;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleUSBDeviceMux;"
++    "   },"
++    "   {"
++    "     'IOClass'         = AppleUSBMux;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleUSBMux;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOWatchdog;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOWatchdog;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -12,6 +12,7 @@ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitc
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
++iokit/Kernel/arm/RosemaryUSBHost.cpp                              optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
