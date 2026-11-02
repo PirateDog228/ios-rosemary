@@ -1,0 +1,59 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -79,6 +79,47 @@ __XNU_PRIVATE_EXTERN    int             syscalls_log[SYS_MAXSYSCALL];
+ extern int mach_trap_count;
+ #endif
+ 
++/*
++ * ROSEMARY diagnostic: boot-arg sweettrace=NAME. After each successful
++ * accept() made by the process called NAME, print its next 400 system calls
++ * (number, first three arguments, error, first return value), for the first
++ * 6 accepted connections. Off (one load per syscall) without the boot-arg.
++ */
++static int rmt_state;           /* 0 = not looked at yet, 1 = off, 2 = on */
++static char rmt_name[32];
++static int rmt_left;
++static int rmt_rearm = 6;
++
++static void
++rmt_syscall(struct proc *proc, struct uthread *uthread, unsigned int code, int error)
++{
++	if (rmt_state == 1) {
++		return;
++	}
++	if (rmt_state == 0) {
++		if (!PE_parse_boot_argn("sweettrace", rmt_name, sizeof(rmt_name))) {
++			rmt_state = 1;
++			return;
++		}
++		rmt_state = 2;
++	}
++	if (strncmp(proc->p_comm, rmt_name, MAXCOMLEN) != 0) {
++		return;
++	}
++	if ((code == SYS_accept || code == SYS_accept_nocancel) && error == 0 && rmt_rearm > 0) {
++		rmt_rearm--;
++		rmt_left = 400;
++	}
++	if (rmt_left > 0) {
++		rmt_left--;
++		printf("RTR %d t%llu sys %u a %llx %llx %llx -> err %d r %llx\n", proc_pid(proc),
++		    (unsigned long long)thread_tid(current_thread()), code,
++		    (unsigned long long)uthread->uu_arg[0], (unsigned long long)uthread->uu_arg[1],
++		    (unsigned long long)uthread->uu_arg[2], error,
++		    (unsigned long long)uthread->uu_rval[0]);
++	}
++}
++
+ /*
+  * Function:	unix_syscall
+  *
+@@ -180,6 +221,7 @@ unix_syscall(
+ 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+ 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
++	rmt_syscall(proc, uthread, code, error);
+ 
+ #if CONFIG_MACF
+ skip_syscall:
