@@ -1,0 +1,44 @@
+diff --git a/osfmk/ipc/ipc_pset.c b/osfmk/ipc/ipc_pset.c
+--- a/osfmk/ipc/ipc_pset.c
++++ b/osfmk/ipc/ipc_pset.c
+@@ -76,6 +76,8 @@
+ #include <kern/policy_internal.h>
+ 
+ #include <kern/kern_types.h>
++#include <kern/task.h>
++#include <kern/misc_protos.h>
+ 
+ #include <vm/vm_map.h>
+ #include <libkern/section_keywords.h>
+@@ -1009,6 +1011,13 @@ filt_machportprocess(struct knote *kn, struct kevent_qos_s *kev)
+ 
+ 	/* If we timed out, or the process is exiting, just zero.  */
+ 	if (wresult == THREAD_RESTART || self->ith_state == MACH_RCV_TIMED_OUT) {
++		/* ROSEMARY diag: knote was active but nothing could be received */
++		static uint32_t rmk_empty;
++		uint32_t rmk_n = os_atomic_inc(&rmk_empty, relaxed);
++		if (rmk_n <= 30 || (rmk_n & 0x3fff) == 0) {
++			printf("MPK empty #%u pid %d wres %d state 0x%x\n", rmk_n,
++			    task_pid(current_task()), (int)wresult, (unsigned)self->ith_state);
++		}
+ 		assert(self->turnstile != TURNSTILE_NULL);
+ 		self->ith_knote = ITH_KNOTE_NULL;
+ 		return 0;
+@@ -1068,6 +1077,17 @@ filt_machportprocess(struct knote *kn, struct kevent_qos_s *kev)
+ 
+ 	/* kmsg and object reference consumed */
+ 
++	if (kev->fflags != MACH_MSG_SUCCESS) {
++		/* ROSEMARY diag: a receive that did not deliver the message */
++		static uint32_t rmk_err;
++		uint32_t rmk_e = os_atomic_inc(&rmk_err, relaxed);
++		if (rmk_e <= 60 || (rmk_e & 0x3fff) == 0) {
++			printf("MPK recv err #%u pid %d fflags 0x%x msize %u max %u opt 0x%llx\n", rmk_e,
++			    task_pid(current_task()), (unsigned)kev->fflags,
++			    (unsigned)self->ith_msize, (unsigned)max_msg_size, (unsigned long long)option64);
++		}
++	}
++
+ 	/*
+ 	 * if the user asked for the identity of ports containing a
+ 	 * a too-large message, return it in the data field (as we

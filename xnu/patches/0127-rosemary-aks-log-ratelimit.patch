@@ -1,0 +1,19 @@
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -250,6 +250,13 @@
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	/* coreduetd polls selector 17 every ~40 ms: log the first calls of each selector, errors always */
++	static uint32_t seen[128];
++	uint32_t cnt = selector < 128 ? ++seen[selector] : 0;
++	if (ret != kIOReturnSuccess || cnt <= 40) {
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	} else if (cnt == 41) {
++		IOLog("SWEET AKS: sel %u: further successful calls are not logged\n", selector);
++	}
+ 	return ret;
+ }
