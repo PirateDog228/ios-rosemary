@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/rosemary_ufs.c b/bsd/dev/rosemary_ufs.c
+--- a/bsd/dev/rosemary_ufs.c
++++ b/bsd/dev/rosemary_ufs.c
+@@ -25,4 +25,9 @@
+ 		extern void rosemary_usb_init(void);
+ 		rosemary_usb_init();
+ 	}
++	/* process sampler (0054): only sweet_ufs.c started it, rosemary_ufs.c never did */
++	{
++		extern void sweet_sample_start(void);
++		sweet_sample_start();
++	}
+ 	uint32_t pause = 0;
