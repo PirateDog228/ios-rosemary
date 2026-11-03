@@ -1,0 +1,86 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -1891,7 +1891,11 @@
+ /* 0112 diagnostic: in-kernel TCP banner/echo server on port 2222. It proves
+  * the USB <-> usbmux <-> rmx0 <-> XNU TCP path works in both directions
+  * without launchd/lockdownd. Test from the host: iproxy 2222 2222; nc 127.0.0.1 2222 */
+ #define RU_ECHO_PORT 2222
++#ifndef TCP_PEER_PID
++/* Private XNU TCP socket option: lookup PID of the loopback peer. */
++#define TCP_PEER_PID 0x204
++#endif
+ 
+ static void ru_echo_conn(socket_t cs)
+ {
+@@ -1899,8 +1903,21 @@ static void ru_echo_conn(socket_t cs)
+ 	struct iovec iov;
+ 	struct msghdr msg;
+ 	size_t n = 0;
++	struct sockaddr_in peer;
++	int peer_len = sizeof(peer);
++	pid_t peer_pid = -1;
++	int peer_pid_len = sizeof(peer_pid);
++	errno_t peer_name_err, peer_pid_err;
+ 	errno_t e;
+ 
++	bzero(&peer, sizeof(peer));
++	peer_name_err = sock_getpeername(cs, (struct sockaddr *)&peer, peer_len);
++	peer_pid_err = sock_getsockopt(cs, IPPROTO_TCP, TCP_PEER_PID,
++	    &peer_pid, &peer_pid_len);
++	printf("ROSEMARY ECHO: peername_err=%d peer=%08x:%u peerpid_err=%d pid=%d len=%d\n",
++	    peer_name_err, (unsigned)ntohl(peer.sin_addr.s_addr), (unsigned)ntohs(peer.sin_port),
++	    peer_pid_err, peer_pid, peer_pid_len);
++
+ 	bzero(&msg, sizeof(msg));
+ 	iov.iov_base = (void *)(uintptr_t)banner;
+ 	iov.iov_len = sizeof(banner) - 1;
+@@ -2033,6 +2051,35 @@ static void ru_echo_conn(socket_t cs)
+ 	sock_close(cs);
+ }
+ 
++/* One-shot diagnostic: create a TCP client from a kernel thread and connect
++ * to the echo listener through 127.0.0.1. The accepted side logs TCP_PEER_PID.
++ * This isolates loopback/kernel-socket identity from the USBMUX TCP peer. */
++static void ru_echo_loopback_probe(void *arg __unused, wait_result_t w __unused)
++{
++	socket_t so = NULL;
++	struct sockaddr_in sin;
++	errno_t e;
++
++	e = sock_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &so);
++	if (e != 0) {
++		printf("ROSEMARY LOOPBACK: sock_socket err=%d\n", e);
++		for (;;) ru_sleep_ms(60000);
++	}
++	bzero(&sin, sizeof(sin));
++	sin.sin_len = sizeof(sin);
++	sin.sin_family = AF_INET;
++	sin.sin_port = htons(RU_ECHO_PORT);
++	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++	e = sock_connect(so, (struct sockaddr *)&sin, 0);
++	printf("ROSEMARY LOOPBACK: connect 127.0.0.1:%d err=%d\n", RU_ECHO_PORT, e);
++	if (e == 0) {
++		/* Keep the client PCB alive long enough for an echo worker to accept it. */
++		ru_sleep_ms(3000);
++	}
++	sock_close(so);
++	for (;;) ru_sleep_ms(60000);
++}
++
+ /* 0117: several workers accept on the same listening socket, so one stuck or
+  * idle connection (e.g. a client that vanished without an RST) cannot block
+  * every later connection behind it. */
+@@ -2081,4 +2130,12 @@ static void ru_echo_thread(void *arg __unused, wait_result_t w __unused)
+ 		}
+ 	}
++	{
++		thread_t pt = THREAD_NULL;
++		if (kernel_thread_start(ru_echo_loopback_probe, NULL, &pt) == KERN_SUCCESS) {
++			thread_deallocate(pt);
++		} else {
++			printf("ROSEMARY LOOPBACK: kernel_thread_start failed\n");
++		}
++	}
+ 	ru_echo_accept_loop(ls);
+ }
