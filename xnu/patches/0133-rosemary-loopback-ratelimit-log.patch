@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 360d0f0..eeafbed 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -1032,8 +1032,26 @@ static void ru_loop_tx_segment(uint16_t local_port, uint16_t peer_port,
+ 	ru.txq[idx].len = (uint16_t)total_len;
+ 	ru.txq_count++;
+ 	ru.mux_tcp_out_count++;
+-	printf("ROSEMARY USB: loopback TCP OUT %u->%u flags=%02x seq=%u ack=%u bytes=%u\n",
+-	    local_port, peer_port, flags, seq, ack, paylen);
++	/* This fires on every segment of every loopback-bridged connection,
++	 * including long-lived, high-volume ones such as the syslog relay. An
++	 * unconditional printf here is a feedback loop waiting to happen: a
++	 * syslog-relay client logs this line, which syslogd relays back through
++	 * the same connection, which logs another line, without end - and it
++	 * previously took usbmuxd down with it (buffer overflow, crash) well
++	 * before anyone could read the log. Cap it hard, like the other
++	 * high-frequency traces in this file (ru.mux_tcp_out_count, 0125's
++	 * seqmap_in_logs). */
++	{
++		static uint32_t loop_out_logs;
++		if (loop_out_logs < 128u) {
++			loop_out_logs++;
++			printf("ROSEMARY USB: loopback TCP OUT %u->%u flags=%02x seq=%u ack=%u bytes=%u\n",
++			    local_port, peer_port, flags, seq, ack, paylen);
++			if (loop_out_logs == 128u) {
++				printf("ROSEMARY USB: loopback TCP OUT: further frames are not logged\n");
++			}
++		}
++	}
+ 	ru_tx_kick_locked();
+ 	lck_mtx_unlock(ru.tx_lock);
+ }
