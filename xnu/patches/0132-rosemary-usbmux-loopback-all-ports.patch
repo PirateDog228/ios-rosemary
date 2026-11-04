@@ -1,0 +1,392 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 3e33b93..8860212 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -212,14 +212,16 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+  * the peer address accept() hands back: non-loopback is treated as "WiFi" and
+  * killed outright, and even a loopback peer must belong to the kernel itself
+  * (pid 0) or it is "unsafe". Relaying usbmuxd's TCP segments through rmx0
+- * (above) satisfies neither test, since lockdownd sees a plain remote peer on
+- * 198.18.0.1. For this one port, terminate usbmuxd's simplified TCP directly
+- * in software (no Ethernet/IP, just the embedded TCP segment) and bridge the
+- * payload to a real kernel-originated loopback socket to 127.0.0.1:62078 -
+- * exactly what AppleUSBMux does on a real iPhone, so lockdownd sees a genuine
+- * local/kernel peer. */
+-#define RU_LOOP_PORT              62078u
+-#define RU_LOOP_DEPTH             4u
++ * (above) satisfies neither test, since the real stack sees a plain remote
++ * peer on 198.18.0.1. Other services reached via lockdownd's StartService
++ * (afc, syslog relay, diagnostics, ...) are handed a fresh, dynamically
++ * chosen port over the same mux tunnel and may apply the same kind of check,
++ * so every mux TCP connection - not just port 62078 - is terminated directly
++ * in software here (no Ethernet/IP, just the embedded TCP segment) and
++ * bridged to a real kernel-originated loopback socket to 127.0.0.1:<port> -
++ * exactly what AppleUSBMux does on a real iPhone, so whatever is listening
++ * sees a genuine local/kernel peer regardless of which port it is on. */
++#define RU_LOOP_DEPTH             8u
+ #define RU_LOOP_RX_CHUNK          1200u
+ 
+ static const uint8_t ru_mux_host_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xef, 0x01 };
+@@ -269,10 +271,11 @@ static struct {
+ 	uint32_t mux_tcp_map_next;
+ 	struct {
+ 		uint8_t valid;
++		uint16_t local_port;  /* the mux destination port this session targets */
+ 		uint16_t peer_port;   /* usbmuxd's synthetic client port */
+ 		uint32_t our_seq;     /* next seq we will use toward usbmuxd */
+ 		uint32_t peer_seq;    /* next seq we expect from usbmuxd (our ack) */
+-		socket_t so;          /* real kernel socket to 127.0.0.1:62078 */
++		socket_t so;          /* real kernel socket to 127.0.0.1:local_port */
+ 	} loop[RU_LOOP_DEPTH];
+ 	struct {
+ 		uint16_t len;
+@@ -945,12 +948,13 @@ static int ru_loop_find_locked(uint16_t peer_port)
+ 	return -1;
+ }
+ 
+-static int ru_loop_alloc_locked(uint16_t peer_port)
++static int ru_loop_alloc_locked(uint16_t local_port, uint16_t peer_port)
+ {
+ 	for (uint32_t i = 0; i < RU_LOOP_DEPTH; i++) {
+ 		if (!ru.loop[i].valid) {
+ 			bzero(&ru.loop[i], sizeof(ru.loop[i]));
+ 			ru.loop[i].valid = 1;
++			ru.loop[i].local_port = local_port;
+ 			ru.loop[i].peer_port = peer_port;
+ 			return (int)i;
+ 		}
+@@ -975,14 +979,14 @@ static void ru_loop_reset_all_locked(void)
+ 	}
+ }
+ 
+-/* Build one bare TCP segment (no Ethernet/IP) addressed from RU_LOOP_PORT to
++/* Build one bare TCP segment (no Ethernet/IP) addressed from local_port to
+  * peer_port, frame it as a normal USBMUX TCP packet, and queue it exactly
+  * like ru_mux_tx_tcp_mbuf does. The checksum uses the same synthetic
+  * 198.18.0.2 -> 198.18.0.1 pseudo-header usbmuxd already expects, since this
+  * is still carried over the same mux wire protocol - only the IP/Ethernet
+  * injection into XNU's real stack is skipped for this port. */
+-static void ru_loop_tx_segment(uint16_t peer_port, uint32_t seq, uint32_t ack,
+-    uint8_t flags, const uint8_t *payload, uint32_t paylen)
++static void ru_loop_tx_segment(uint16_t local_port, uint16_t peer_port, uint32_t seq,
++    uint32_t ack, uint8_t flags, const uint8_t *payload, uint32_t paylen)
+ {
+ 	uint8_t tcp_header[20];
+ 	uint8_t pseudo[12];
+@@ -997,7 +1001,7 @@ static void ru_loop_tx_segment(uint16_t peer_port, uint32_t seq, uint32_t ack,
+ 	}
+ 
+ 	bzero(tcp_header, sizeof(tcp_header));
+-	rosemary_usbmux_put_be16(tcp_header + 0, (uint16_t)RU_LOOP_PORT);
++	rosemary_usbmux_put_be16(tcp_header + 0, local_port);
+ 	rosemary_usbmux_put_be16(tcp_header + 2, peer_port);
+ 	rosemary_usbmux_put_be32(tcp_header + 4, seq);
+ 	rosemary_usbmux_put_be32(tcp_header + 8, ack);
+@@ -1051,21 +1055,22 @@ static void ru_loop_tx_segment(uint16_t peer_port, uint32_t seq, uint32_t ack,
+ 	ru.txq[idx].len = (uint16_t)total_len;
+ 	ru.txq_count++;
+ 	ru.mux_tcp_out_count++;
+-	printf("ROSEMARY USB: loopback TCP OUT 62078->%u flags=%02x seq=%u ack=%u bytes=%u\n",
+-	    peer_port, flags, seq, ack, paylen);
++	printf("ROSEMARY USB: loopback TCP OUT %u->%u flags=%02x seq=%u ack=%u bytes=%u\n",
++	    local_port, peer_port, flags, seq, ack, paylen);
+ 	ru_tx_kick_locked();
+ 	lck_mtx_unlock(ru.tx_lock);
+ }
+ 
+-/* Handle one TCP segment addressed to RU_LOOP_PORT. Unlike ru_mux_tcp_input,
+- * this never touches rmx0/ifnet_input: on SYN it opens a genuine kernel
+- * socket to 127.0.0.1:62078 (sock_socket+sock_connect, exactly as
+- * AppleUSBMux does on a real iPhone, so lockdownd's peer_is_safe() sees pid
+- * 0), then shuttles bytes between that socket and usbmuxd's simplified TCP,
+- * which this function terminates itself. Runs only on the single-threaded
++/* Handle one TCP segment addressed to any mux-local port. Unlike the
++ * ru_mux_tcp_input path above, this never touches rmx0/ifnet_input: on SYN
++ * it opens a genuine kernel socket to 127.0.0.1:<local_port>
++ * (sock_socket+sock_connect, exactly as AppleUSBMux does on a real iPhone,
++ * so whatever is listening sees pid 0 on a loopback peer), then shuttles
++ * bytes between that socket and usbmuxd's simplified TCP, which this
++ * function terminates itself. Runs only on the single-threaded
+  * ru_usb_thread, so the ru.loop[] table needs no locking beyond what is
+  * already needed to share ru.txq with the network stack's output callback. */
+-static int ru_loop_tcp_input(const uint8_t *segment, uint32_t tcp_len)
++static int ru_loop_tcp_input(uint16_t local_port, const uint8_t *segment, uint32_t tcp_len)
+ {
+ 	struct tcphdr th;
+ 	uint16_t peer_port;
+@@ -1095,28 +1100,29 @@ static int ru_loop_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ 		lck_mtx_lock(ru.tx_lock);
+ 		idx = ru_loop_find_locked(peer_port);
+ 		if (idx >= 0) ru_loop_close_locked(idx);
+-		idx = ru_loop_alloc_locked(peer_port);
++		idx = ru_loop_alloc_locked(local_port, peer_port);
+ 		lck_mtx_unlock(ru.tx_lock);
+ 		if (idx < 0) {
+-			printf("ROSEMARY USB: loopback SYN %u->62078: no free slot\n", peer_port);
++			printf("ROSEMARY USB: loopback SYN %u->%u: no free slot\n", peer_port, local_port);
+ 			return 1;
+ 		}
+ 
+ 		bzero(&sin, sizeof(sin));
+ 		sin.sin_len = sizeof(sin);
+ 		sin.sin_family = AF_INET;
+-		sin.sin_port = htons((uint16_t)RU_LOOP_PORT);
++		sin.sin_port = htons(local_port);
+ 		sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+ 		err = sock_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, NULL, &so);
+ 		if (err == 0) err = sock_connect(so, (struct sockaddr *)&sin, 0);
+ 		if (err != 0) {
+ 			printf("ROSEMARY USB: loopback connect 127.0.0.1:%u failed err=%d\n",
+-			    RU_LOOP_PORT, err);
++			    local_port, err);
+ 			if (so != NULL) sock_close(so);
+ 			lck_mtx_lock(ru.tx_lock);
+ 			ru_loop_close_locked(idx);
+ 			lck_mtx_unlock(ru.tx_lock);
+-			ru_loop_tx_segment(peer_port, seg_seq + 1u, 0u, TH_RST | TH_ACK, NULL, 0u);
++			ru_loop_tx_segment(local_port, peer_port, seg_seq + 1u, 0u,
++			    TH_RST | TH_ACK, NULL, 0u);
+ 			return 1;
+ 		}
+ 
+@@ -1134,9 +1140,10 @@ static int ru_loop_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ 		}
+ 		lck_mtx_unlock(ru.tx_lock);
+ 
+-		printf("ROSEMARY USB: loopback TCP %u->62078 connected to 127.0.0.1:62078 isn=%u\n",
+-		    peer_port, our_isn);
+-		ru_loop_tx_segment(peer_port, our_isn, seg_seq + 1u, TH_SYN | TH_ACK, NULL, 0u);
++		printf("ROSEMARY USB: loopback TCP %u->%u connected to 127.0.0.1:%u isn=%u\n",
++		    peer_port, local_port, local_port, our_isn);
++		ru_loop_tx_segment(local_port, peer_port, our_isn, seg_seq + 1u,
++		    TH_SYN | TH_ACK, NULL, 0u);
+ 		return 1;
+ 	}
+ 
+@@ -1145,8 +1152,8 @@ static int ru_loop_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ 	lck_mtx_unlock(ru.tx_lock);
+ 	if (idx < 0) {
+ 		if ((flags & TH_RST) == 0u) {
+-			ru_loop_tx_segment(peer_port, seg_ack, seg_seq + (paylen != 0u ? paylen : 1u),
+-			    TH_RST | TH_ACK, NULL, 0u);
++			ru_loop_tx_segment(local_port, peer_port, seg_ack,
++			    seg_seq + (paylen != 0u ? paylen : 1u), TH_RST | TH_ACK, NULL, 0u);
+ 		}
+ 		return 1;
+ 	}
+@@ -1155,7 +1162,7 @@ static int ru_loop_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ 		lck_mtx_lock(ru.tx_lock);
+ 		ru_loop_close_locked(idx);
+ 		lck_mtx_unlock(ru.tx_lock);
+-		printf("ROSEMARY USB: loopback TCP %u->62078 reset by usbmuxd\n", peer_port);
++		printf("ROSEMARY USB: loopback TCP %u->%u reset by usbmuxd\n", peer_port, local_port);
+ 		return 1;
+ 	}
+ 
+@@ -1186,8 +1193,8 @@ static int ru_loop_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ 				total_sent += (uint32_t)sent;
+ 			}
+ 			if (err != 0 || total_sent != paylen) {
+-				printf("ROSEMARY USB: loopback TCP %u->62078 sock_send err=%d sent=%u/%u\n",
+-				    peer_port, err, total_sent, paylen);
++				printf("ROSEMARY USB: loopback TCP %u->%u sock_send err=%d sent=%u/%u\n",
++				    peer_port, local_port, err, total_sent, paylen);
+ 			}
+ 			expect_seq += paylen;
+ 			lck_mtx_lock(ru.tx_lock);
+@@ -1196,7 +1203,7 @@ static int ru_loop_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ 			}
+ 			lck_mtx_unlock(ru.tx_lock);
+ 		}
+-		ru_loop_tx_segment(peer_port, our_seq, expect_seq, TH_ACK, NULL, 0u);
++		ru_loop_tx_segment(local_port, peer_port, our_seq, expect_seq, TH_ACK, NULL, 0u);
+ 	}
+ 
+ 	if ((flags & TH_FIN) != 0u) {
+@@ -1213,8 +1220,8 @@ static int ru_loop_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ 		lck_mtx_unlock(ru.tx_lock);
+ 
+ 		if (so != NULL) sock_shutdown(so, SHUT_WR);
+-		ru_loop_tx_segment(peer_port, our_seq, new_peer_seq, TH_ACK, NULL, 0u);
+-		printf("ROSEMARY USB: loopback TCP %u->62078 got FIN, half-closing\n", peer_port);
++		ru_loop_tx_segment(local_port, peer_port, our_seq, new_peer_seq, TH_ACK, NULL, 0u);
++		printf("ROSEMARY USB: loopback TCP %u->%u got FIN, half-closing\n", peer_port, local_port);
+ 	}
+ 
+ 	return 1;
+@@ -1228,7 +1235,7 @@ static void ru_loop_poll_slot(uint32_t i)
+ {
+ 	uint8_t buf[RU_LOOP_RX_CHUNK];
+ 	socket_t so;
+-	uint16_t peer_port;
++	uint16_t local_port, peer_port;
+ 	uint32_t our_seq, peer_seq;
+ 
+ 	lck_mtx_lock(ru.tx_lock);
+@@ -1237,6 +1244,7 @@ static void ru_loop_poll_slot(uint32_t i)
+ 		return;
+ 	}
+ 	so = ru.loop[i].so;
++	local_port = ru.loop[i].local_port;
+ 	peer_port = ru.loop[i].peer_port;
+ 	our_seq = ru.loop[i].our_seq;
+ 	peer_seq = ru.loop[i].peer_seq;
+@@ -1266,13 +1274,13 @@ static void ru_loop_poll_slot(uint32_t i)
+ 				ru_loop_close_locked((int)i);
+ 			}
+ 			lck_mtx_unlock(ru.tx_lock);
+-			ru_loop_tx_segment(peer_port, our_seq, peer_seq, TH_FIN | TH_ACK, NULL, 0u);
+-			printf("ROSEMARY USB: loopback TCP %u->62078 lockdownd closed (err=%d); sent FIN\n",
+-			    peer_port, err);
++			ru_loop_tx_segment(local_port, peer_port, our_seq, peer_seq, TH_FIN | TH_ACK, NULL, 0u);
++			printf("ROSEMARY USB: loopback TCP %u->%u closed (err=%d); sent FIN\n",
++			    peer_port, local_port, err);
+ 			return;
+ 		}
+ 
+-		ru_loop_tx_segment(peer_port, our_seq, peer_seq, TH_ACK, buf, (uint32_t)recvd);
++		ru_loop_tx_segment(local_port, peer_port, our_seq, peer_seq, TH_ACK, buf, (uint32_t)recvd);
+ 		our_seq += (uint32_t)recvd;
+ 		lck_mtx_lock(ru.tx_lock);
+ 		if (!ru.loop[i].valid || ru.loop[i].peer_port != peer_port) {
+@@ -1342,130 +1350,28 @@ static int ru_mux_arp_reply(mbuf_t request, size_t frame_len)
+ 	return 1;
+ }
+ 
+-/* MUX_PROTO_TCP carries a TCP segment without an IP header. Recreate an
+- * Ethernet/IPv4 packet and inject it into XNU's normal TCP stack. The host's
+- * usbmuxd leaves the TCP checksum unset, so calculate it against this stable
+- * synthetic /30 link before calling ifnet_input(). */
++/* MUX_PROTO_TCP carries a TCP segment without an IP header. Every such
++ * segment - whatever local port it targets - is terminated directly in
++ * software and bridged to a real kernel-originated loopback socket by
++ * ru_loop_tcp_input(); see the comment above that function and above
++ * RU_LOOP_DEPTH for why injecting into XNU's real stack via rmx0 (the
++ * approach this function historically used) does not satisfy lockdownd's
++ * or other mux services' peer-trust checks. */
+ static int ru_mux_tcp_input(const uint8_t *segment, uint32_t tcp_len)
+ {
+-	struct ether_header eh;
+-	struct ip ip;
+ 	struct tcphdr th;
+-	struct ifnet_stat_increment_param stats = {};
+-	uint8_t tcp_header[60];
+-	uint8_t pseudo[12];
+-	mbuf_t m = NULL;
+ 	size_t tcp_hlen;
+-	size_t full_len;
+-	uint32_t sum;
+-	uint16_t tcp_sum;
+-	uint16_t local_port, peer_port;
+-	uint32_t server_isn, wire_ack, translated_ack;
+-	int map_found;
++	uint16_t local_port;
+ 
+ 	if (!segment || tcp_len < sizeof(struct tcphdr) || ru.mux_ifp == NULL) return 0;
+ 	tcp_hlen = (size_t)((segment[12] >> 4) & 0x0fu) * 4u;
+-	if (tcp_hlen < sizeof(struct tcphdr) || tcp_hlen > sizeof(tcp_header) || tcp_hlen > tcp_len) {
++	if (tcp_hlen < sizeof(struct tcphdr) || tcp_hlen > 60u || tcp_hlen > tcp_len) {
+ 		printf("ROSEMARY USB: invalid TCP header len=%lu segment=%u\n", (unsigned long)tcp_hlen, tcp_len);
+ 		return 0;
+ 	}
+ 	bcopy(segment, &th, sizeof(th));
+ 	local_port = ntohs(th.th_dport);
+-	peer_port = ntohs(th.th_sport);
+-
+-	/* lockdownd's own peer-trust check is satisfied only by a genuine local
+-	 * kernel peer; terminate its TCP here instead of injecting into rmx0. */
+-	if (local_port == RU_LOOP_PORT) {
+-		return ru_loop_tcp_input(segment, tcp_len);
+-	}
+-
+-	bcopy(segment, tcp_header, tcp_hlen);
+-	tcp_header[16] = 0;
+-	tcp_header[17] = 0;
+-
+-	/* ACKs from usbmuxd are in its synthetic sequence space. Translate them
+-	 * into the real XNU sequence space before recomputing the TCP checksum. */
+-	if ((th.th_flags & TH_ACK) != 0u) {
+-		server_isn = ru_mux_tcp_map_get(local_port, peer_port, &map_found);
+-		if (map_found) {
+-			uint32_t net_ack;
+-			wire_ack = ntohl(th.th_ack);
+-			translated_ack = wire_ack + server_isn;
+-			net_ack = htonl(translated_ack);
+-			bcopy(&net_ack, tcp_header + 8, sizeof(net_ack));
+-			printf("ROSEMARY USB: TCP SEQMAP IN %u->%u ack=%u->%u isn=%u\n",
+-			    peer_port, local_port, wire_ack, translated_ack, server_isn);
+-		}
+-	}
+-
+-	bzero(&ip, sizeof(ip));
+-	ip.ip_v = IPVERSION;
+-	ip.ip_hl = sizeof(ip) / 4u;
+-	ip.ip_len = htons((uint16_t)(sizeof(ip) + tcp_len));
+-	ip.ip_id = htons(++ru.mux_ip_id);
+-	ip.ip_off = 0;
+-	ip.ip_ttl = 64;
+-	ip.ip_p = IPPROTO_TCP;
+-	ip.ip_src.s_addr = htonl(RU_MUX_HOST_IP);
+-	ip.ip_dst.s_addr = htonl(RU_MUX_DEVICE_IP);
+-	ip.ip_sum = 0;
+-	ip.ip_sum = htons(ru_checksum_finish(ru_checksum_add(0, (const uint8_t *)&ip, sizeof(ip))));
+-
+-	bcopy(&ip.ip_src.s_addr, pseudo, 4);
+-	bcopy(&ip.ip_dst.s_addr, pseudo + 4, 4);
+-	pseudo[8] = 0;
+-	pseudo[9] = IPPROTO_TCP;
+-	pseudo[10] = (uint8_t)(tcp_len >> 8);
+-	pseudo[11] = (uint8_t)tcp_len;
+-	sum = ru_checksum_add(0, pseudo, sizeof(pseudo));
+-	/* Pseudo-header and TCP header lengths are both even, so the odd-byte
+-	 * checksum rule only matters at the end of the payload. */
+-	sum = ru_checksum_add(sum, tcp_header, tcp_hlen);
+-	if (tcp_len > tcp_hlen) sum = ru_checksum_add(sum, segment + tcp_hlen, tcp_len - tcp_hlen);
+-	tcp_sum = ru_checksum_finish(sum);
+-	tcp_header[16] = (uint8_t)(tcp_sum >> 8);
+-	tcp_header[17] = (uint8_t)tcp_sum;
+-
+-	bcopy(ru_mux_device_mac, eh.ether_dhost, ETHER_ADDR_LEN);
+-	bcopy(ru_mux_host_mac, eh.ether_shost, ETHER_ADDR_LEN);
+-	eh.ether_type = htons(ETHERTYPE_IP);
+-	full_len = ETHER_HDR_LEN + sizeof(ip) + tcp_len;
+-	if (mbuf_allocpacket(MBUF_DONTWAIT, full_len, NULL, &m) != 0 || m == NULL) {
+-		printf("ROSEMARY USB: failed to allocate TCP input mbuf len=%lu\n", (unsigned long)full_len);
+-		if (m != NULL) mbuf_freem(m);
+-		return 0;
+-	}
+-	if (mbuf_copyback(m, 0, ETHER_HDR_LEN, &eh, MBUF_DONTWAIT) != 0 ||
+-	    mbuf_copyback(m, ETHER_HDR_LEN, sizeof(ip), &ip, MBUF_DONTWAIT) != 0 ||
+-	    mbuf_copyback(m, ETHER_HDR_LEN + sizeof(ip), tcp_hlen, tcp_header, MBUF_DONTWAIT) != 0 ||
+-	    (tcp_len > tcp_hlen && mbuf_copyback(m, ETHER_HDR_LEN + sizeof(ip) + tcp_hlen,
+-	        tcp_len - tcp_hlen, segment + tcp_hlen, MBUF_DONTWAIT) != 0)) {
+-		mbuf_freem(m);
+-		return 0;
+-	}
+-	{
+-		void *frame_header = mbuf_data(m);
+-		mbuf_pkthdr_setrcvif(m, ru.mux_ifp);
+-		mbuf_pkthdr_setheader(m, frame_header);
+-		mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
+-		(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
+-	}
+-	stats.packets_in = 1;
+-	stats.bytes_in = full_len;
+-	ifnet_input(ru.mux_ifp, m, &stats);
+-	if ((th.th_flags & TH_RST) != 0u) {
+-		ru_mux_tcp_map_clear(local_port, peer_port);
+-	}
+-
+-	/* Log the packet as injected into XNU (including its translated ACK). */
+-	bcopy(tcp_header, &th, sizeof(th));
+-	ru.mux_tcp_in_count++;
+-	if (ru.mux_tcp_in_count <= 16u) {
+-		printf("ROSEMARY USB: TCP IN #%u %u->%u flags=%02x seq=%u ack=%u bytes=%u\n",
+-		    ru.mux_tcp_in_count, ntohs(th.th_sport), ntohs(th.th_dport), th.th_flags,
+-		    ntohl(th.th_seq), ntohl(th.th_ack), tcp_len - (uint32_t)tcp_hlen);
+-	}
+-	return 1;
++	return ru_loop_tcp_input(local_port, segment, tcp_len);
+ }
+ 
+ static int ru_mux_tx_tcp_mbuf(mbuf_t m, size_t offset, uint32_t tcp_len)
