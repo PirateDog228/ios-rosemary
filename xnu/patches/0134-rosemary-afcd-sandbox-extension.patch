@@ -1,0 +1,29 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4d..99e2ca1 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -296,10 +296,22 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
+-	case 5:         /* extension issue */
+-	case 6:         /* extension consume */
+ 	case 0x43:      /* container expected */
++		/* These must hand back real path data we do not have; a bare
++		 * success with nothing written to the caller's buffer risks a
++		 * worse failure downstream than a clean ENOENT the caller can
++		 * (and does) handle. */
+ 		return ENOENT;
++	case 5:         /* extension issue */
++	case 6:         /* extension consume */
++		/* This policy registers no vnode/file hooks, so nothing in the
++		 * kernel ever inspects or enforces an issued extension token;
++		 * ENOENT here only serves to make libsystem_sandbox report
++		 * failure to the caller. Some daemons (afcd) treat that as
++		 * fatal ("failed to load sandbox", sandbox_extension_issue_file
++		 * failed: 2) and exit(1) outright, even though nothing was
++		 * actually going to be enforced either way. Claim success. */
++		return 0;
+ 	default:
+ 		return 0;
+ 	}
