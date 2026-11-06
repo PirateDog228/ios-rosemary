@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index eeafbed..0629e23 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -984,7 +984,16 @@ static void ru_loop_tx_segment(uint16_t local_port, uint16_t peer_port,
+ 	rosemary_usbmux_put_be32(tcp_header + 8, ack);
+ 	tcp_header[12] = (uint8_t)(5u << 4); /* data offset = 5 words, no options */
+ 	tcp_header[13] = flags;
+-	rosemary_usbmux_put_be16(tcp_header + 14, 32768u); /* window */
++	/* 0135: same usbmuxd quirk noted in ru_mux_tcp_output() at 0123 -
++	 * usbmuxd multiplies the window value it reads by 256. This path was
++	 * added in 0132 and advertised a raw 32768, which usbmuxd read as an
++	 * ~8 MB window; it then kept streaming without waiting for us, and its
++	 * own small per-connection input buffer overflowed ("Input buffer
++	 * overflow ... space=891, payload=1075"), tearing the connection down
++	 * and crashing high-throughput clients like idevicesyslog. Advertise
++	 * a real 32 KiB window by sending it pre-shifted, exactly like the
++	 * other path does. */
++	rosemary_usbmux_put_be16(tcp_header + 14, 32768u >> 8); /* window (pre-shifted for usbmuxd's *256) */
+ 
+ 	{
+ 		uint32_t src_ip = htonl(RU_MUX_DEVICE_IP);
