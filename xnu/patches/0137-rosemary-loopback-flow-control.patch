@@ -1,0 +1,109 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 1581fa7..5ccd4b2 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -267,6 +267,8 @@ static struct {
+ 		uint16_t peer_port;   /* usbmuxd's synthetic client port */
+ 		uint32_t our_seq;     /* next seq we will use toward usbmuxd */
+ 		uint32_t peer_seq;    /* next seq we expect from usbmuxd (our ack) */
++		uint32_t acked_seq;   /* 0137: highest our_seq byte usbmuxd has ACKed */
++		uint32_t peer_window; /* 0137: usbmuxd's last advertised receive window, in real bytes */
+ 		socket_t so;          /* real kernel socket to 127.0.0.1:local_port */
+ 	} loop[RU_LOOP_DEPTH];
+ 	struct {
+@@ -1175,6 +1177,12 @@ static int ru_loop_tcp_input(uint16_t local_port, const uint8_t *segment,
+ 			ru.loop[idx].so = so;
+ 			ru.loop[idx].peer_seq = seg_seq + 1u;
+ 			ru.loop[idx].our_seq = our_isn + 1u; /* +1 for the SYN below */
++			ru.loop[idx].acked_seq = our_isn + 1u; /* 0137: nothing sent/outstanding yet */
++			/* 0137: usbmuxd's SYN already carries its real receive window for
++			 * this connection; seed peer_window from it instead of assuming
++			 * we may send freely. Same >>8 wire convention as our own window
++			 * (0123/0135) applies symmetrically - see ru_loop_tcp_input. */
++			ru.loop[idx].peer_window = ((uint32_t)ntohs(th.th_win)) << 8;
+ 		} else {
+ 			/* Slot was reset concurrently (USB reconfig); undo the connect. */
+ 			lck_mtx_unlock(ru.tx_lock);
+@@ -1209,6 +1217,28 @@ static int ru_loop_tcp_input(uint16_t local_port, const uint8_t *segment,
+ 		return 1;
+ 	}
+ 
++	/* 0137: every segment from usbmuxd carries a current ack/window, not just
++	 * pure ACKs - a data segment or a FIN updates both just as well. Nothing
++	 * here throttled how fast ru_loop_poll_slot() drained the local service's
++	 * socket back toward usbmuxd: we read and forwarded as fast as the local
++	 * daemon produced data, ignoring usbmuxd's own small per-connection
++	 * buffer entirely. On a high-throughput connection (the syslog relay)
++	 * that overran it ("Input buffer overflow ... space=891, payload=1075"),
++	 * tearing the connection down and crashing the client reading it. Track
++	 * usbmuxd's actual advertised window so ru_loop_poll_slot() can cap how
++	 * much unacknowledged data it keeps in flight. */
++	if ((flags & TH_ACK) != 0u) {
++		lck_mtx_lock(ru.tx_lock);
++		if (ru.loop[idx].valid && ru.loop[idx].local_port == local_port &&
++		    ru.loop[idx].peer_port == peer_port) {
++			if ((int32_t)(seg_ack - ru.loop[idx].acked_seq) > 0) {
++				ru.loop[idx].acked_seq = seg_ack;
++			}
++			ru.loop[idx].peer_window = ((uint32_t)ntohs(th.th_win)) << 8;
++		}
++		lck_mtx_unlock(ru.tx_lock);
++	}
++
+ 	if (paylen != 0u) {
+ 		socket_t so;
+ 		uint32_t expect_seq, our_seq, total_sent;
+@@ -1271,8 +1301,21 @@ static int ru_loop_tcp_input(uint16_t local_port, const uint8_t *segment,
+ 	return 1;
+ }
+ 
++/* 0137: hard ceiling on unacknowledged bytes in flight toward usbmuxd,
++ * regardless of the window it advertises. usbmuxd's real per-connection
++ * buffer on a high-throughput relay (idevicesyslog) has been observed to
++ * overflow with only a few hundred bytes of headroom ("Input buffer
++ * overflow ... space=891, payload=1075"); this keeps us well under that
++ * even if the peer_window parsed from its ACKs (see ru_loop_tcp_input) is
++ * wrong or absent. */
++#define RU_LOOP_INFLIGHT_CAP 2048u
++
+ /* Drain one loopback socket (non-blocking) and forward whatever the local
+- * service sent back to usbmuxd, translating EOF into a FIN. */
++ * service sent back to usbmuxd, translating EOF into a FIN. Throttled by
++ * usbmuxd's own advertised window (0137): never keeps more than a small,
++ * capped amount of unacknowledged data outstanding, so a fast local
++ * producer (e.g. syslogd) no longer outruns usbmuxd's small per-connection
++ * buffer. */
+ static void ru_loop_poll_slot(uint32_t i)
+ {
+ 	uint8_t buf[RU_LOOP_RX_CHUNK];
+@@ -1296,11 +1339,29 @@ static void ru_loop_poll_slot(uint32_t i)
+ 		struct msghdr msg;
+ 		struct iovec iov;
+ 		size_t recvd = 0;
++		size_t want;
++		uint32_t in_flight, window_cap, available;
+ 		errno_t err;
+ 
++		lck_mtx_lock(ru.tx_lock);
++		if (!ru.loop[i].valid || ru.loop[i].local_port != local_port ||
++		    ru.loop[i].peer_port != peer_port) {
++			lck_mtx_unlock(ru.tx_lock);
++			return; /* slot reused/closed concurrently (reset path) */
++		}
++		our_seq = ru.loop[i].our_seq;
++		window_cap = ru.loop[i].peer_window;
++		in_flight = our_seq - ru.loop[i].acked_seq;
++		lck_mtx_unlock(ru.tx_lock);
++
++		if (window_cap > RU_LOOP_INFLIGHT_CAP) window_cap = RU_LOOP_INFLIGHT_CAP;
++		available = (window_cap > in_flight) ? (window_cap - in_flight) : 0u;
++		if (available == 0u) return; /* window closed; resume once an ACK reopens it */
++		want = (available < sizeof(buf)) ? (size_t)available : sizeof(buf);
++
+ 		bzero(&msg, sizeof(msg));
+ 		iov.iov_base = buf;
+-		iov.iov_len = sizeof(buf);
++		iov.iov_len = want;
+ 		msg.msg_iov = &iov;
+ 		msg.msg_iovlen = 1;
+ 		err = sock_receive(so, &msg, MSG_DONTWAIT, &recvd);
