@@ -1,0 +1,83 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index eeafbed..1581fa7 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -959,6 +959,10 @@ static void ru_loop_reset_all_locked(void)
+ 	}
+ }
+ 
++/* 0136: forward declaration - defined later in the file (0123), needed here
++ * to recompute the TCP checksum after the anti-512-boundary split below. */
++static void ru_mux_tcp_fix_checksum(uint8_t *seg, uint32_t len);
++
+ /* Build one bare TCP segment (no Ethernet/IP) addressed from local_port to
+  * peer_port and queue it as a normal USBMUX TCP packet. */
+ static void ru_loop_tx_segment(uint16_t local_port, uint16_t peer_port,
+@@ -984,7 +988,16 @@ static void ru_loop_tx_segment(uint16_t local_port, uint16_t peer_port,
+ 	rosemary_usbmux_put_be32(tcp_header + 8, ack);
+ 	tcp_header[12] = (uint8_t)(5u << 4); /* data offset = 5 words, no options */
+ 	tcp_header[13] = flags;
+-	rosemary_usbmux_put_be16(tcp_header + 14, 32768u); /* window */
++	/* 0135: same usbmuxd quirk noted in ru_mux_tcp_output() at 0123 -
++	 * usbmuxd multiplies the window value it reads by 256. This path was
++	 * added in 0132 and advertised a raw 32768, which usbmuxd read as an
++	 * ~8 MB window; it then kept streaming without waiting for us, and its
++	 * own small per-connection input buffer overflowed ("Input buffer
++	 * overflow ... space=891, payload=1075"), tearing the connection down
++	 * and crashing high-throughput clients like idevicesyslog. Advertise
++	 * a real 32 KiB window by sending it pre-shifted, exactly like the
++	 * other path does. */
++	rosemary_usbmux_put_be16(tcp_header + 14, 32768u >> 8); /* window (pre-shifted for usbmuxd's *256) */
+ 
+ 	{
+ 		uint32_t src_ip = htonl(RU_MUX_DEVICE_IP);
+@@ -1029,8 +1042,47 @@ static void ru_loop_tx_segment(uint16_t local_port, uint16_t peer_port,
+ 	}
+ 	bcopy(tcp_header, out + header_len, sizeof(tcp_header));
+ 	if (paylen != 0u) bcopy(payload, out + header_len + sizeof(tcp_header), paylen);
+-	ru.txq[idx].len = (uint16_t)total_len;
+-	ru.txq_count++;
++
++	/* 0136: the same 0122 workaround, ported to this loopback path. A bulk-IN
++	 * transfer whose length is an exact multiple of RU_BULK_MPS is not
++	 * reliably terminated for the host by the controller's ZLP bit (0120's
++	 * GPD_FLAGS_ZLP alone is not enough here either), so usbmuxd glues it to
++	 * whatever frame follows ("Incoming packet size mismatch ... expected
++	 * 512, got 1040") and then overflows its small per-connection buffer and
++	 * tears the connection down. Move the last payload byte into a second,
++	 * short mux frame so no loopback frame ever lands exactly on a
++	 * RU_BULK_MPS boundary. */
++	if ((total_len % RU_BULK_MPS) == 0u && paylen != 0u &&
++	    ru.txq_count + 1u < RU_MUX_TXQ_DEPTH) {
++		uint32_t idx2 = (idx + 1u) % RU_MUX_TXQ_DEPTH;
++		uint8_t *out2 = ru.txq[idx2].data;
++		uint32_t tcp_len2 = (uint32_t)sizeof(tcp_header) + 1u;
++		uint32_t total_len2 = header_len + tcp_len2;
++		uint32_t seq2 = seq + paylen - 1u;
++
++		bcopy(out, out2, header_len + sizeof(tcp_header));
++		out2[header_len + 4] = (uint8_t)(seq2 >> 24);
++		out2[header_len + 5] = (uint8_t)(seq2 >> 16);
++		out2[header_len + 6] = (uint8_t)(seq2 >> 8);
++		out2[header_len + 7] = (uint8_t)seq2;
++		out2[header_len + sizeof(tcp_header)] = out[header_len + sizeof(tcp_header) + paylen - 1u];
++		rosemary_usbmux_put_be32(out2 + 4, total_len2);
++		if (ru.mux_version >= 2u) rosemary_usbmux_put_be16(out2 + 12, ru.mux_tx_seq++);
++		ru_mux_tcp_fix_checksum(out2 + header_len, tcp_len2);
++
++		tcp_len -= 1u;
++		total_len -= 1u;
++		rosemary_usbmux_put_be32(out + 4, total_len);
++		ru_mux_tcp_fix_checksum(out + header_len, tcp_len);
++
++		ru.txq[idx].len = (uint16_t)total_len;
++		ru.txq_count++;
++		ru.txq[idx2].len = (uint16_t)total_len2;
++		ru.txq_count++;
++	} else {
++		ru.txq[idx].len = (uint16_t)total_len;
++		ru.txq_count++;
++	}
+ 	ru.mux_tcp_out_count++;
+ 	/* This fires on every segment of every loopback-bridged connection,
+ 	 * including long-lived, high-volume ones such as the syslog relay. An
