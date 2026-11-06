@@ -1,0 +1,90 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 5ccd4b2..e18d5e2 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -1301,27 +1301,36 @@ static int ru_loop_tcp_input(uint16_t local_port, const uint8_t *segment,
+ 	return 1;
+ }
+ 
+-/* 0137: hard ceiling on unacknowledged bytes in flight toward usbmuxd,
+- * regardless of the window it advertises. usbmuxd's real per-connection
+- * buffer on a high-throughput relay (idevicesyslog) has been observed to
+- * overflow with only a few hundred bytes of headroom ("Input buffer
+- * overflow ... space=891, payload=1075"); this keeps us well under that
+- * even if the peer_window parsed from its ACKs (see ru_loop_tcp_input) is
+- * wrong or absent. */
+-#define RU_LOOP_INFLIGHT_CAP 2048u
++/* 0138: 0137 gated sending on usbmuxd's advertised receive window, parsed
++ * from th_win on its ACKs under the assumption that it uses the same >>8
++ * wire convention as our own outbound window (0123/0135). In practice this
++ * stalled every loopback connection outright, syslog included - usbmuxd's
++ * synthetic TCP shim does not seem to advertise a real, growing window on
++ * this path at all ("usbmuxd does not check sequence numbers" was already
++ * the working assumption elsewhere in this file), so the parsed window
++ * stayed at (or decoded to) zero forever and nothing was ever allowed to
++ * send again. Rather than trust that field, throttle the dumb but reliable
++ * way: cap how many chunks a single ru_loop_poll_slot() call forwards, and
++ * let the very frequent outer poll loop (ru_tx_poll/ru_rx_poll/ru_loop_poll
++ * run every pass of the USB driver's main loop) spread a fast producer's
++ * output across many ticks instead of draining the whole socket backlog in
++ * one tight inner loop, which is what overran usbmuxd's small
++ * per-connection buffer in the first place ("Input buffer overflow ...
++ * space=891, payload=1075"). acked_seq/peer_window (0137) are still updated
++ * for visibility but no longer gate sending. */
++#define RU_LOOP_CHUNKS_PER_TICK 2u
+ 
+ /* Drain one loopback socket (non-blocking) and forward whatever the local
+- * service sent back to usbmuxd, translating EOF into a FIN. Throttled by
+- * usbmuxd's own advertised window (0137): never keeps more than a small,
+- * capped amount of unacknowledged data outstanding, so a fast local
+- * producer (e.g. syslogd) no longer outruns usbmuxd's small per-connection
+- * buffer. */
++ * service sent back to usbmuxd, translating EOF into a FIN. Bounded to a
++ * few chunks per call (0138) so one fast connection cannot both starve the
++ * other loopback slots and outrun usbmuxd's own buffer in a single burst. */
+ static void ru_loop_poll_slot(uint32_t i)
+ {
+ 	uint8_t buf[RU_LOOP_RX_CHUNK];
+ 	socket_t so;
+ 	uint16_t local_port, peer_port;
+ 	uint32_t our_seq, peer_seq;
++	uint32_t chunks = 0u;
+ 
+ 	lck_mtx_lock(ru.tx_lock);
+ 	if (!ru.loop[i].valid || ru.loop[i].so == NULL) {
+@@ -1335,33 +1344,15 @@ static void ru_loop_poll_slot(uint32_t i)
+ 	peer_seq = ru.loop[i].peer_seq;
+ 	lck_mtx_unlock(ru.tx_lock);
+ 
+-	for (;;) {
++	for (; chunks < RU_LOOP_CHUNKS_PER_TICK; chunks++) {
+ 		struct msghdr msg;
+ 		struct iovec iov;
+ 		size_t recvd = 0;
+-		size_t want;
+-		uint32_t in_flight, window_cap, available;
+ 		errno_t err;
+ 
+-		lck_mtx_lock(ru.tx_lock);
+-		if (!ru.loop[i].valid || ru.loop[i].local_port != local_port ||
+-		    ru.loop[i].peer_port != peer_port) {
+-			lck_mtx_unlock(ru.tx_lock);
+-			return; /* slot reused/closed concurrently (reset path) */
+-		}
+-		our_seq = ru.loop[i].our_seq;
+-		window_cap = ru.loop[i].peer_window;
+-		in_flight = our_seq - ru.loop[i].acked_seq;
+-		lck_mtx_unlock(ru.tx_lock);
+-
+-		if (window_cap > RU_LOOP_INFLIGHT_CAP) window_cap = RU_LOOP_INFLIGHT_CAP;
+-		available = (window_cap > in_flight) ? (window_cap - in_flight) : 0u;
+-		if (available == 0u) return; /* window closed; resume once an ACK reopens it */
+-		want = (available < sizeof(buf)) ? (size_t)available : sizeof(buf);
+-
+ 		bzero(&msg, sizeof(msg));
+ 		iov.iov_base = buf;
+-		iov.iov_len = want;
++		iov.iov_len = sizeof(buf);
+ 		msg.msg_iov = &iov;
+ 		msg.msg_iovlen = 1;
+ 		err = sock_receive(so, &msg, MSG_DONTWAIT, &recvd);
