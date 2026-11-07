@@ -1,0 +1,176 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index e18d5e2..7c606be 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -269,6 +269,7 @@ static struct {
+ 		uint32_t peer_seq;    /* next seq we expect from usbmuxd (our ack) */
+ 		uint32_t acked_seq;   /* 0137: highest our_seq byte usbmuxd has ACKed */
+ 		uint32_t peer_window; /* 0137: usbmuxd's last advertised receive window, in real bytes */
++		uint64_t next_send_tick; /* 0139: ru_counter() value before which sending is paused */
+ 		socket_t so;          /* real kernel socket to 127.0.0.1:local_port */
+ 	} loop[RU_LOOP_DEPTH];
+ 	struct {
+@@ -1183,6 +1184,7 @@ static int ru_loop_tcp_input(uint16_t local_port, const uint8_t *segment,
+ 			 * we may send freely. Same >>8 wire convention as our own window
+ 			 * (0123/0135) applies symmetrically - see ru_loop_tcp_input. */
+ 			ru.loop[idx].peer_window = ((uint32_t)ntohs(th.th_win)) << 8;
++			ru.loop[idx].next_send_tick = 0u; /* 0139: nothing sent yet, allow immediately */
+ 		} else {
+ 			/* Slot was reset concurrently (USB reconfig); undo the connect. */
+ 			lck_mtx_unlock(ru.tx_lock);
+@@ -1301,42 +1303,51 @@ static int ru_loop_tcp_input(uint16_t local_port, const uint8_t *segment,
+ 	return 1;
+ }
+ 
+-/* 0138: 0137 gated sending on usbmuxd's advertised receive window, parsed
+- * from th_win on its ACKs under the assumption that it uses the same >>8
+- * wire convention as our own outbound window (0123/0135). In practice this
+- * stalled every loopback connection outright, syslog included - usbmuxd's
+- * synthetic TCP shim does not seem to advertise a real, growing window on
+- * this path at all ("usbmuxd does not check sequence numbers" was already
+- * the working assumption elsewhere in this file), so the parsed window
+- * stayed at (or decoded to) zero forever and nothing was ever allowed to
+- * send again. Rather than trust that field, throttle the dumb but reliable
+- * way: cap how many chunks a single ru_loop_poll_slot() call forwards, and
+- * let the very frequent outer poll loop (ru_tx_poll/ru_rx_poll/ru_loop_poll
+- * run every pass of the USB driver's main loop) spread a fast producer's
+- * output across many ticks instead of draining the whole socket backlog in
+- * one tight inner loop, which is what overran usbmuxd's small
+- * per-connection buffer in the first place ("Input buffer overflow ...
+- * space=891, payload=1075"). acked_seq/peer_window (0137) are still updated
+- * for visibility but no longer gate sending. */
+-#define RU_LOOP_CHUNKS_PER_TICK 2u
++/* 0139: 0138's per-tick chunk cap still let up to RU_LOOP_CHUNKS_PER_TICK
++ * full RU_LOOP_RX_CHUNK (1200-byte) reads go out back-to-back with no actual
++ * delay between them - the outer poll loop (ru_tx_poll/ru_rx_poll/
++ * ru_loop_poll, run every pass of the USB driver's main loop) turns out to
++ * cycle fast enough that this was still effectively one big burst, and
++ * usbmuxd's per-connection buffer has been observed as small as ~300 bytes
++ * of headroom ("Input buffer overflow ... space=305, payload=526") - well
++ * under even a single chunk. There is no reliable signal from usbmuxd's side
++ * to size against (0137's parsed window never worked - see its removal in
++ * 0138), so pace by real wall-clock time instead: a simple leaky bucket, one
++ * smaller chunk per call, gated by ru_counter() (already used for ru_delay_us
++ * / ru_sleep_ms) so a connection cannot send again until enough time has
++ * passed for the last chunk to drain at a conservative target rate. This
++ * does not depend on tick frequency, chunk size, or any assumption about
++ * usbmuxd's internals - only wall-clock time, which is the one thing a slow
++ * downstream reader actually needs. */
++#define RU_LOOP_SEND_CHUNK          512u   /* bytes forwarded per allowed send */
++#define RU_LOOP_RATE_BYTES_PER_SEC  16384u /* sustained cap per loopback connection */
+ 
+ /* Drain one loopback socket (non-blocking) and forward whatever the local
+- * service sent back to usbmuxd, translating EOF into a FIN. Bounded to a
+- * few chunks per call (0138) so one fast connection cannot both starve the
+- * other loopback slots and outrun usbmuxd's own buffer in a single burst. */
++ * service sent back to usbmuxd, translating EOF into a FIN. Paced by
++ * next_send_tick (0139) so a fast local producer (e.g. syslogd) cannot
++ * outrun usbmuxd's own small per-connection buffer. */
+ static void ru_loop_poll_slot(uint32_t i)
+ {
+ 	uint8_t buf[RU_LOOP_RX_CHUNK];
+ 	socket_t so;
+ 	uint16_t local_port, peer_port;
+ 	uint32_t our_seq, peer_seq;
+-	uint32_t chunks = 0u;
++	uint64_t now, hz;
++	struct msghdr msg;
++	struct iovec iov;
++	size_t recvd = 0;
++	errno_t err;
+ 
+ 	lck_mtx_lock(ru.tx_lock);
+ 	if (!ru.loop[i].valid || ru.loop[i].so == NULL) {
+ 		lck_mtx_unlock(ru.tx_lock);
+ 		return;
+ 	}
++	now = ru_counter();
++	if (now < ru.loop[i].next_send_tick) {
++		lck_mtx_unlock(ru.tx_lock);
++		return; /* 0139: still inside this connection's paced window */
++	}
+ 	so = ru.loop[i].so;
+ 	local_port = ru.loop[i].local_port;
+ 	peer_port = ru.loop[i].peer_port;
+@@ -1344,48 +1355,45 @@ static void ru_loop_poll_slot(uint32_t i)
+ 	peer_seq = ru.loop[i].peer_seq;
+ 	lck_mtx_unlock(ru.tx_lock);
+ 
+-	for (; chunks < RU_LOOP_CHUNKS_PER_TICK; chunks++) {
+-		struct msghdr msg;
+-		struct iovec iov;
+-		size_t recvd = 0;
+-		errno_t err;
+-
+-		bzero(&msg, sizeof(msg));
+-		iov.iov_base = buf;
+-		iov.iov_len = sizeof(buf);
+-		msg.msg_iov = &iov;
+-		msg.msg_iovlen = 1;
+-		err = sock_receive(so, &msg, MSG_DONTWAIT, &recvd);
+-
+-		if (err == EWOULDBLOCK || err == EAGAIN) return;
++	bzero(&msg, sizeof(msg));
++	iov.iov_base = buf;
++	iov.iov_len = RU_LOOP_SEND_CHUNK;
++	msg.msg_iov = &iov;
++	msg.msg_iovlen = 1;
++	err = sock_receive(so, &msg, MSG_DONTWAIT, &recvd);
+ 
+-		if (err != 0 || recvd == 0u) {
+-			lck_mtx_lock(ru.tx_lock);
+-			if (ru.loop[i].valid && ru.loop[i].local_port == local_port &&
+-			    ru.loop[i].peer_port == peer_port) {
+-				our_seq = ru.loop[i].our_seq;
+-				peer_seq = ru.loop[i].peer_seq;
+-				ru.loop[i].our_seq = our_seq + 1u; /* FIN consumes one seq */
+-				ru_loop_close_locked((int)i);
+-			}
+-			lck_mtx_unlock(ru.tx_lock);
+-			ru_loop_tx_segment(local_port, peer_port, our_seq, peer_seq, TH_FIN | TH_ACK, NULL, 0u);
+-			printf("ROSEMARY USB: loopback TCP %u->%u closed (err=%d); sent FIN\n",
+-			    peer_port, local_port, err);
+-			return;
+-		}
++	if (err == EWOULDBLOCK || err == EAGAIN) return;
+ 
+-		ru_loop_tx_segment(local_port, peer_port, our_seq, peer_seq, TH_ACK, buf, (uint32_t)recvd);
+-		our_seq += (uint32_t)recvd;
++	if (err != 0 || recvd == 0u) {
+ 		lck_mtx_lock(ru.tx_lock);
+-		if (!ru.loop[i].valid || ru.loop[i].local_port != local_port ||
+-		    ru.loop[i].peer_port != peer_port) {
+-			lck_mtx_unlock(ru.tx_lock);
+-			return; /* slot reused/closed concurrently (reset path) */
++		if (ru.loop[i].valid && ru.loop[i].local_port == local_port &&
++		    ru.loop[i].peer_port == peer_port) {
++			our_seq = ru.loop[i].our_seq;
++			peer_seq = ru.loop[i].peer_seq;
++			ru.loop[i].our_seq = our_seq + 1u; /* FIN consumes one seq */
++			ru_loop_close_locked((int)i);
+ 		}
+-		ru.loop[i].our_seq = our_seq;
+ 		lck_mtx_unlock(ru.tx_lock);
++		ru_loop_tx_segment(local_port, peer_port, our_seq, peer_seq, TH_FIN | TH_ACK, NULL, 0u);
++		printf("ROSEMARY USB: loopback TCP %u->%u closed (err=%d); sent FIN\n",
++		    peer_port, local_port, err);
++		return;
+ 	}
++
++	ru_loop_tx_segment(local_port, peer_port, our_seq, peer_seq, TH_ACK, buf, (uint32_t)recvd);
++	our_seq += (uint32_t)recvd;
++	hz = ru_counter_freq();
++	lck_mtx_lock(ru.tx_lock);
++	if (!ru.loop[i].valid || ru.loop[i].local_port != local_port ||
++	    ru.loop[i].peer_port != peer_port) {
++		lck_mtx_unlock(ru.tx_lock);
++		return; /* slot reused/closed concurrently (reset path) */
++	}
++	ru.loop[i].our_seq = our_seq;
++	if (hz != 0u) {
++		ru.loop[i].next_send_tick = now + (hz * (uint64_t)recvd) / RU_LOOP_RATE_BYTES_PER_SEC;
++	}
++	lck_mtx_unlock(ru.tx_lock);
+ }
+ 
+ static void ru_loop_poll(void)
