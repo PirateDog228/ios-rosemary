@@ -1,0 +1,96 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 7c606be..34e6f3c 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -270,6 +270,7 @@ static struct {
+ 		uint32_t acked_seq;   /* 0137: highest our_seq byte usbmuxd has ACKed */
+ 		uint32_t peer_window; /* 0137: usbmuxd's last advertised receive window, in real bytes */
+ 		uint64_t next_send_tick; /* 0139: ru_counter() value before which sending is paused */
++		uint32_t total_sent;     /* 0140: bytes forwarded so far this connection, for the burst allowance */
+ 		socket_t so;          /* real kernel socket to 127.0.0.1:local_port */
+ 	} loop[RU_LOOP_DEPTH];
+ 	struct {
+@@ -1185,6 +1186,7 @@ static int ru_loop_tcp_input(uint16_t local_port, const uint8_t *segment,
+ 			 * (0123/0135) applies symmetrically - see ru_loop_tcp_input. */
+ 			ru.loop[idx].peer_window = ((uint32_t)ntohs(th.th_win)) << 8;
+ 			ru.loop[idx].next_send_tick = 0u; /* 0139: nothing sent yet, allow immediately */
++			ru.loop[idx].total_sent = 0u;     /* 0140: full-speed burst allowance starts fresh */
+ 		} else {
+ 			/* Slot was reset concurrently (USB reconfig); undo the connect. */
+ 			lck_mtx_unlock(ru.tx_lock);
+@@ -1319,24 +1321,38 @@ static int ru_loop_tcp_input(uint16_t local_port, const uint8_t *segment,
+  * does not depend on tick frequency, chunk size, or any assumption about
+  * usbmuxd's internals - only wall-clock time, which is the one thing a slow
+  * downstream reader actually needs. */
+-#define RU_LOOP_SEND_CHUNK          512u   /* bytes forwarded per allowed send */
+-#define RU_LOOP_RATE_BYTES_PER_SEC  16384u /* sustained cap per loopback connection */
++#define RU_LOOP_SEND_CHUNK          512u   /* bytes forwarded per throttled send, once past the burst */
++#define RU_LOOP_RATE_BYTES_PER_SEC  16384u /* sustained cap once a connection is being throttled */
++/* 0140: 0139's pacing applied to every loopback connection uniformly, which
++ * also throttled lockdownd's own control tunnel (port 62078 goes through
++ * this same generalized path since 0132) and ssh's login exchange - both
++ * low-volume, latency-sensitive, and previously fine on their own. Spacing
++ * their small handshake/command traffic into 512-byte/~31ms steps piled up
++ * enough latency to time out pairing ("-7", receive timeout) and hang ssh
++ * outright. Only a connection that keeps producing well beyond a normal
++ * command exchange - the syslog relay - actually needs throttling. Give
++ * every connection a generous unthrottled burst allowance first (full-size
++ * reads, no gating) and only switch to 0139's paced, small-chunk mode once a
++ * connection has sent more than that within its lifetime. */
++#define RU_LOOP_BURST_BYTES         32768u
+ 
+ /* Drain one loopback socket (non-blocking) and forward whatever the local
+- * service sent back to usbmuxd, translating EOF into a FIN. Paced by
+- * next_send_tick (0139) so a fast local producer (e.g. syslogd) cannot
+- * outrun usbmuxd's own small per-connection buffer. */
++ * service sent back to usbmuxd, translating EOF into a FIN. Runs at full
++ * speed for RU_LOOP_BURST_BYTES per connection (0140), then falls back to
++ * 0139's wall-clock-paced small chunks so a sustained fast producer (e.g.
++ * syslogd) cannot outrun usbmuxd's own small per-connection buffer. */
+ static void ru_loop_poll_slot(uint32_t i)
+ {
+ 	uint8_t buf[RU_LOOP_RX_CHUNK];
+ 	socket_t so;
+ 	uint16_t local_port, peer_port;
+-	uint32_t our_seq, peer_seq;
++	uint32_t our_seq, peer_seq, total_sent;
+ 	uint64_t now, hz;
+ 	struct msghdr msg;
+ 	struct iovec iov;
+ 	size_t recvd = 0;
+ 	errno_t err;
++	int throttled;
+ 
+ 	lck_mtx_lock(ru.tx_lock);
+ 	if (!ru.loop[i].valid || ru.loop[i].so == NULL) {
+@@ -1344,7 +1360,9 @@ static void ru_loop_poll_slot(uint32_t i)
+ 		return;
+ 	}
+ 	now = ru_counter();
+-	if (now < ru.loop[i].next_send_tick) {
++	total_sent = ru.loop[i].total_sent;
++	throttled = (total_sent >= RU_LOOP_BURST_BYTES);
++	if (throttled && now < ru.loop[i].next_send_tick) {
+ 		lck_mtx_unlock(ru.tx_lock);
+ 		return; /* 0139: still inside this connection's paced window */
+ 	}
+@@ -1357,7 +1375,7 @@ static void ru_loop_poll_slot(uint32_t i)
+ 
+ 	bzero(&msg, sizeof(msg));
+ 	iov.iov_base = buf;
+-	iov.iov_len = RU_LOOP_SEND_CHUNK;
++	iov.iov_len = throttled ? RU_LOOP_SEND_CHUNK : sizeof(buf);
+ 	msg.msg_iov = &iov;
+ 	msg.msg_iovlen = 1;
+ 	err = sock_receive(so, &msg, MSG_DONTWAIT, &recvd);
+@@ -1390,7 +1408,9 @@ static void ru_loop_poll_slot(uint32_t i)
+ 		return; /* slot reused/closed concurrently (reset path) */
+ 	}
+ 	ru.loop[i].our_seq = our_seq;
+-	if (hz != 0u) {
++	total_sent += (uint32_t)recvd;
++	ru.loop[i].total_sent = (total_sent < RU_LOOP_BURST_BYTES) ? total_sent : RU_LOOP_BURST_BYTES;
++	if (throttled && hz != 0u) {
+ 		ru.loop[i].next_send_tick = now + (hz * (uint64_t)recvd) / RU_LOOP_RATE_BYTES_PER_SEC;
+ 	}
+ 	lck_mtx_unlock(ru.tx_lock);
