@@ -1,0 +1,105 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 34e6f3c..040bf2b 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -242,6 +242,16 @@ static struct {
+ 	int rx_gen2, rx_active;
+ 	int wait_channel;
+ 	uint32_t setups_logged, resets, speed_changes;
++	/* 0141: EP0 IN multi-packet state. Every descriptor sent so far has fit
++	 * in one 64-byte packet, so the old code always finished a transfer
++	 * after exactly one; growing the config descriptor past 64 bytes (for a
++	 * second USB interface) needs real continuation. ep0_tx_buf holds a
++	 * private copy so the data survives across polling-loop iterations
++	 * after the caller that queued it has returned. */
++	uint8_t  ep0_tx_buf[256];
++	uint32_t ep0_tx_cursor;
++	uint32_t ep0_tx_remaining;
++	uint8_t  ep0_tx_zlp_pending;
+ 	uint32_t mux_version, mux_state;
+ 	uint16_t mux_tx_seq, mux_rx_seq;
+ 	uint32_t tx_packets, tx_errors, tx_len;
+@@ -518,19 +528,69 @@ static void ru_ep0_ack_setup_in(void)
+ 	ru_wr(ru.mac, RU_EP0CSR, csr | RU_EP0_SETUPPKTRDY | RU_EP0_DPHTX);
+ }
+ 
++/* 0141: start (or restart) an EP0 IN data stage. Copies up to
++ * sizeof(ru.ep0_tx_buf) bytes into a buffer that survives across polling
++ * ticks, sends the first <=64-byte packet, and leaves ru.ep0_tx_remaining
++ * set up for ru_ep0_tx_continue() to finish the rest - see that function for
++ * why a single packet was never enough once descriptors exceed 64 bytes. */
+ static void ru_ep0_send_in(const uint8_t *data, uint32_t descriptor_len,
+     uint32_t requested_len, enum ru_ep0_state *state)
+ {
+-	uint32_t len = MIN(descriptor_len, requested_len);
++	uint32_t total = MIN(descriptor_len, requested_len);
++	uint32_t chunk;
+ 	uint32_t csr;
+-	if (len > 64u) len = 64u;
++
++	if (total > sizeof(ru.ep0_tx_buf)) total = (uint32_t)sizeof(ru.ep0_tx_buf);
++	if (total != 0u && data != NULL) bcopy(data, ru.ep0_tx_buf, total);
++	ru.ep0_tx_cursor = 0u;
++	ru.ep0_tx_remaining = total;
++	/* A transfer whose length is an exact nonzero multiple of the EP0 max
++	 * packet size (64) needs a trailing zero-length packet to tell the host
++	 * it is over - same reasoning as the bulk IN ZLP fix (0120), just for
++	 * control transfers instead of bulk ones. */
++	ru.ep0_tx_zlp_pending = (total != 0u && (total % 64u) == 0u) ? 1u : 0u;
++
++	chunk = (ru.ep0_tx_remaining < 64u) ? ru.ep0_tx_remaining : 64u;
+ 	ru_ep0_ack_setup_in();
+-	if (len) ru_fifo_write(data, len);
++	if (chunk) ru_fifo_write(ru.ep0_tx_buf, chunk);
++	ru.ep0_tx_cursor = chunk;
++	ru.ep0_tx_remaining -= chunk;
+ 	csr = ru_rd(ru.mac, RU_EP0CSR) & RU_EP0_W1C_BITS;
+ 	ru_wr(ru.mac, RU_EP0CSR, csr | RU_EP0_TXPKTRDY);
+ 	*state = RU_EP0_TX_END;
+ }
+ 
++/* 0141: called from the main poll loop once a queued EP0 IN packet has
++ * actually gone out (TXPKTRDY cleared). The old code always treated that as
++ * "the whole transfer is done" and immediately sent DATAEND; that silently
++ * truncated anything bigger than one packet; nothing has needed more than
++ * one yet; a second USB interface's descriptor will be the first to have
++ * more. Sends the next chunk if any remains, a trailing ZLP if the last
++ * chunk exactly filled a packet, and DATAEND only once both are done. */
++static void ru_ep0_tx_continue(enum ru_ep0_state *state)
++{
++	uint32_t csr = ru_rd(ru.mac, RU_EP0CSR) & RU_EP0_W1C_BITS;
++	uint32_t chunk;
++
++	if (ru.ep0_tx_remaining == 0u && !ru.ep0_tx_zlp_pending) {
++		ru_wr(ru.mac, RU_EP0CSR, csr | RU_EP0_DATAEND);
++		*state = RU_EP0_SETUP;
++		return;
++	}
++	if (ru.ep0_tx_remaining == 0u) {
++		ru.ep0_tx_zlp_pending = 0u;
++		ru_wr(ru.mac, RU_EP0CSR, csr | RU_EP0_TXPKTRDY);
++		*state = RU_EP0_TX_END;
++		return;
++	}
++	chunk = (ru.ep0_tx_remaining < 64u) ? ru.ep0_tx_remaining : 64u;
++	ru_fifo_write(ru.ep0_tx_buf + ru.ep0_tx_cursor, chunk);
++	ru.ep0_tx_cursor += chunk;
++	ru.ep0_tx_remaining -= chunk;
++	ru_wr(ru.mac, RU_EP0CSR, csr | RU_EP0_TXPKTRDY);
++	*state = RU_EP0_TX_END;
++}
++
+ static void ru_ep0_send_status(enum ru_ep0_state *state)
+ {
+ 	uint32_t csr = ru_rd(ru.mac, RU_EP0CSR) & RU_EP0_W1C_BITS;
+@@ -2560,9 +2620,7 @@ static void ru_usb_thread(void *arg, wait_result_t result)
+ 			continue;
+ 		}
+ 		if (state == RU_EP0_TX_END && !(ep0 & RU_EP0_TXPKTRDY) && !(ep0 & RU_EP0_FIFOFULL)) {
+-			uint32_t csr = ru_rd(ru.mac, RU_EP0CSR) & RU_EP0_W1C_BITS;
+-			ru_wr(ru.mac, RU_EP0CSR, csr | RU_EP0_DATAEND);
+-			state = RU_EP0_SETUP;
++			ru_ep0_tx_continue(&state); /* 0141: was unconditional DATAEND - truncated >64-byte transfers */
+ 			continue;
+ 		}
+ 		ru_sleep_ms(RU_USB_POLL_MS);
