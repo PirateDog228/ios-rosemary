@@ -1,0 +1,539 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 6d92924..ae0c978 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -77,6 +77,20 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ #define RU_RXQHIAR1              0x04c4u
+ #define RU_RXQCSR1               0x0610u
+ #define RU_RXQSAR1               0x0614u
++/* 0143: per-endpoint register blocks follow a fixed stride; EP1 above is
++ * n=1 (TX1CSR0=0x110, RX1CSR0=0x210, TXQCSR1=0x510, RXQCSR1=0x610, ...). */
++#define RU_TXCSR0(n)             (0x0100u + 0x10u * (n))
++#define RU_TXCSR1(n)             (0x0104u + 0x10u * (n))
++#define RU_TXCSR2(n)             (0x0108u + 0x10u * (n))
++#define RU_RXCSR0(n)             (0x0200u + 0x10u * (n))
++#define RU_RXCSR1(n)             (0x0204u + 0x10u * (n))
++#define RU_RXCSR2(n)             (0x0208u + 0x10u * (n))
++#define RU_TXQHIAR(n)            (0x0480u + 0x04u * (n))
++#define RU_RXQHIAR(n)            (0x04c0u + 0x04u * (n))
++#define RU_TXQCSR(n)             (0x0500u + 0x10u * (n))
++#define RU_TXQSAR(n)             (0x0504u + 0x10u * (n))
++#define RU_RXQCSR(n)             (0x0600u + 0x10u * (n))
++#define RU_RXQSAR(n)             (0x0604u + 0x10u * (n))
+ #define RU_EPISR                 0x0080u
+ #define RU_QISAR0                0x0700u
+ #define RU_TXQERRIR0             0x0780u
+@@ -201,6 +215,20 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ #define RU_MUX_RX_ACCUM_MAX       65536u
+ #define RU_MUX_TX_FRAME_MAX       2048u
+ #define RU_MUX_TCP_MAP_DEPTH      16u
++/* 0143: CDC-ECM data path on EP2 (bulk, QMU) in the spare DMA space after the
++ * usbmux TX buffer. EP3 is the (unused for now) notification endpoint. */
++#define RU_ECM_EP                 2u
++#define RU_ECM_INT_EP             3u
++#define RU_ECM_RX_DEPTH           8u
++#define RU_ECM_FRAME_CAP          2048u
++#define RU_ECM_TXQ_DEPTH          32u
++#define RU_ECM_GPD_TX_OFF         0x0100u
++#define RU_ECM_GPD_RX_OFF         0x0140u
++#define RU_ECM_RX_BUF_OFF         0x1a800u
++#define RU_ECM_TX_BUF_OFF         (RU_ECM_RX_BUF_OFF + RU_ECM_RX_DEPTH * RU_ECM_FRAME_CAP)
++#if (RU_ECM_TX_BUF_OFF + RU_ECM_FRAME_CAP) > RU_DMA_SIZE
++#error "Rosemary USB ECM DMA buffers exceed DMA allocation"
++#endif
+ #if (RU_RX_BUFFER_OFF + RU_RX_RING_DEPTH * RU_RX_CAPACITY) > RU_TX_BUFFER_OFF
+ #error "Rosemary USB RX DMA ring overlaps TX DMA buffer"
+ #endif
+@@ -2446,6 +2474,445 @@ static void ru_rx_poll(void)
+ 	}
+ }
+ 
++/* ===== 0143: USB CDC-ECM network function (configuration 4) =====
++ *
++ * Ethernet frames over EP2 (bulk OUT 0x02 / bulk IN 0x82) as the host's
++ * cdc_ether expects, exposed to XNU as ue0 (192.168.7.2/24; the host side is
++ * 192.168.7.1). The queues are polled from the USB thread like the usbmux
++ * ones, with their own GPDs and buffers in the spare DMA space. The IN
++ * transfer is never an exact multiple of the packet size (one pad byte is
++ * appended instead of relying on the QMU ZLP bit - see 0120/0122). */
++static const uint8_t ru_ecm_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
++
++static struct {
++	ifnet_t ifp;
++	lck_mtx_t *lock;
++	mbuf_t txq[RU_ECM_TXQ_DEPTH];
++	uint32_t txq_head, txq_count;
++	int tx_active, hw_ready;
++	uint32_t tx_len;
++	uint32_t rx_consumer;
++	uint32_t rx_frames, tx_frames, rx_drops, tx_drops;
++	/* FIFO geometry handed over by ru_qmu_init() */
++	uint32_t tx_base, rx_base, slot, tx_end, rx_end;
++} ue;
++
++static struct ru_qmu_gpd *ru_ecm_tx_gpd(void)
++{
++	return (struct ru_qmu_gpd *)(ru.dma + RU_ECM_GPD_TX_OFF);
++}
++
++static struct ru_qmu_gpd *ru_ecm_rx_gpd(void)
++{
++	return (struct ru_qmu_gpd *)(ru.dma + RU_ECM_GPD_RX_OFF);
++}
++
++static void ru_ecm_rx_rearm_slot(uint32_t slot)
++{
++	struct ru_qmu_gpd *gpd = ru_ecm_rx_gpd() + slot;
++	uint32_t next_slot = (slot + 1u) % RU_ECM_RX_DEPTH;
++	uint64_t next_pa = ru.dma_pa + RU_ECM_GPD_RX_OFF + (uint64_t)next_slot * sizeof(*gpd);
++	uint32_t buffer_off = RU_ECM_RX_BUF_OFF + slot * RU_ECM_FRAME_CAP;
++	uint64_t buffer_pa = ru.dma_pa + buffer_off;
++
++	gpd->next_gpd = (uint32_t)next_pa;
++	gpd->buffer = (uint32_t)buffer_pa;
++	gpd->dw3_info = ru_gpd_upper(buffer_pa, next_pa);
++	gpd->dw0_info = (ru.rx_gen2 ? (RU_ECM_FRAME_CAP << 12) : (RU_ECM_FRAME_CAP << 16)) |
++	    RU_QMU_GPD_IOC;
++	ru_dma_sync(buffer_off, RU_ECM_FRAME_CAP);
++	ru_dma_clean(RU_ECM_GPD_RX_OFF + slot * sizeof(*gpd), sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++	gpd->dw0_info |= RU_QMU_GPD_HWO;
++	ru_dma_clean(RU_ECM_GPD_RX_OFF + slot * sizeof(*gpd), sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int ru_ecm_rx_arm(void)
++{
++	struct ru_qmu_gpd *gpd = ru_ecm_rx_gpd();
++	uint64_t gpd_pa = ru.dma_pa + RU_ECM_GPD_RX_OFF;
++
++	if (!ru_qmu_stop(RU_RXQCSR(RU_ECM_EP))) return 0;
++	bzero(gpd, RU_ECM_RX_DEPTH * sizeof(*gpd));
++	for (uint32_t i = 0; i < RU_ECM_RX_DEPTH; i++) {
++		uint32_t next_slot = (i + 1u) % RU_ECM_RX_DEPTH;
++		uint64_t next_pa = ru.dma_pa + RU_ECM_GPD_RX_OFF + (uint64_t)next_slot * sizeof(*gpd);
++		uint32_t buffer_off = RU_ECM_RX_BUF_OFF + i * RU_ECM_FRAME_CAP;
++		uint64_t buffer_pa = ru.dma_pa + buffer_off;
++		gpd[i].next_gpd = (uint32_t)next_pa;
++		gpd[i].buffer = (uint32_t)buffer_pa;
++		gpd[i].dw3_info = ru_gpd_upper(buffer_pa, next_pa);
++		gpd[i].dw0_info = (ru.rx_gen2 ? (RU_ECM_FRAME_CAP << 12) : (RU_ECM_FRAME_CAP << 16)) |
++		    RU_QMU_GPD_IOC;
++		ru_dma_sync(buffer_off, RU_ECM_FRAME_CAP);
++	}
++	ru_dma_clean(RU_ECM_GPD_RX_OFF, RU_ECM_RX_DEPTH * sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < RU_ECM_RX_DEPTH; i++) gpd[i].dw0_info |= RU_QMU_GPD_HWO;
++	ru_dma_clean(RU_ECM_GPD_RX_OFF, RU_ECM_RX_DEPTH * sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++	ue.rx_consumer = 0;
++	ru_qmu_set_start(RU_RXQSAR(RU_ECM_EP), RU_RXQHIAR(RU_ECM_EP), gpd_pa);
++	ru_wr(ru.mac, RU_RXCSR0(RU_ECM_EP), (ru_rd(ru.mac, RU_RXCSR0(RU_ECM_EP)) & ~0x7ffu) |
++	    RU_RX_DMAREQEN | RU_BULK_MPS);
++	__asm__ volatile("dsb sy" ::: "memory");
++	ru_wr(ru.mac, RU_RXQCSR(RU_ECM_EP), RU_QMU_Q_START);
++	__asm__ volatile("dsb sy" ::: "memory");
++	return 1;
++}
++
++/* Start the next queued frame if the IN endpoint is idle. ue.lock held. */
++static void ru_ecm_tx_kick_locked(void)
++{
++	while (!ue.tx_active && ue.txq_count != 0u && ue.hw_ready) {
++		struct ru_qmu_gpd *gpd = ru_ecm_tx_gpd();
++		mbuf_t m = ue.txq[ue.txq_head];
++		uint64_t gpd_pa = ru.dma_pa + RU_ECM_GPD_TX_OFF;
++		uint64_t next_pa = gpd_pa + sizeof(*gpd);
++		uint64_t buffer_pa = ru.dma_pa + RU_ECM_TX_BUF_OFF;
++		size_t len;
++
++		ue.txq[ue.txq_head] = NULL;
++		ue.txq_head = (ue.txq_head + 1u) % RU_ECM_TXQ_DEPTH;
++		ue.txq_count--;
++		len = mbuf_pkthdr_len(m);
++		if (len < ETHER_HDR_LEN || len > ETHER_MAX_LEN - ETHER_CRC_LEN ||
++		    !ru_qmu_stop(RU_TXQCSR(RU_ECM_EP))) {
++			ue.tx_drops++;
++			mbuf_freem(m);
++			continue;
++		}
++		mbuf_copydata(m, 0, len, (void *)(ru.dma + RU_ECM_TX_BUF_OFF));
++		mbuf_freem(m);
++		if ((len % RU_BULK_MPS) == 0u) {
++			((uint8_t *)(ru.dma + RU_ECM_TX_BUF_OFF))[len++] = 0;
++		}
++		bzero(gpd, 2u * sizeof(*gpd));
++		gpd[0].next_gpd = (uint32_t)next_pa;
++		gpd[0].buffer = (uint32_t)buffer_pa;
++		gpd[0].dw3_info = (uint32_t)len;
++		gpd[0].dw0_info = ru_gpd_upper(buffer_pa, next_pa);
++		gpd[1].next_gpd = (uint32_t)gpd_pa;
++
++		ru_dma_clean(RU_ECM_TX_BUF_OFF, (uint32_t)len);
++		ru_dma_clean(RU_ECM_GPD_TX_OFF, 2u * sizeof(*gpd));
++		__asm__ volatile("dsb sy" ::: "memory");
++		gpd[0].dw0_info |= RU_QMU_GPD_IOC | RU_QMU_GPD_HWO;
++		ru_dma_clean(RU_ECM_GPD_TX_OFF, sizeof(*gpd));
++		__asm__ volatile("dsb sy" ::: "memory");
++		ru_qmu_set_start(RU_TXQSAR(RU_ECM_EP), RU_TXQHIAR(RU_ECM_EP), gpd_pa);
++		ru_wr(ru.mac, RU_TXCSR0(RU_ECM_EP),
++		    (ru_rd(ru.mac, RU_TXCSR0(RU_ECM_EP)) & ~0x7ffu) | RU_TX_DMAREQEN | RU_BULK_MPS);
++		__asm__ volatile("dsb sy" ::: "memory");
++		ru_wr(ru.mac, RU_TXQCSR(RU_ECM_EP), RU_QMU_Q_START);
++		__asm__ volatile("dsb sy" ::: "memory");
++		ue.tx_active = 1;
++		ue.tx_len = (uint32_t)len;
++		return;
++	}
++}
++
++static void ru_ecm_tx_poll(void)
++{
++	struct ru_qmu_gpd *gpd = ru_ecm_tx_gpd();
++	static uint32_t tx_logs;
++
++	if (!ue.hw_ready || ue.lock == NULL) return;
++	lck_mtx_lock(ue.lock);
++	if (!ue.tx_active) {
++		ru_ecm_tx_kick_locked();
++		lck_mtx_unlock(ue.lock);
++		return;
++	}
++	ru_dma_sync(RU_ECM_GPD_TX_OFF, 2u * sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (gpd[0].dw0_info & RU_QMU_GPD_HWO) {
++		lck_mtx_unlock(ue.lock);
++		return;
++	}
++	if (!ru_qmu_stop(RU_TXQCSR(RU_ECM_EP))) {
++		ue.tx_drops++;
++		lck_mtx_unlock(ue.lock);
++		return;
++	}
++	ue.tx_active = 0;
++	ue.tx_frames++;
++	if (tx_logs < 8u) {
++		tx_logs++;
++		printf("ROSEMARY ECM: bulk IN complete #%u len=%u\n", ue.tx_frames, ue.tx_len);
++	}
++	ru_ecm_tx_kick_locked();
++	lck_mtx_unlock(ue.lock);
++}
++
++static void ru_ecm_rx_deliver(const uint8_t *frame, uint32_t len)
++{
++	mbuf_t m;
++	struct ifnet_stat_increment_param stats;
++	void *frame_header;
++
++	if (ue.ifp == NULL || len < ETHER_HDR_LEN || len > ETHER_MAX_LEN) {
++		ue.rx_drops++;
++		return;
++	}
++	m = ru_mbuf_alloc_contig(len);
++	if (m == NULL) {
++		ue.rx_drops++;
++		return;
++	}
++	bcopy(frame, mbuf_data(m), len);
++	frame_header = mbuf_data(m);
++	mbuf_pkthdr_setrcvif(m, ue.ifp);
++	mbuf_pkthdr_setheader(m, frame_header);
++	mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++	(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++	bzero(&stats, sizeof(stats));
++	stats.packets_in = 1;
++	stats.bytes_in = len;
++	ue.rx_frames++;
++	ifnet_input(ue.ifp, m, &stats);
++}
++
++static void ru_ecm_rx_poll(void)
++{
++	struct ru_qmu_gpd *gpd = ru_ecm_rx_gpd();
++	uint32_t actual_len_mask = ru.rx_gen2 ? 0xfffffu : 0xffffu;
++	static uint32_t rx_logs;
++	uint32_t done = 0;
++
++	if (!ue.hw_ready) return;
++	ru_dma_sync(RU_ECM_GPD_RX_OFF, RU_ECM_RX_DEPTH * sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++	while (done < RU_ECM_RX_DEPTH) {
++		uint32_t slot = ue.rx_consumer;
++		uint32_t buffer_off = RU_ECM_RX_BUF_OFF + slot * RU_ECM_FRAME_CAP;
++		uint32_t len;
++
++		if (gpd[slot].dw0_info & RU_QMU_GPD_HWO) break;
++		len = gpd[slot].dw3_info & actual_len_mask;
++		if (len > RU_ECM_FRAME_CAP) len = RU_ECM_FRAME_CAP;
++		ru_dma_sync(buffer_off, RU_ECM_FRAME_CAP);
++		if (rx_logs < 8u) {
++			rx_logs++;
++			printf("ROSEMARY ECM: bulk OUT #%u slot=%u len=%u\n", rx_logs, slot, len);
++		}
++		if (len != 0u) ru_ecm_rx_deliver((const uint8_t *)(ru.dma + buffer_off), len);
++		ru_ecm_rx_rearm_slot(slot);
++		ue.rx_consumer = (slot + 1u) % RU_ECM_RX_DEPTH;
++		done++;
++	}
++	if (done == 0u) return;
++	ru_dma_sync(RU_ECM_GPD_RX_OFF + ue.rx_consumer * sizeof(*gpd), sizeof(*gpd));
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (!(ru_rd(ru.mac, RU_RXQCSR(RU_ECM_EP)) & RU_QMU_Q_ACTIVE) &&
++	    (gpd[ue.rx_consumer].dw0_info & RU_QMU_GPD_HWO)) {
++		uint64_t next_gpd_pa = ru.dma_pa + RU_ECM_GPD_RX_OFF +
++		    (uint64_t)ue.rx_consumer * sizeof(*gpd);
++		ru_qmu_set_start(RU_RXQSAR(RU_ECM_EP), RU_RXQHIAR(RU_ECM_EP), next_gpd_pa);
++		ru_wr(ru.mac, RU_RXCSR0(RU_ECM_EP), (ru_rd(ru.mac, RU_RXCSR0(RU_ECM_EP)) & ~0x7ffu) |
++		    RU_RX_DMAREQEN | RU_BULK_MPS);
++		__asm__ volatile("dsb sy" ::: "memory");
++		ru_wr(ru.mac, RU_RXQCSR(RU_ECM_EP), RU_QMU_Q_START);
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
++static void ru_ecm_flush_txq(void)
++{
++	if (ue.lock == NULL) return;
++	lck_mtx_lock(ue.lock);
++	while (ue.txq_count != 0u) {
++		mbuf_freem(ue.txq[ue.txq_head]);
++		ue.txq[ue.txq_head] = NULL;
++		ue.txq_head = (ue.txq_head + 1u) % RU_ECM_TXQ_DEPTH;
++		ue.txq_count--;
++	}
++	ue.txq_head = 0;
++	ue.tx_active = 0;
++	lck_mtx_unlock(ue.lock);
++}
++
++static void ru_ecm_hw_shutdown(void)
++{
++	if (!ue.hw_ready) return;
++	ue.hw_ready = 0;
++	(void)ru_qmu_stop(RU_TXQCSR(RU_ECM_EP));
++	(void)ru_qmu_stop(RU_RXQCSR(RU_ECM_EP));
++	ru_ecm_flush_txq();
++	ru_wr(ru.mac, RU_TXCSR0(RU_ECM_EP), 0); ru_wr(ru.mac, RU_TXCSR1(RU_ECM_EP), 0); ru_wr(ru.mac, RU_TXCSR2(RU_ECM_EP), 0);
++	ru_wr(ru.mac, RU_RXCSR0(RU_ECM_EP), 0); ru_wr(ru.mac, RU_RXCSR1(RU_ECM_EP), 0); ru_wr(ru.mac, RU_RXCSR2(RU_ECM_EP), 0);
++	ru_wr(ru.mac, RU_TXCSR0(RU_ECM_INT_EP), 0); ru_wr(ru.mac, RU_TXCSR1(RU_ECM_INT_EP), 0); ru_wr(ru.mac, RU_TXCSR2(RU_ECM_INT_EP), 0);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("ROSEMARY ECM: endpoints stopped (rx=%u tx=%u rx_drop=%u tx_drop=%u)\n",
++	    ue.rx_frames, ue.tx_frames, ue.rx_drops, ue.tx_drops);
++}
++
++/* Bring up EP2 (bulk, QMU) and EP3 (interrupt, idle) once the host selects
++ * configuration 4. FIFO space is carved behind EP1's using its slot count as
++ * the stride; if the FIFOs are too small the feature stays off and usbmux is
++ * unaffected. */
++static void ru_ecm_hw_start(void)
++{
++	uint32_t stride = (ue.slot + 1u) * RU_BULK_MPS;
++	uint32_t tx2 = ue.tx_base + stride;
++	uint32_t tx3 = tx2 + stride;
++	uint32_t rx2 = ue.rx_base + stride;
++
++	printf("ROSEMARY ECM: FIFO tx_base=%u rx_base=%u slot=%u stride=%u tx_end=%u rx_end=%u -> tx2=%u tx3=%u rx2=%u\n",
++	    ue.tx_base, ue.rx_base, ue.slot, stride, ue.tx_end, ue.rx_end, tx2, tx3, rx2);
++	if (ue.ifp == NULL || ue.lock == NULL) {
++		printf("ROSEMARY ECM: no ue0 interface; data path disabled\n");
++		return;
++	}
++	if (tx3 + 64u > ue.tx_end || rx2 + stride > ue.rx_end) {
++		printf("ROSEMARY ECM: not enough endpoint FIFO space; data path disabled\n");
++		return;
++	}
++	ru_wr(ru.mac, RU_TXCSR0(RU_ECM_EP), 0); ru_wr(ru.mac, RU_TXCSR1(RU_ECM_EP), 0); ru_wr(ru.mac, RU_TXCSR2(RU_ECM_EP), 0);
++	ru_wr(ru.mac, RU_RXCSR0(RU_ECM_EP), 0); ru_wr(ru.mac, RU_RXCSR1(RU_ECM_EP), 0); ru_wr(ru.mac, RU_RXCSR2(RU_ECM_EP), 0);
++	ru_wr(ru.mac, RU_TXCSR1(RU_ECM_EP), ue.slot << 8);
++	ru_wr(ru.mac, RU_RXCSR1(RU_ECM_EP), ue.slot << 8);
++	ru_wr(ru.mac, RU_TXCSR2(RU_ECM_EP), ((tx2 >> 4) & 0x1fffu) | (9u << 16));
++	ru_wr(ru.mac, RU_RXCSR2(RU_ECM_EP), ((rx2 >> 4) & 0x1fffu) | (9u << 16));
++	ru_wr(ru.mac, RU_TXCSR0(RU_ECM_EP), RU_TX_DMAREQEN | RU_BULK_MPS);
++	ru_wr(ru.mac, RU_RXCSR0(RU_ECM_EP), RU_RX_DMAREQEN | RU_BULK_MPS);
++	/* EP3: interrupt IN notification endpoint, programmed only so the host's
++	 * status URB gets NAKs; nothing is queued on it yet. */
++	ru_wr(ru.mac, RU_TXCSR1(RU_ECM_INT_EP), 0);
++	ru_wr(ru.mac, RU_TXCSR2(RU_ECM_INT_EP), ((tx3 >> 4) & 0x1fffu) | (6u << 16));
++	ru_wr(ru.mac, RU_TXCSR0(RU_ECM_INT_EP), 16u);
++	__asm__ volatile("dsb sy" ::: "memory");
++	ue.tx_active = 0;
++	ue.txq_head = 0;
++	ue.txq_count = 0;
++	if (!ru_ecm_rx_arm()) {
++		printf("ROSEMARY ECM: RX QMU initial arm failed\n");
++		return;
++	}
++	ue.hw_ready = 1;
++	printf("ROSEMARY ECM: endpoints active; OUT=02 IN=82 INT=83 MPS=%u\n", RU_BULK_MPS);
++}
++
++static errno_t ru_ecm_if_output(ifnet_t ifp, mbuf_t m)
++{
++	if (m == NULL) return 0;
++	if (ue.lock == NULL) {
++		mbuf_freem(m);
++		return 0;
++	}
++	lck_mtx_lock(ue.lock);
++	if (!ue.hw_ready || ue.txq_count >= RU_ECM_TXQ_DEPTH) {
++		ue.tx_drops++;
++		lck_mtx_unlock(ue.lock);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		mbuf_freem(m);
++		return 0;
++	}
++	ifnet_stat_increment_out(ifp, 1, (uint32_t)mbuf_pkthdr_len(m), 0);
++	ue.txq[(ue.txq_head + ue.txq_count) % RU_ECM_TXQ_DEPTH] = m;
++	ue.txq_count++;
++	ru_ecm_tx_kick_locked();
++	lck_mtx_unlock(ue.lock);
++	return 0;
++}
++
++static errno_t ru_ecm_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
++{
++	switch (cmd) {
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void ru_ecm_if_detach(ifnet_t ifp __unused) { }
++
++/* ue0, 192.168.7.2/24 (host side 192.168.7.1). Created at boot like rmx0 so
++ * the interface exists before the host ever selects configuration 4. */
++static void ru_ecm_if_create(void)
++{
++	struct ifnet_init_eparams init;
++	struct ifaliasreq ifra;
++	struct sockaddr_in *a;
++	socket_t so = NULL;
++	errno_t err;
++	static lck_grp_t *grp;
++
++	if (ue.ifp != NULL) return;
++	if (grp == NULL) grp = lck_grp_alloc_init("rosemary_ecm", LCK_GRP_ATTR_NULL);
++	if (grp == NULL) return;
++	ue.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	if (ue.lock == NULL) return;
++
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "rosemary-usb-ecm";
++	init.uniqueid_len = sizeof("rosemary-usb-ecm") - 1;
++	init.name = "ue";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = ru_ecm_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = ru_ecm_if_ioctl;
++	init.detach = ru_ecm_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &ue.ifp) != 0) {
++		printf("ROSEMARY ECM: ue0 ifnet_allocate failed\n");
++		ue.ifp = NULL;
++		return;
++	}
++	ifnet_set_addrlen(ue.ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(ue.ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(ue.ifp, ETHERMTU);
++	ifnet_set_baudrate(ue.ifp, 480000000);
++	ifnet_set_flags(ue.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(ue.ifp, NULL) != 0) {
++		printf("ROSEMARY ECM: ue0 ifnet_attach failed\n");
++		ue.ifp = NULL;
++		return;
++	}
++	ifnet_set_lladdr(ue.ifp, ru_ecm_phone_mac, ETHER_ADDR_LEN);
++	err = proto_plumb(PF_INET, ue.ifp);
++	if (err == 0) err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	if (err == 0) {
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "ue0");
++		a = (struct sockaddr_in *)&ifra.ifra_addr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xc0a80702u);        /* 192.168.7.2 */
++		a = (struct sockaddr_in *)&ifra.ifra_mask;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xffffff00u);
++		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xc0a807ffu);
++		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
++		sock_close(so);
++	}
++	if (err == 0) ifnet_set_flags(ue.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	printf("ROSEMARY ECM: ue0 192.168.7.2/24 %s (ifaddr err=%d)\n",
++	    err == 0 ? "ready" : "degraded", err);
++}
++
+ static int ru_qmu_init(void)
+ {
+ 	uint32_t tx_cap = ru_rd(ru.mac, RU_CAP_EPNTXFFSZ);
+@@ -2486,11 +2953,20 @@ static int ru_qmu_init(void)
+ 		return 0;
+ 	}
+ 	printf("ROSEMARY USB: USBMUX endpoints active; OUT=01 IN=81 MPS=%u\n", RU_BULK_MPS);
++	if (ru.configuration == 4u) {
++		ue.tx_base = tx_fifo_addr;
++		ue.rx_base = rx_fifo_addr;
++		ue.slot = slot;
++		ue.tx_end = dev_cap ? tx_cap : 64u + ((tx_cap / RU_BULK_MPS) >> 1) * RU_BULK_MPS;
++		ue.rx_end = dev_cap ? rx_cap : 64u + (tx_cap / RU_BULK_MPS) * RU_BULK_MPS;
++		ru_ecm_hw_start();
++	}
+ 	return 1;
+ }
+ 
+ static void ru_qmu_shutdown(void)
+ {
++	ru_ecm_hw_shutdown();
+ 	int tx_stopped = ru_qmu_stop(RU_TXQCSR1);
+ 	int rx_stopped = ru_qmu_stop(RU_RXQCSR1);
+ 	if (!tx_stopped || !rx_stopped) {
+@@ -2657,7 +3133,7 @@ static void ru_usb_thread(void *arg, wait_result_t result)
+ 
+ 		if (ru.configuration != ru.seen_configuration) {
+ 			/* Drain old QMU state before reconfiguring the same endpoints. */
+-			if (ru.rx_active || ru.tx_active) ru_qmu_shutdown();
++			if (ru.rx_active || ru.tx_active || ue.hw_ready) ru_qmu_shutdown();
+ 			if (ru.configuration != 0u) {
+ 				if (!ru_qmu_init()) {
+ 					printf("ROSEMARY USB: QMU endpoint startup failed\n");
+@@ -2668,6 +3144,8 @@ static void ru_usb_thread(void *arg, wait_result_t result)
+ 		ru_tx_poll();
+ 		ru_rx_poll();
+ 		ru_loop_poll();
++		ru_ecm_tx_poll();
++		ru_ecm_rx_poll();
+ 
+ 		/* Handle SETUP before completing any previous EP0 IN transfer. */
+ 		if (ep0 & RU_EP0_SETUPPKTRDY) {
+@@ -2868,6 +3346,7 @@ void rosemary_usb_init(void)
+ 		}
+ 	}
+ 	ru_mux_if_create();
++	ru_ecm_if_create();
+ 	ru_echo_start();
+ 	if (kernel_thread_start(ru_usb_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
