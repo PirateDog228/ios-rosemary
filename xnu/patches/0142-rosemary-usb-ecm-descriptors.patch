@@ -1,0 +1,183 @@
+diff --git a/bsd/dev/rosemary_usb.c b/bsd/dev/rosemary_usb.c
+index 040bf2b..6d92924 100644
+--- a/bsd/dev/rosemary_usb.c
++++ b/bsd/dev/rosemary_usb.c
+@@ -252,6 +252,7 @@ static struct {
+ 	uint32_t ep0_tx_cursor;
+ 	uint32_t ep0_tx_remaining;
+ 	uint8_t  ep0_tx_zlp_pending;
++	uint8_t  ecm_data_alt;  /* 0142: CDC-ECM data interface (2) alternate setting */
+ 	uint32_t mux_version, mux_state;
+ 	uint16_t mux_tx_seq, mux_rx_seq;
+ 	uint32_t tx_packets, tx_errors, tx_len;
+@@ -480,6 +481,13 @@ static const uint8_t ru_serial_desc[] = {
+ 	'E',0,'E',0,'F',0,'F',0,'1',0,'2',0,'3',0,'4',0
+ };
+ 
++/* 0142: string index 4 = the host-side MAC for the CDC-ECM function
++ * (iMACAddress): 02:00:5e:77:ee:01. The phone's own end is ..:02. */
++static const uint8_t ru_mac_desc[] = {
++	26, 3,
++	'0',0,'2',0,'0',0,'0',0,'5',0,'E',0,'7',0,'7',0,'E',0,'E',0,'0',0,'1',0
++};
++
+ static void ru_fifo_read(uint8_t *dst, uint32_t len)
+ {
+ 	uint32_t i = 0;
+@@ -612,26 +620,66 @@ static uint16_t ru_le16(const uint8_t *p)
+ 	return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+ }
+ 
+-/* USBMUX must be endpoint OUT first, then endpoint IN: usbmuxd relies on it. */
+-static void ru_build_config(uint8_t index, int other_speed, uint8_t out[32])
+-{
+-	static const uint8_t template_desc[32] = {
++/* 0142: biggest config descriptor we build (usbmux + CDC-ECM = 111 bytes). */
++#define RU_CFG_MAX 128u
++
++/* USBMUX must be endpoint OUT first, then endpoint IN: usbmuxd relies on it.
++ *
++ * Configurations 1-3 (index 0-2) are the unchanged usbmux-only layout.
++ * Configuration 4 (index 3) adds a CDC-ECM Ethernet function beside it
++ * (interfaces 1+2, grouped by an IAD), so the default configuration the host
++ * picks - and everything that already works - is untouched; the host opts in
++ * to USB networking by selecting configuration 4. Endpoint numbers avoid the
++ * usbmux pair on EP1: bulk OUT 0x02, bulk IN 0x82, interrupt IN 0x83. */
++static uint16_t ru_build_config(uint8_t index, int other_speed, uint8_t out[RU_CFG_MAX])
++{
++	static const uint8_t mux_only[32] = {
+ 		9, 2, 32, 0, 1, 1, 0, 0x80, 50,
+ 		9, 4, 0, 0, 2, 0xff, 0xfe, 0x02, 0,
+ 		7, 5, 0x01, 0x02, 0x00, 0x02, 0,
+ 		7, 5, 0x81, 0x02, 0x00, 0x02, 0
+ 	};
+-	memcpy(out, template_desc, sizeof(template_desc));
++	static const uint8_t mux_ecm[111] = {
++		9, 2, 111, 0, 3, 4, 0, 0x80, 50,                         /* config: 3 interfaces */
++		9, 4, 0, 0, 2, 0xff, 0xfe, 0x02, 0,                      /*  0: usbmux */
++		7, 5, 0x01, 0x02, 0x00, 0x02, 0,                         /*     bulk OUT 1 */
++		7, 5, 0x81, 0x02, 0x00, 0x02, 0,                         /*     bulk IN 1 */
++		8, 0x0b, 1, 2, 0x02, 0x06, 0x00, 0,                      /* IAD: ifaces 1-2, CDC ECM */
++		9, 4, 1, 0, 1, 0x02, 0x06, 0x00, 0,                      /*  1: CDC comm, 1 endpoint */
++		5, 0x24, 0x00, 0x10, 0x01,                               /*     header, CDC 1.10 */
++		5, 0x24, 0x06, 1, 2,                                     /*     union: control 1, data 2 */
++		13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0,     /*     ethernet: MAC str 4, seg 1514 */
++		7, 5, 0x83, 0x03, 16, 0, 9,                              /*     interrupt IN 3, 16 bytes */
++		9, 4, 2, 0, 0, 0x0a, 0x00, 0x00, 0,                      /*  2: CDC data alt 0, no endpoints */
++		9, 4, 2, 1, 2, 0x0a, 0x00, 0x00, 0,                      /*     alt 1, two bulk endpoints */
++		7, 5, 0x82, 0x02, 0x00, 0x02, 0,                         /*     bulk IN 2 */
++		7, 5, 0x02, 0x02, 0x00, 0x02, 0                          /*     bulk OUT 2 */
++	};
++	uint16_t len;
++
++	if (index == 3u) {
++		memcpy(out, mux_ecm, sizeof(mux_ecm));
++		len = (uint16_t)sizeof(mux_ecm);
++	} else {
++		memcpy(out, mux_only, sizeof(mux_only));
++		len = (uint16_t)sizeof(mux_only);
++	}
+ 	out[1] = other_speed ? 7 : 2;
+ 	out[5] = (uint8_t)(index + 1u); /* configuration value follows its index */
+ 	if (other_speed) {
+ 		out[22] = 64; out[23] = 0;
+ 		out[29] = 64; out[30] = 0;
++		if (len == sizeof(mux_ecm)) {
++			out[78] = 16;                    /* interrupt interval: 16 ms at full speed */
++			out[100] = 64; out[101] = 0;
++			out[107] = 64; out[108] = 0;
++		}
+ 	}
++	return len;
+ }
+ 
+ static int ru_get_descriptor(uint8_t type, uint8_t index,
+-    const uint8_t **data, uint16_t *len, uint8_t config_scratch[32])
++    const uint8_t **data, uint16_t *len, uint8_t config_scratch[RU_CFG_MAX])
+ {
+ 	switch (type) {
+ 	case 1:
+@@ -639,14 +687,15 @@ static int ru_get_descriptor(uint8_t type, uint8_t index,
+ 		*data = ru_dev_desc; *len = sizeof(ru_dev_desc); return 1;
+ 	case 2:
+ 		if (index > 3) return 0;
+-		ru_build_config(index, 0, config_scratch);
+-		*data = config_scratch; *len = 32; return 1;
++		*len = ru_build_config(index, 0, config_scratch);
++		*data = config_scratch; return 1;
+ 	case 3:
+ 		switch (index) {
+ 		case 0: *data = ru_lang_desc; *len = sizeof(ru_lang_desc); return 1;
+ 		case 1: *data = ru_maker_desc; *len = sizeof(ru_maker_desc); return 1;
+ 		case 2: *data = ru_product_desc; *len = sizeof(ru_product_desc); return 1;
+ 		case 3: *data = ru_serial_desc; *len = sizeof(ru_serial_desc); return 1;
++		case 4: *data = ru_mac_desc; *len = sizeof(ru_mac_desc); return 1;
+ 		default: return 0;
+ 		}
+ 	case 6:
+@@ -654,8 +703,8 @@ static int ru_get_descriptor(uint8_t type, uint8_t index,
+ 		*data = ru_qual_desc; *len = sizeof(ru_qual_desc); return 1;
+ 	case 7:
+ 		if (index > 3) return 0;
+-		ru_build_config(index, 1, config_scratch);
+-		*data = config_scratch; *len = 32; return 1;
++		*len = ru_build_config(index, 1, config_scratch);
++		*data = config_scratch; return 1;
+ 	default:
+ 		return 0;
+ 	}
+@@ -671,7 +720,7 @@ static void ru_handle_setup(const uint8_t raw[8], enum ru_ep0_state *state,
+ 	const uint8_t *desc = NULL;
+ 	uint16_t desc_len = 0;
+ 	uint8_t small[2] = { 0, 0 }, one = 0;
+-	uint8_t config_desc[32];
++	uint8_t config_desc[RU_CFG_MAX];
+ 	int recognized = 0;
+ 
+ 	if (ru.setups_logged < RU_MAX_SETUP_LOGS) {
+@@ -710,13 +759,21 @@ static void ru_handle_setup(const uint8_t raw[8], enum ru_ep0_state *state,
+ 			ru_ep0_send_in(&one, 1, wlen, state);
+ 			return;
+ 		}
+-		if (req == 10u && (bm & 0x1fu) == 1u && idx == 0u && wlen >= 1u) {
+-			one = 0;
++		if (req == 10u && (bm & 0x1fu) == 1u && wlen >= 1u &&
++		    (idx == 0u || (ru.configuration == 4u && (idx == 1u || idx == 2u)))) {
++			one = (idx == 2u) ? ru.ecm_data_alt : 0; /* 0142 */
+ 			ru_ep0_send_in(&one, 1, wlen, state);
+ 			return;
+ 		}
+ 	}
+ 
++	/* 0142: CDC-ECM class request SET_ETHERNET_PACKET_FILTER (configuration 4
++	 * only); the data path is not wired up yet, so just acknowledge it. */
++	if (bm == 0x21u && req == 0x43u && wlen == 0u && ru.configuration == 4u) {
++		ru_ep0_send_status(state);
++		return;
++	}
++
+ 	if ((bm & 0x60u) == 0u && !(bm & 0x80u) && wlen == 0u) {
+ 		if (bm == 0u && req == 5u && val <= 127u) {
+ 			uint32_t conf = ru_rd(ru.mac, RU_DEVICE_CONF) & ~RU_DEVICE_ADDR_MASK;
+@@ -724,14 +781,20 @@ static void ru_handle_setup(const uint8_t raw[8], enum ru_ep0_state *state,
+ 			recognized = 1;
+ 		} else if (bm == 0u && req == 9u && val <= 4u) {
+ 			ru.configuration = val;
++			ru.ecm_data_alt = 0;
+ 			recognized = 1;
+ 		} else if (bm == 1u && req == 11u && idx == 0u && val == 0u) {
+ 			recognized = 1;
++		} else if (bm == 1u && req == 11u && ru.configuration == 4u &&
++		    ((idx == 1u && val == 0u) || (idx == 2u && val <= 1u))) {
++			if (idx == 2u) ru.ecm_data_alt = (uint8_t)val; /* 0142 */
++			recognized = 1;
+ 		} else if (bm == 0u && (req == 1u || req == 3u) && val == 1u) {
+ 			*remote_wakeup = (uint8_t)(req == 3u);
+ 			recognized = 1;
+ 		} else if (bm == 2u && (req == 1u || req == 3u) && val == 0u &&
+-		    (idx == 0x01u || idx == 0x81u)) {
++		    (idx == 0x01u || idx == 0x81u ||
++		    (ru.configuration == 4u && (idx == 0x02u || idx == 0x82u || idx == 0x83u)))) {
+ 			recognized = 1; /* endpoint halt feature; there is no halted data queue */
+ 		}
+ 	}
