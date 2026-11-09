@@ -1,0 +1,37 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..ccefc06 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -72,6 +72,7 @@ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
++static uint32_t      sweet_surface_web_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+@@ -703,10 +704,20 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			}
+ 		}
+ 	}
+-	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
+-		char name[32];
+-		proc_selfname(name, sizeof(name));
+-		sweet_surface_creates_logged++;
++	/* 0145: the first 64 creates are all boot-time; keep a separate budget for
++	 * WebKit/Safari so the surfaces behind a blank page are visible. */
++	char logname[32];
++	proc_selfname(logname, sizeof(logname));
++	bool web = strnstr(logname, "WebKit", sizeof(logname)) != NULL ||
++	    strnstr(logname, "Safari", sizeof(logname)) != NULL;
++	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64 ||
++	    (web && sweet_surface_web_logged < 48)) {
++		char *name = logname;
++		if (web) {
++			sweet_surface_web_logged++;
++		} else {
++			sweet_surface_creates_logged++;
++		}
+ 		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);

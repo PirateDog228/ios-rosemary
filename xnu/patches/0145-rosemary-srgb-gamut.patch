@@ -1,0 +1,51 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..f101b61 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,7 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <libkern/c++/OSData.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -22,6 +23,30 @@ public:
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++/*
++ * 0146: the iPhone X device tree says "artwork-display-gamut" = P3, so
++ * MobileGestalt reports HasExtendedColorDisplay and WebKit draws page tiles
++ * into 10-bit IOSurfaces ('w30r' / 'b3a8'). Our surfaces and the window
++ * server's software path only handle 8-bit BGRA, so the tiles stay zero and
++ * a page shows only its solid background layer. The panel here is sRGB.
++ */
++static void
++sweetSetSrgbGamut(void)
++{
++	IORegistryEntry *product = IORegistryEntry::fromPath("/product", gIODTPlane);
++	if (product == NULL) {
++		IOLog("SWEET: no /product node, gamut left as is\n");
++		return;
++	}
++	OSData *value = OSData::withBytes("sRGB", 5);
++	if (value != NULL) {
++		product->setProperty("artwork-display-gamut", value);
++		value->release();
++		IOLog("SWEET: artwork-display-gamut set to sRGB\n");
++	}
++	product->release();
++}
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+@@ -31,6 +56,7 @@ SweetPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
++	sweetSetSrgbGamut();
+ 	return true;
+ }
+ 
