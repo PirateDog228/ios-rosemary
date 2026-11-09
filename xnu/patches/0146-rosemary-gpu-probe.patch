@@ -1,0 +1,116 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e8023fc..4fb7c2b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/rosemary_keys.c		standard
+ bsd/dev/rosemary_rtc.c		standard
+ bsd/dev/rosemary_touch.c		standard
+ bsd/dev/rosemary_usb.c		standard
++bsd/dev/rosemary_gpu.c		standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+diff --git a/bsd/dev/rosemary_gpu.c b/bsd/dev/rosemary_gpu.c
+new file mode 100644
+index 0000000..ca1ae5b
+--- /dev/null
++++ b/bsd/dev/rosemary_gpu.c
+@@ -0,0 +1,83 @@
++/*
++ * ROSEMARY (Redmi Note 10S, MT6785): GPU phase 0 - read-only probe.
++ *
++ * The Mali-G76 (Bifrost) sits at 0x13040000 behind the MFG0..MFG5 power
++ * domains. This only READS the SPM power status and, when every domain is
++ * already on, the GPU_ID register. It switches nothing on: touching a Mali
++ * register while its domain is off can hang a MediaTek bus, so the register
++ * is read only when the status says the GPU is powered.
++ * Boot-arg rosemarygpu=0 skips it entirely.
++ */
++#if defined(ROSEMARY)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void rosemary_gpu_probe(void);
++
++#define RG_SPM_PA            0x10006000u
++#define RG_SPM_SIZE          0x1000u
++#define RG_PWR_STATUS        0x160u
++#define RG_PWR_STATUS_2ND    0x164u
++#define RG_MFG0_PWR_CON      0x328u   /* MFG0..MFG4: 0x328 + 4 * n */
++#define RG_MFG5_PWR_CON      0x350u
++
++#define RG_GPU_PA            0x13040000u
++#define RG_GPU_SIZE          0x10000u
++#define RG_GPU_ID            0x000u
++#define RG_GPU_STATUS        0x034u
++
++/* PWR_STATUS bits of the GPU domains (clk-mt6785-pg.c) */
++#define RG_MFG0_BIT          (1u << 4)
++#define RG_MFG1_BIT          (1u << 7)
++#define RG_MFG5_BIT          (1u << 13)
++#define RG_MFG2_BIT          (1u << 20)
++#define RG_MFG3_BIT          (1u << 22)
++#define RG_MFG4_BIT          (1u << 23)
++#define RG_ALL_BITS          (RG_MFG0_BIT | RG_MFG1_BIT | RG_MFG2_BIT | RG_MFG3_BIT | RG_MFG4_BIT | RG_MFG5_BIT)
++
++static uint32_t
++rg_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++void
++rosemary_gpu_probe(void)
++{
++	int enable = 1;
++	vm_offset_t spm;
++	uint32_t st, st2;
++	static const char *const names[6] = { "MFG0", "MFG1", "MFG2", "MFG3", "MFG4", "MFG5" };
++	static const uint32_t bits[6] = { RG_MFG0_BIT, RG_MFG1_BIT, RG_MFG2_BIT, RG_MFG3_BIT, RG_MFG4_BIT, RG_MFG5_BIT };
++
++	if (PE_parse_boot_argn("rosemarygpu", &enable, sizeof(enable)) && enable == 0) {
++		return;
++	}
++	spm = ml_io_map(RG_SPM_PA, RG_SPM_SIZE);
++	if (spm == 0) {
++		printf("ROSEMARY GPU: cannot map SPM\n");
++		return;
++	}
++	st = rg_rd(spm, RG_PWR_STATUS);
++	st2 = rg_rd(spm, RG_PWR_STATUS_2ND);
++	printf("ROSEMARY GPU: SPM PWR_STATUS=%08x PWR_STATUS_2ND=%08x\n", st, st2);
++	for (int i = 0; i < 6; i++) {
++		uint32_t con = rg_rd(spm, i < 5 ? RG_MFG0_PWR_CON + 4u * (uint32_t)i : RG_MFG5_PWR_CON);
++		printf("ROSEMARY GPU: %s status=%s/%s PWR_CON=%08x\n", names[i],
++		    (st & bits[i]) ? "on" : "off", (st2 & bits[i]) ? "on" : "off", con);
++	}
++	if ((st & RG_ALL_BITS) != RG_ALL_BITS || (st2 & RG_ALL_BITS) != RG_ALL_BITS) {
++		printf("ROSEMARY GPU: domains are not all powered; GPU registers not touched\n");
++		return;
++	}
++	vm_offset_t gpu = ml_io_map(RG_GPU_PA, RG_GPU_SIZE);
++	if (gpu == 0) {
++		printf("ROSEMARY GPU: cannot map GPU registers\n");
++		return;
++	}
++	printf("ROSEMARY GPU: GPU_ID=%08x GPU_STATUS=%08x\n", rg_rd(gpu, RG_GPU_ID), rg_rd(gpu, RG_GPU_STATUS));
++}
++#endif /* ROSEMARY */
+diff --git a/bsd/dev/rosemary_ufs.c b/bsd/dev/rosemary_ufs.c
+index 511952a..be4cef2 100644
+--- a/bsd/dev/rosemary_ufs.c
++++ b/bsd/dev/rosemary_ufs.c
+@@ -809,6 +809,10 @@ rosemary_ufs_init(void)
+ 		extern void rosemary_usb_init(void);
+ 		rosemary_usb_init();
+ 	}
++	{
++		extern void rosemary_gpu_probe(void);
++		rosemary_gpu_probe();
++	}
+ 	/* process sampler (0054): only sweet_ufs.c started it, rosemary_ufs.c never did */
+ 	{
+ 		extern void sweet_sample_start(void);
