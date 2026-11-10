@@ -1,0 +1,290 @@
+diff --git a/bsd/dev/rosemary_gpu.c b/bsd/dev/rosemary_gpu.c
+index ca1ae5b..3c4ba5a 100644
+--- a/bsd/dev/rosemary_gpu.c
++++ b/bsd/dev/rosemary_gpu.c
+@@ -1,12 +1,19 @@
+ /*
+- * ROSEMARY (Redmi Note 10S, MT6785): GPU phase 0 - read-only probe.
++ * ROSEMARY (Redmi Note 10S, MT6785): GPU phase 0.
+  *
+  * The Mali-G76 (Bifrost) sits at 0x13040000 behind the MFG0..MFG5 power
+- * domains. This only READS the SPM power status and, when every domain is
+- * already on, the GPU_ID register. It switches nothing on: touching a Mali
+- * register while its domain is off can hang a MediaTek bus, so the register
+- * is read only when the status says the GPU is powered.
+- * Boot-arg rosemarygpu=0 skips it entirely.
++ * domains, which the bootloader leaves off.
++ *
++ *   rosemarygpu=0  do nothing
++ *   (default / 1)  read-only: log the SPM power status; touch GPU registers
++ *                  only if every domain is already on
++ *   rosemarygpu=2  power the domains on (MFG0, MFG1 + bus protect release,
++ *                  MFG2..MFG5), ungate the MFGCFG clock gate and log the Mali
++ *                  identification registers
++ *
++ * Reading a Mali register while its domain is off can hang a MediaTek bus,
++ * so mode 2 is opt-in. The mfg_sel mux and the PLLs are left alone: the
++ * identification registers are readable from the bootloader's clock.
+  */
+ #if defined(ROSEMARY)
+ #include <sys/param.h>
+@@ -18,25 +25,56 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void rosemary_gpu_probe(void);
+ 
+ #define RG_SPM_PA            0x10006000u
+-#define RG_SPM_SIZE          0x1000u
++#define RG_INFRA_PA          0x10001000u   /* infracfg_ao */
++#define RG_TOPCK_PA          0x10000000u
++#define RG_MFGCFG_PA         0x13fbf000u
++#define RG_GPU_PA            0x13040000u
++#define RG_PAGE              0x1000u
++#define RG_GPU_SIZE          0x10000u
++
+ #define RG_PWR_STATUS        0x160u
+ #define RG_PWR_STATUS_2ND    0x164u
+ #define RG_MFG0_PWR_CON      0x328u   /* MFG0..MFG4: 0x328 + 4 * n */
+ #define RG_MFG5_PWR_CON      0x350u
+ 
+-#define RG_GPU_PA            0x13040000u
+-#define RG_GPU_SIZE          0x10000u
+-#define RG_GPU_ID            0x000u
+-#define RG_GPU_STATUS        0x034u
+-
+-/* PWR_STATUS bits of the GPU domains (clk-mt6785-pg.c) */
+-#define RG_MFG0_BIT          (1u << 4)
+-#define RG_MFG1_BIT          (1u << 7)
+-#define RG_MFG5_BIT          (1u << 13)
+-#define RG_MFG2_BIT          (1u << 20)
+-#define RG_MFG3_BIT          (1u << 22)
+-#define RG_MFG4_BIT          (1u << 23)
+-#define RG_ALL_BITS          (RG_MFG0_BIT | RG_MFG1_BIT | RG_MFG2_BIT | RG_MFG3_BIT | RG_MFG4_BIT | RG_MFG5_BIT)
++#define RG_PWR_RST_B         (1u << 0)
++#define RG_PWR_ISO           (1u << 1)
++#define RG_PWR_ON            (1u << 2)
++#define RG_PWR_ON_2ND        (1u << 3)
++#define RG_PWR_CLK_DIS       (1u << 4)
++#define RG_SRAM_PDN0         (1u << 8)
++#define RG_SRAM_PDN1         (1u << 9)
++#define RG_SRAM_ACK0         (1u << 12)
++#define RG_SRAM_ACK1         (1u << 13)
++
++/* infracfg_ao AXI bus protection (MFG1 only) */
++#define RG_PROTECTEN         0x220u
++#define RG_PROTECTEN_1       0x250u
++#define RG_PROTECTEN_CLR     0x2a4u
++#define RG_PROTECTEN_1_CLR   0x2acu
++#define RG_MFG1_PROT_STEP2   ((1u << 21) | (1u << 22))              /* PROTECTEN_CLR   */
++#define RG_MFG1_PROT_STEP1   ((1u << 19) | (1u << 20) | (1u << 21)) /* PROTECTEN_1_CLR */
++
++#define RG_CK_CFG_3          0x50u     /* mfg_sel: bits [17:16] */
++#define RG_MFG_CG_CON        0x00u
++#define RG_MFG_CG_CLR        0x08u
++#define RG_MFG_CG_BG3D       0x1u
++
++struct rg_domain {
++	const char *name;
++	uint32_t con;       /* PWR_CON offset in SPM */
++	uint32_t sta_bit;   /* bit in PWR_STATUS / PWR_STATUS_2ND */
++	uint32_t sram_bits; /* 0, 1 or 2 SRAM power-down bits to release */
++};
++
++static const struct rg_domain rg_domains[6] = {
++	{ "MFG0", 0x328u, 1u << 4,  0 },
++	{ "MFG1", 0x32cu, 1u << 7,  2 },
++	{ "MFG2", 0x330u, 1u << 20, 1 },
++	{ "MFG3", 0x334u, 1u << 22, 1 },
++	{ "MFG4", 0x338u, 1u << 23, 1 },
++	{ "MFG5", 0x350u, 1u << 13, 1 },
++};
+ 
+ static uint32_t
+ rg_rd(vm_offset_t base, uint32_t off)
+@@ -44,40 +82,165 @@ rg_rd(vm_offset_t base, uint32_t off)
+ 	return *(volatile uint32_t *)(base + off);
+ }
+ 
++static void
++rg_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++rg_delay_us(uint32_t us)
++{
++	uint64_t hz, start, ticks, now;
++
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
++	__asm__ volatile ("isb; mrs %0, cntpct_el0" : "=r"(start));
++	ticks = (hz * us) / 1000000ULL;
++	if (ticks == 0) {
++		ticks = 1;
++	}
++	do {
++		__asm__ volatile ("isb; mrs %0, cntpct_el0" : "=r"(now));
++	} while ((now - start) < ticks);
++}
++
++/* Poll until (read(off) & mask) == want, up to ~20 ms. Returns 1 on success. */
++static int
++rg_wait(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want)
++{
++	for (int i = 0; i < 2000; i++) {
++		if ((rg_rd(base, off) & mask) == want) {
++			return 1;
++		}
++		rg_delay_us(10);
++	}
++	return 0;
++}
++
++static void
++rg_log_status(vm_offset_t spm, const char *when)
++{
++	uint32_t st = rg_rd(spm, RG_PWR_STATUS), st2 = rg_rd(spm, RG_PWR_STATUS_2ND);
++
++	printf("ROSEMARY GPU: %s: SPM PWR_STATUS=%08x PWR_STATUS_2ND=%08x\n", when, st, st2);
++	for (int i = 0; i < 6; i++) {
++		const struct rg_domain *d = &rg_domains[i];
++		printf("ROSEMARY GPU: %s: %s %s/%s PWR_CON=%08x\n", when, d->name,
++		    (st & d->sta_bit) ? "on" : "off", (st2 & d->sta_bit) ? "on" : "off",
++		    rg_rd(spm, d->con));
++	}
++}
++
++static int
++rg_all_on(vm_offset_t spm)
++{
++	uint32_t st = rg_rd(spm, RG_PWR_STATUS), st2 = rg_rd(spm, RG_PWR_STATUS_2ND);
++
++	for (int i = 0; i < 6; i++) {
++		if (!(st & rg_domains[i].sta_bit) || !(st2 & rg_domains[i].sta_bit)) {
++			return 0;
++		}
++	}
++	return 1;
++}
++
++/* Same register sequence as the vendor spm_mtcmos_ctrl_mfgN(STA_POWER_ON). */
++static int
++rg_domain_on(vm_offset_t spm, const struct rg_domain *d)
++{
++	uint32_t v;
++
++	rg_wr(spm, d->con, rg_rd(spm, d->con) | RG_PWR_ON);
++	rg_wr(spm, d->con, rg_rd(spm, d->con) | RG_PWR_ON_2ND);
++	if (!rg_wait(spm, RG_PWR_STATUS, d->sta_bit, d->sta_bit) ||
++	    !rg_wait(spm, RG_PWR_STATUS_2ND, d->sta_bit, d->sta_bit)) {
++		printf("ROSEMARY GPU: %s: power status timeout\n", d->name);
++		return 0;
++	}
++	rg_wr(spm, d->con, rg_rd(spm, d->con) & ~RG_PWR_CLK_DIS);
++	rg_wr(spm, d->con, rg_rd(spm, d->con) & ~RG_PWR_ISO);
++	rg_wr(spm, d->con, rg_rd(spm, d->con) | RG_PWR_RST_B);
++	if (d->sram_bits >= 1) {
++		rg_wr(spm, d->con, rg_rd(spm, d->con) & ~RG_SRAM_PDN0);
++		if (!rg_wait(spm, d->con, RG_SRAM_ACK0, 0)) {
++			printf("ROSEMARY GPU: %s: SRAM ack0 timeout\n", d->name);
++			return 0;
++		}
++	}
++	if (d->sram_bits >= 2) {
++		rg_wr(spm, d->con, rg_rd(spm, d->con) & ~RG_SRAM_PDN1);
++		if (!rg_wait(spm, d->con, RG_SRAM_ACK1, 0)) {
++			printf("ROSEMARY GPU: %s: SRAM ack1 timeout\n", d->name);
++			return 0;
++		}
++	}
++	v = rg_rd(spm, d->con);
++	printf("ROSEMARY GPU: %s on, PWR_CON=%08x\n", d->name, v);
++	return 1;
++}
++
++static void
++rg_read_gpu(vm_offset_t gpu)
++{
++	uint32_t id = rg_rd(gpu, 0x000);
++
++	printf("ROSEMARY GPU: GPU_ID=%08x (product %04x, major %u, minor %u, status %u)\n", id,
++	    id >> 16, (id >> 12) & 0xfu, (id >> 4) & 0xffu, id & 0xfu);
++	printf("ROSEMARY GPU: L2_FEATURES=%08x CORE_FEATURES=%08x TILER_FEATURES=%08x MEM_FEATURES=%08x\n",
++	    rg_rd(gpu, 0x004), rg_rd(gpu, 0x008), rg_rd(gpu, 0x00c), rg_rd(gpu, 0x010));
++	printf("ROSEMARY GPU: MMU_FEATURES=%08x AS_PRESENT=%08x JS_PRESENT=%08x GPU_STATUS=%08x\n",
++	    rg_rd(gpu, 0x014), rg_rd(gpu, 0x018), rg_rd(gpu, 0x01c), rg_rd(gpu, 0x034));
++	printf("ROSEMARY GPU: SHADER_PRESENT=%08x TILER_PRESENT=%08x L2_PRESENT=%08x\n",
++	    rg_rd(gpu, 0x100), rg_rd(gpu, 0x110), rg_rd(gpu, 0x120));
++}
++
+ void
+ rosemary_gpu_probe(void)
+ {
+-	int enable = 1;
+-	vm_offset_t spm;
+-	uint32_t st, st2;
+-	static const char *const names[6] = { "MFG0", "MFG1", "MFG2", "MFG3", "MFG4", "MFG5" };
+-	static const uint32_t bits[6] = { RG_MFG0_BIT, RG_MFG1_BIT, RG_MFG2_BIT, RG_MFG3_BIT, RG_MFG4_BIT, RG_MFG5_BIT };
++	int mode = 1;
++	vm_offset_t spm, infra, topck, mfgcfg, gpu;
+ 
+-	if (PE_parse_boot_argn("rosemarygpu", &enable, sizeof(enable)) && enable == 0) {
++	if (PE_parse_boot_argn("rosemarygpu", &mode, sizeof(mode)) && mode == 0) {
+ 		return;
+ 	}
+-	spm = ml_io_map(RG_SPM_PA, RG_SPM_SIZE);
+-	if (spm == 0) {
+-		printf("ROSEMARY GPU: cannot map SPM\n");
++	spm = ml_io_map(RG_SPM_PA, RG_PAGE);
++	infra = ml_io_map(RG_INFRA_PA, RG_PAGE);
++	topck = ml_io_map(RG_TOPCK_PA, RG_PAGE);
++	mfgcfg = ml_io_map(RG_MFGCFG_PA, RG_PAGE);
++	gpu = ml_io_map(RG_GPU_PA, RG_GPU_SIZE);
++	if (spm == 0 || infra == 0 || topck == 0 || mfgcfg == 0 || gpu == 0) {
++		printf("ROSEMARY GPU: register mapping failed\n");
+ 		return;
+ 	}
+-	st = rg_rd(spm, RG_PWR_STATUS);
+-	st2 = rg_rd(spm, RG_PWR_STATUS_2ND);
+-	printf("ROSEMARY GPU: SPM PWR_STATUS=%08x PWR_STATUS_2ND=%08x\n", st, st2);
+-	for (int i = 0; i < 6; i++) {
+-		uint32_t con = rg_rd(spm, i < 5 ? RG_MFG0_PWR_CON + 4u * (uint32_t)i : RG_MFG5_PWR_CON);
+-		printf("ROSEMARY GPU: %s status=%s/%s PWR_CON=%08x\n", names[i],
+-		    (st & bits[i]) ? "on" : "off", (st2 & bits[i]) ? "on" : "off", con);
++	printf("ROSEMARY GPU: mode %d, mfg_sel=%u, AXI PROTECTEN=%08x PROTECTEN_1=%08x\n", mode,
++	    (rg_rd(topck, RG_CK_CFG_3) >> 16) & 3u, rg_rd(infra, RG_PROTECTEN), rg_rd(infra, RG_PROTECTEN_1));
++	rg_log_status(spm, "before");
++
++	if (mode >= 2 && !rg_all_on(spm)) {
++		for (int i = 0; i < 6; i++) {
++			if (!rg_domain_on(spm, &rg_domains[i])) {
++				printf("ROSEMARY GPU: power-on stopped at %s\n", rg_domains[i].name);
++				rg_log_status(spm, "after");
++				return;
++			}
++			if (i == 1) {
++				/* MFG1: release AXI bus protection once its SRAM is up */
++				rg_wr(infra, RG_PROTECTEN_CLR, RG_MFG1_PROT_STEP2);
++				rg_wr(infra, RG_PROTECTEN_1_CLR, RG_MFG1_PROT_STEP1);
++				printf("ROSEMARY GPU: bus protect released, PROTECTEN=%08x PROTECTEN_1=%08x\n",
++				    rg_rd(infra, RG_PROTECTEN), rg_rd(infra, RG_PROTECTEN_1));
++			}
++		}
++		rg_log_status(spm, "after");
+ 	}
+-	if ((st & RG_ALL_BITS) != RG_ALL_BITS || (st2 & RG_ALL_BITS) != RG_ALL_BITS) {
++	if (!rg_all_on(spm)) {
+ 		printf("ROSEMARY GPU: domains are not all powered; GPU registers not touched\n");
+ 		return;
+ 	}
+-	vm_offset_t gpu = ml_io_map(RG_GPU_PA, RG_GPU_SIZE);
+-	if (gpu == 0) {
+-		printf("ROSEMARY GPU: cannot map GPU registers\n");
+-		return;
+-	}
+-	printf("ROSEMARY GPU: GPU_ID=%08x GPU_STATUS=%08x\n", rg_rd(gpu, RG_GPU_ID), rg_rd(gpu, RG_GPU_STATUS));
++	printf("ROSEMARY GPU: MFG_CG_CON=%08x\n", rg_rd(mfgcfg, RG_MFG_CG_CON));
++	rg_wr(mfgcfg, RG_MFG_CG_CLR, RG_MFG_CG_BG3D);
++	printf("ROSEMARY GPU: MFG_CG_CON after ungate=%08x\n", rg_rd(mfgcfg, RG_MFG_CG_CON));
++	rg_read_gpu(gpu);
+ }
+ #endif /* ROSEMARY */
