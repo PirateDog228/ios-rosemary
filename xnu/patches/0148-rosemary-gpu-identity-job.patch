@@ -1,195 +1,317 @@
 diff --git a/bsd/dev/rosemary_gpu.c b/bsd/dev/rosemary_gpu.c
-index 3c4ba5a..e8f9012 100644
+index 3c4ba5a..6f67737 100644
 --- a/bsd/dev/rosemary_gpu.c
 +++ b/bsd/dev/rosemary_gpu.c
-@@ -1,5 +1,24 @@
- /*
-- * ROSEMARY (Redmi Note 10S, MT6785): GPU phase 0.
-+ * Copyright (c) 2026 ios-rosemary project
-+ * All rights reserved.
-+ *
-+ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
-+ *
-+ * This file contains Original Code and/or Modifications of Original Code
-+ * as defined in and that are subject to the Apple Public Source License
-+ * Version 2.0 (the 'License'). You may not use this file except in
-+ * compliance with the License. The rights granted to you under the License
-+ * may not be used to create, or enable the creation or redistribution of,
-+ * unlawful or unlicensed copies of an Apple operating system, or to
-+ * circumvent, violate, or enable the circumvention or violation of, any
-+ * terms of an Apple operating system software license agreement.
-+ *
-+ * Please obtain a copy of the License at
-+ * http://www.opensource.apple.com/apsl/ and read it before using this file.
-+ *
-+ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
-+ *
-+ * ROSEMARY (Redmi Note 10S, MT6785): GPU bring-up and identity job test.
-  *
-  * The Mali-G76 (Bifrost) sits at 0x13040000 behind the MFG0..MFG5 power
-  * domains, which the bootloader leaves off.
-@@ -10,11 +29,15 @@
+@@ -10,6 +10,8 @@
   *   rosemarygpu=2  power the domains on (MFG0, MFG1 + bus protect release,
   *                  MFG2..MFG5), ungate the MFGCFG clock gate and log the Mali
   *                  identification registers
-+ *   rosemarygpu=3  mode 2 + soft reset + power cores + identity job
++ *   rosemarygpu=3  mode 2 + G76 reset, internal core power-up and a
++ *                  minimal write-value job through identity-mapped AS0
   *
   * Reading a Mali register while its domain is off can hang a MediaTek bus,
   * so mode 2 is opt-in. The mfg_sel mux and the PLLs are left alone: the
-  * identification registers are readable from the bootloader's clock.
-+ *
-+ * Based on hakios-xnu-kernel-mtk redwood_mali.c (Mali-G52) by HakiOS (APSL 2.0).
-  */
- #if defined(ROSEMARY)
- #include <sys/param.h>
-@@ -22,8 +45,12 @@
+@@ -20,8 +22,12 @@
+ #include <sys/systm.h>
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
 +#include <libkern/libkern.h>
-
++#include <vm/vm_kern.h>
+ 
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern uint64_t kvtophys(vm_offset_t va);
 +extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
  void rosemary_gpu_probe(void);
-
+ 
  #define RG_SPM_PA            0x10006000u
-@@ -77,6 +104,43 @@ void rosemary_gpu_probe(void);
- #define RG_MFG_CG_CLR        0x08u
- #define RG_MFG_CG_BG3D       0x1u
-
-+#define GPU_ID               0x000u
-+#define GPU_INT_RAWSTAT      0x020u
-+#define GPU_INT_CLEAR        0x024u
-+#define GPU_INT_MASK         0x028u
-+#define GPU_CMD              0x030u
-+#define SHADER_PRESENT       0x100u
-+#define TILER_PRESENT        0x110u
-+#define L2_PRESENT           0x120u
-+#define SHADER_READY         0x140u
-+#define TILER_READY          0x150u
-+#define L2_READY             0x160u
-+#define SHADER_PWRON         0x180u
-+#define TILER_PWRON          0x190u
-+#define L2_PWRON             0x1a0u
-+#define IRQ_RESET_COMPLETED  (1u<<8)
-+#define JOB_INT_RAWSTAT      0x1000u
-+#define JOB_INT_CLEAR        0x1004u
-+#define JOB_INT_MASK         0x1008u
-+#define JS1                  0x1880u
-+#define JS_STATUS            0x24u
-+#define JS_HEAD_NEXT_LO      0x40u
-+#define JS_HEAD_NEXT_HI      0x44u
-+#define JS_AFFINITY_NEXT_LO  0x50u
-+#define JS_AFFINITY_NEXT_HI  0x54u
-+#define JS_CONFIG_NEXT       0x58u
-+#define JS_COMMAND_NEXT      0x60u
-+#define JS_CONFIG            ((3u<<8)|(3u<<12)|(8u<<16))
-+#define AS0                  0x2400u
-+#define AS_TRANSTAB_LO       0x00u
-+#define AS_TRANSTAB_HI       0x04u
-+#define AS_MEMATTR_LO        0x08u
-+#define AS_MEMATTR_HI        0x0cu
-+#define AS_COMMAND           0x18u
-+#define AS_FAULTSTATUS       0x1cu
-+#define AS_STATUS            0x28u
+@@ -105,17 +111,24 @@ rg_delay_us(uint32_t us)
+ 	} while ((now - start) < ticks);
+ }
+ 
+-/* Poll until (read(off) & mask) == want, up to ~20 ms. Returns 1 on success. */
++/* Poll until (read(off) & mask) == want, for a caller-selected timeout. */
+ static int
+-rg_wait(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want)
++rg_wait_for(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uint32_t timeout_us)
+ {
+-	for (int i = 0; i < 2000; i++) {
++	for (uint32_t elapsed = 0; elapsed < timeout_us; elapsed += 10) {
+ 		if ((rg_rd(base, off) & mask) == want) {
+ 			return 1;
+ 		}
+ 		rg_delay_us(10);
+ 	}
+-	return 0;
++	return (rg_rd(base, off) & mask) == want;
++}
 +
-+static uint32_t shader_mask;
-+
- struct rg_domain {
- 	const char *name;
- 	uint32_t con;       /* PWR_CON offset in SPM */
-@@ -217,9 +281,81 @@ rg_read_gpu(vm_offset_t gpu)
++/* The power sequence uses the vendor's 20 ms bounds. */
++static int
++rg_wait(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want)
++{
++	return rg_wait_for(base, off, mask, want, 20000);
+ }
+ 
+ static void
+@@ -195,6 +208,252 @@ rg_read_gpu(vm_offset_t gpu)
  	    rg_rd(gpu, 0x100), rg_rd(gpu, 0x110), rg_rd(gpu, 0x120));
  }
-
+ 
++
++/* Bifrost GPU registers used for reset, core power and the first Job Manager test. */
++#define RG_GPU_ID                 0x000u
++#define RG_GPU_INT_RAWSTAT        0x020u
++#define RG_GPU_INT_CLEAR          0x024u
++#define RG_GPU_INT_MASK           0x028u
++#define RG_GPU_CMD                0x030u
++#define RG_GPU_RESET_COMPLETED    (1u << 8)
++#define RG_GPU_SHADER_PRESENT     0x100u
++#define RG_GPU_TILER_PRESENT      0x110u
++#define RG_GPU_L2_PRESENT         0x120u
++#define RG_GPU_SHADER_READY       0x140u
++#define RG_GPU_TILER_READY        0x150u
++#define RG_GPU_L2_READY           0x160u
++#define RG_GPU_SHADER_PWRON       0x180u
++#define RG_GPU_TILER_PWRON        0x190u
++#define RG_GPU_L2_PWRON           0x1a0u
++#define RG_GPU_JOB_INT_RAWSTAT    0x1000u
++#define RG_GPU_JOB_INT_CLEAR      0x1004u
++#define RG_GPU_JOB_INT_MASK       0x1008u
++#define RG_GPU_JS1                0x1880u
++#define RG_GPU_JS_STATUS          0x24u
++#define RG_GPU_JS_HEAD_NEXT_LO    0x40u
++#define RG_GPU_JS_HEAD_NEXT_HI    0x44u
++#define RG_GPU_JS_AFFINITY_NEXT_LO 0x50u
++#define RG_GPU_JS_AFFINITY_NEXT_HI 0x54u
++#define RG_GPU_JS_CONFIG_NEXT     0x58u
++#define RG_GPU_JS_COMMAND_NEXT    0x60u
++#define RG_GPU_JS_CONFIG          ((3u << 8) | (3u << 12) | (8u << 16))
++#define RG_GPU_AS0                0x2400u
++#define RG_GPU_AS_TRANSTAB_LO     0x00u
++#define RG_GPU_AS_TRANSTAB_HI     0x04u
++#define RG_GPU_AS_MEMATTR_LO      0x08u
++#define RG_GPU_AS_MEMATTR_HI      0x0cu
++#define RG_GPU_AS_COMMAND         0x18u
++#define RG_GPU_AS_FAULTSTATUS     0x1cu
++#define RG_GPU_AS_STATUS          0x28u
++#define RG_GPU_AS_TRANSCFG_LO     0x30u
++#define RG_GPU_AS_TRANSCFG_HI     0x34u
++#define RG_GPU_AS_COMMAND_UPDATE  1u
++#define RG_GPU_AS_IDENTITY        2u
++#define RG_GPU_JOB_DONE           (1u << 1)
++#define RG_GPU_JOB_EXCEPTION      (1u << 17)
++#define RG_GPU_JOB_TIMEOUT_US     100000u
++
++/* Soft reset: use RAWSTAT, not the masked interrupt output. */
 +static int
-+rg_run_write_job(vm_offset_t gpu, vm_offset_t page_va, uint64_t page_pa)
++rg_gpu_soft_reset(vm_offset_t gpu)
 +{
-+	volatile uint32_t *job = (volatile uint32_t *)page_va, *target = (volatile uint32_t *)(page_va+0x800);
-+	int ok;
-+	bzero((void*)page_va, 4096);
-+	job[4] = (2u<<1)|1u|(1u<<16);
-+	job[8] = (uint32_t)(page_pa+0x800);
-+	job[9] = (uint32_t)((page_pa+0x800)>>32);
-+	job[10] = 6;
-+	job[12] = 0xc0ffee01u;
-+	FlushPoC_DcacheRegion(page_va, 4096);
-+	rg_wr(gpu, AS0+AS_TRANSTAB_LO, 0);
-+	rg_wr(gpu, AS0+AS_TRANSTAB_HI, 0);
-+	rg_wr(gpu, AS0+0x30, 2);
-+	rg_wr(gpu, AS0+0x34, 0);
-+	rg_wr(gpu, AS0+AS_MEMATTR_LO, 0x88888888u);
-+	rg_wr(gpu, AS0+AS_MEMATTR_HI, 0x88888888u);
-+	rg_wr(gpu, AS0+AS_COMMAND, 1);
-+	if (!rg_wait(gpu, AS0+AS_STATUS, 1, 0)) {
-+		printf("ROSEMARY GPU: AS0 update timeout\n");
++	rg_wr(gpu, RG_GPU_INT_MASK, 0);
++	rg_wr(gpu, RG_GPU_INT_CLEAR, 0xffffffffu);
++	rg_wr(gpu, RG_GPU_CMD, 1u);
++	if (!rg_wait_for(gpu, RG_GPU_INT_RAWSTAT, RG_GPU_RESET_COMPLETED,
++	    RG_GPU_RESET_COMPLETED, 100000u)) {
++		printf("ROSEMARY GPU: soft reset timeout, GPU_INT_RAWSTAT=%08x GPU_STATUS=%08x\n",
++		    rg_rd(gpu, RG_GPU_INT_RAWSTAT), rg_rd(gpu, 0x034u));
 +		return 0;
 +	}
-+	rg_wr(gpu, JOB_INT_MASK, 0);
-+	rg_wr(gpu, JOB_INT_CLEAR, 0xffffffffu);
-+	rg_wr(gpu, JS1+JS_HEAD_NEXT_LO, (uint32_t)page_pa);
-+	rg_wr(gpu, JS1+JS_HEAD_NEXT_HI, (uint32_t)(page_pa>>32));
-+	rg_wr(gpu, JS1+JS_AFFINITY_NEXT_LO, shader_mask);
-+	rg_wr(gpu, JS1+JS_AFFINITY_NEXT_HI, 0);
-+	rg_wr(gpu, JS1+JS_CONFIG_NEXT, JS_CONFIG);
-+	rg_wr(gpu, JS1+JS_COMMAND_NEXT, 1);
-+	if (!rg_wait(gpu, JOB_INT_RAWSTAT, (1u<<1)|(1u<<17), 1u<<1)) {
-+		printf("ROSEMARY GPU: job timeout, irq=%08x\n", rg_rd(gpu, JOB_INT_RAWSTAT));
++	rg_wr(gpu, RG_GPU_INT_CLEAR, 0xffffffffu);
++	return 1;
++}
++
++/* Power the GPU's internal L2, tiler and shader blocks after the SoC MFG domains are up. */
++static int
++rg_gpu_power_cores(vm_offset_t gpu, uint32_t *shader_mask_out)
++{
++	uint32_t shader_mask = rg_rd(gpu, RG_GPU_SHADER_PRESENT);
++	uint32_t tiler_mask = rg_rd(gpu, RG_GPU_TILER_PRESENT);
++	uint32_t l2_mask = rg_rd(gpu, RG_GPU_L2_PRESENT);
++	uint32_t as_present = rg_rd(gpu, 0x018u);
++	uint32_t js_present = rg_rd(gpu, 0x01cu);
++
++	if (shader_mask == 0 || tiler_mask == 0 || l2_mask == 0 ||
++	    (as_present & 1u) == 0 || (js_present & (1u << 1)) == 0) {
++		printf("ROSEMARY GPU: invalid topology shader=%08x tiler=%08x l2=%08x AS=%08x JS=%08x\n",
++		    shader_mask, tiler_mask, l2_mask, as_present, js_present);
++		return 0;
 +	}
-+	FlushPoC_DcacheRegion(page_va, 4096);
-+	ok = (*target == 0xc0ffee01u);
-+	printf("ROSEMARY GPU: job: irq=%08x slot=%08x mmu=%08x job=%08x target=%08x%s\n",
-+	    rg_rd(gpu, JOB_INT_RAWSTAT), rg_rd(gpu, JS1+JS_STATUS), rg_rd(gpu, AS0+AS_FAULTSTATUS),
-+	    job[0], *target, ok?" OK":" FAIL");
-+	rg_wr(gpu, JOB_INT_CLEAR, 0xffffffffu);
-+	return ok;
++	rg_wr(gpu, RG_GPU_L2_PWRON, l2_mask);
++	rg_wr(gpu, RG_GPU_TILER_PWRON, tiler_mask);
++	rg_wr(gpu, RG_GPU_SHADER_PWRON, shader_mask);
++	if (!rg_wait_for(gpu, RG_GPU_L2_READY, l2_mask, l2_mask, 50000u) ||
++	    !rg_wait_for(gpu, RG_GPU_TILER_READY, tiler_mask, tiler_mask, 50000u) ||
++	    !rg_wait_for(gpu, RG_GPU_SHADER_READY, shader_mask, shader_mask, 50000u)) {
++		printf("ROSEMARY GPU: internal core power timeout: L2=%08x/%08x TILER=%08x/%08x SHADER=%08x/%08x\n",
++		    rg_rd(gpu, RG_GPU_L2_READY), l2_mask, rg_rd(gpu, RG_GPU_TILER_READY), tiler_mask,
++		    rg_rd(gpu, RG_GPU_SHADER_READY), shader_mask);
++		return 0;
++	}
++	*shader_mask_out = shader_mask;
++	printf("ROSEMARY GPU: internal cores ready: shader=%08x tiler=%08x l2=%08x\n",
++	    shader_mask, tiler_mask, l2_mask);
++	return 1;
++}
++
++/*
++ * Our GPU_ID is 0x7211xxxx. Panfrost normalizes MediaTek's 0x7xxx variant with
++ * (product & 0xf00f), yielding the standard Mali-G76 model ID 0x7001.
++ */
++static int
++rg_gpu_is_g76(vm_offset_t gpu)
++{
++	uint32_t id = rg_rd(gpu, RG_GPU_ID);
++	uint32_t product = id >> 16;
++	uint32_t panfrost_model = product & 0xf00fu;
++
++	uint32_t mmu_features = rg_rd(gpu, 0x014u);
++	printf("ROSEMARY GPU: model check product=%04x normalized=%04x revision=%04x MMU_FEATURES=%08x VA_BITS=%u PA_BITS=%u\n",
++	    product, panfrost_model, id & 0xffffu, mmu_features,
++	    mmu_features & 0xffu, (mmu_features >> 8) & 0xffu);
++	return panfrost_model == 0x7001u;
++}
++
++/* Configure address space 0 for identity mode: GPU VA is the physical address. */
++static int
++rg_gpu_as0_identity(vm_offset_t gpu)
++{
++	vm_offset_t as0 = gpu + RG_GPU_AS0;
++
++	rg_wr(as0, RG_GPU_AS_TRANSTAB_LO, 0);
++	rg_wr(as0, RG_GPU_AS_TRANSTAB_HI, 0);
++	rg_wr(as0, RG_GPU_AS_TRANSCFG_LO, RG_GPU_AS_IDENTITY);
++	rg_wr(as0, RG_GPU_AS_TRANSCFG_HI, 0);
++	rg_wr(as0, RG_GPU_AS_MEMATTR_LO, 0x88888888u);
++	rg_wr(as0, RG_GPU_AS_MEMATTR_HI, 0x88888888u);
++	rg_wr(as0, RG_GPU_AS_COMMAND, RG_GPU_AS_COMMAND_UPDATE);
++	if (!rg_wait_for(gpu, RG_GPU_AS0 + RG_GPU_AS_STATUS, 1u, 0u, 50000u)) {
++		printf("ROSEMARY GPU: AS0 identity update timeout, status=%08x fault=%08x\n",
++		    rg_rd(gpu, RG_GPU_AS0 + RG_GPU_AS_STATUS), rg_rd(gpu, RG_GPU_AS0 + RG_GPU_AS_FAULTSTATUS));
++		return 0;
++	}
++	printf("ROSEMARY GPU: AS0 configured for identity addressing\n");
++	return 1;
++}
++
++/*
++ * A minimal Bifrost Job Descriptor: write one immediate 32-bit value to page+0x800.
++ * Return 1 on success, 0 on a completed-but-failed job, and -1 if it timed out.
++ */
++static int
++rg_gpu_identity_write_job(vm_offset_t gpu, vm_offset_t page_va, uint64_t page_pa, uint32_t shader_mask)
++{
++	volatile uint32_t *job = (volatile uint32_t *)page_va;
++	volatile uint32_t *target = (volatile uint32_t *)(page_va + 0x800u);
++	uint32_t irq = 0;
++	int completed = 0;
++
++	bzero((void *)page_va, PAGE_SIZE);
++	job[4] = (2u << 1) | 1u | (1u << 16); /* WRITE_VALUE, 64-bit pointers, slot 1 */
++	job[8] = (uint32_t)(page_pa + 0x800u);
++	job[9] = (uint32_t)((page_pa + 0x800u) >> 32);
++	job[10] = 6u;                         /* 32-bit immediate */
++	job[12] = 0xc0ffee01u;
++	FlushPoC_DcacheRegion(page_va, PAGE_SIZE);
++
++	rg_wr(gpu, RG_GPU_JOB_INT_MASK, 0);
++	rg_wr(gpu, RG_GPU_JOB_INT_CLEAR, 0xffffffffu);
++	rg_wr(gpu, RG_GPU_JS1 + RG_GPU_JS_HEAD_NEXT_LO, (uint32_t)page_pa);
++	rg_wr(gpu, RG_GPU_JS1 + RG_GPU_JS_HEAD_NEXT_HI, (uint32_t)(page_pa >> 32));
++	rg_wr(gpu, RG_GPU_JS1 + RG_GPU_JS_AFFINITY_NEXT_LO, shader_mask);
++	rg_wr(gpu, RG_GPU_JS1 + RG_GPU_JS_AFFINITY_NEXT_HI, 0);
++	rg_wr(gpu, RG_GPU_JS1 + RG_GPU_JS_CONFIG_NEXT, RG_GPU_JS_CONFIG);
++	rg_wr(gpu, RG_GPU_JS1 + RG_GPU_JS_COMMAND_NEXT, 1u);
++
++	for (uint32_t elapsed = 0; elapsed < RG_GPU_JOB_TIMEOUT_US; elapsed += 10u) {
++		irq = rg_rd(gpu, RG_GPU_JOB_INT_RAWSTAT);
++		if (irq & RG_GPU_JOB_DONE) {
++			completed = 1;
++			break;
++		}
++		if (irq & RG_GPU_JOB_EXCEPTION) {
++			completed = 1;
++			break;
++		}
++		rg_delay_us(10);
++	}
++	if (!completed) {
++		printf("ROSEMARY GPU: identity job timeout, irq=%08x slot=%08x mmu=%08x fault=%08x\n",
++		    rg_rd(gpu, RG_GPU_JOB_INT_RAWSTAT), rg_rd(gpu, RG_GPU_JS1 + RG_GPU_JS_STATUS),
++		    rg_rd(gpu, 0x2000u), rg_rd(gpu, RG_GPU_AS0 + RG_GPU_AS_FAULTSTATUS));
++		return -1;
++	}
++
++	FlushPoC_DcacheRegion(page_va, PAGE_SIZE);
++	irq = rg_rd(gpu, RG_GPU_JOB_INT_RAWSTAT);
++	printf("ROSEMARY GPU: identity job irq=%08x slot=%08x job=%08x target=%08x fault=%08x\n",
++	    irq, rg_rd(gpu, RG_GPU_JS1 + RG_GPU_JS_STATUS), job[0], *target,
++	    rg_rd(gpu, RG_GPU_AS0 + RG_GPU_AS_FAULTSTATUS));
++	rg_wr(gpu, RG_GPU_JOB_INT_CLEAR, RG_GPU_JOB_DONE | RG_GPU_JOB_EXCEPTION);
++	return ((irq & RG_GPU_JOB_DONE) != 0 && (irq & RG_GPU_JOB_EXCEPTION) == 0 &&
++	    *target == 0xc0ffee01u) ? 1 : 0;
++}
++
++/* Mode 3 is opt-in and runs only after the already-tested MT6785 power sequence. */
++static void
++rg_gpu_test_identity_job(vm_offset_t gpu)
++{
++	vm_offset_t page_va = 0;
++	uint64_t page_pa;
++	uint32_t shader_mask = 0;
++	kern_return_t kr;
++	int result, safe_to_free = 1;
++
++	if (!rg_gpu_is_g76(gpu)) {
++		printf("ROSEMARY GPU: refusing job test on an unexpected GPU model\n");
++		return;
++	}
++	if (!rg_gpu_soft_reset(gpu) || !rg_gpu_power_cores(gpu, &shader_mask)) {
++		printf("ROSEMARY GPU: reset/core initialization failed; no job submitted\n");
++		return;
++	}
++
++	kr = kmem_alloc(kernel_map, &page_va, PAGE_SIZE,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS || page_va == 0) {
++		printf("ROSEMARY GPU: cannot allocate identity-job page (kr=%d)\n", kr);
++		return;
++	}
++	page_pa = kvtophys(page_va);
++	if (page_pa == 0 || (page_pa & (PAGE_SIZE - 1u)) != 0 || page_pa >= (1ULL << 40)) {
++		printf("ROSEMARY GPU: invalid physical address for job page: %llx\n", (unsigned long long)page_pa);
++		kmem_free(kernel_map, page_va, PAGE_SIZE);
++		return;
++	}
++	if (!rg_gpu_as0_identity(gpu)) {
++		kmem_free(kernel_map, page_va, PAGE_SIZE);
++		return;
++	}
++
++	result = rg_gpu_identity_write_job(gpu, page_va, page_pa, shader_mask);
++	if (result < 0) {
++		/* Never free a page while an uncompleted GPU job may still reference it. */
++		safe_to_free = rg_gpu_soft_reset(gpu);
++		if (safe_to_free) {
++			uint32_t ignored_mask;
++			(void)rg_gpu_power_cores(gpu, &ignored_mask);
++		} else {
++			printf("ROSEMARY GPU: keeping the test page allocated; GPU reset did not complete\n");
++		}
++	}
++	if (safe_to_free) {
++		kmem_free(kernel_map, page_va, PAGE_SIZE);
++	}
++	printf("ROSEMARY GPU: identity job %s\n", result == 1 ? "SUCCESS" : "FAILED");
 +}
 +
  void
  rosemary_gpu_probe(void)
  {
- 	int mode = 1;
- 	vm_offset_t spm, infra, topck, mfgcfg, gpu;
-+	uint32_t shaders, tiler, l2, gpu_id;
-
- 	if (PE_parse_boot_argn("rosemarygpu", &mode, sizeof(mode)) && mode == 0) {
-@@ -287,5 +423,38 @@ rosemary_gpu_probe(void)
+@@ -242,5 +501,8 @@ rosemary_gpu_probe(void)
  	rg_wr(mfgcfg, RG_MFG_CG_CLR, RG_MFG_CG_BG3D);
  	printf("ROSEMARY GPU: MFG_CG_CON after ungate=%08x\n", rg_rd(mfgcfg, RG_MFG_CG_CON));
  	rg_read_gpu(gpu);
 +	if (mode >= 3) {
-+		vm_offset_t page_va = 0;
-+		if (kmem_alloc(kernel_map, &page_va, 4096, KMA_KOBJECT|KMA_ZERO|KMA_DATA, 0) != KERN_SUCCESS) {
-+			printf("ROSEMARY GPU: no page\n");
-+			return;
-+		}
-+		gpu_id = rg_rd(gpu, GPU_ID);
-+		shader_mask = rg_rd(gpu, SHADER_PRESENT);
-+		shaders = shader_mask;
-+		tiler = rg_rd(gpu, TILER_PRESENT);
-+		l2 = rg_rd(gpu, L2_PRESENT);
-+		rg_wr(gpu, GPU_INT_MASK, 0);
-+		rg_wr(gpu, GPU_INT_CLEAR, 0xffffffffu);
-+		rg_wr(gpu, GPU_CMD, 1);
-+		if (!rg_wait(gpu, GPU_INT_RAWSTAT, IRQ_RESET_COMPLETED, IRQ_RESET_COMPLETED)) {
-+			printf("ROSEMARY GPU: reset timeout\n");
-+			kmem_free(kernel_map, page_va, 4096);
-+			return;
-+		}
-+		rg_wr(gpu, GPU_INT_CLEAR, 0xffffffffu);
-+		rg_wr(gpu, L2_PWRON, l2);
-+		rg_wr(gpu, TILER_PWRON, tiler);
-+		rg_wr(gpu, SHADER_PWRON, shaders);
-+		if (!rg_wait(gpu, L2_READY, l2, l2) || !rg_wait(gpu, TILER_READY, tiler, tiler) ||
-+		    !rg_wait(gpu, SHADER_READY, shaders, shaders)) {
-+			printf("ROSEMARY GPU: cores timeout, ready=%08x\n", rg_rd(gpu, SHADER_READY));
-+			kmem_free(kernel_map, page_va, 4096);
-+			return;
-+		}
-+		printf("ROSEMARY GPU: Mali-G76 r%up%u cores ready\n", (gpu_id>>12)&0xf, (gpu_id>>4)&0xff);
-+		if (rg_run_write_job(gpu, page_va, kvtophys(page_va)))
-+			printf("ROSEMARY GPU: identity job SUCCESS\n");
-+		kmem_free(kernel_map, page_va, 4096);
++		rg_gpu_test_identity_job(gpu);
 +	}
  }
  #endif /* ROSEMARY */
