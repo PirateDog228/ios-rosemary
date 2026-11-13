@@ -1,0 +1,286 @@
+diff --git a/bsd/dev/rosemary_gpu.c b/bsd/dev/rosemary_gpu.c
+index 6f67737..8d1a9b2 100644
+--- a/bsd/dev/rosemary_gpu.c
++++ b/bsd/dev/rosemary_gpu.c
+@@ -20,3 +20,5 @@
+  *   rosemarygpu=3  mode 2 + G76 reset, internal core power-up and a
+  *                  minimal write-value job through identity-mapped AS0
++ *   rosemarygpu=4  mode 3 + one WRITE_VALUE job through a four-level
++ *                  AArch64 4-KiB page table using a non-identity GPU VA
+  *
+@@ -230,5 +232,14 @@
+ #define RG_GPU_AS_COMMAND_UPDATE  1u
+ #define RG_GPU_AS_IDENTITY        2u
++#define RG_GPU_AS_AARCH64_4K      6u
++#define RG_GPU_AS_INA_BITS(x)     ((x) << 6)
++#define RG_GPU_AS_PTW_MEMATTR_NC  (1u << 24)
++#define RG_GPU_AS_FAULTADDRESS_LO 0x20u
++#define RG_GPU_AS_FAULTADDRESS_HI 0x24u
++#define RG_GPU_AS_LOCKADDR_LO     0x10u
++#define RG_GPU_AS_LOCKADDR_HI     0x14u
++#define RG_GPU_AS_COMMAND_LOCK    2u
++#define RG_GPU_AS_COMMAND_FLUSH_MEM 5u
+ #define RG_GPU_JOB_DONE           (1u << 1)
+ #define RG_GPU_JOB_EXCEPTION      (1u << 17)
+ #define RG_GPU_JOB_TIMEOUT_US     100000u
+@@ -350,7 +361,7 @@
+  * Return 1 on success, 0 on a completed-but-failed job, and -1 if it timed out.
+  */
+ static int
+-rg_gpu_identity_write_job(vm_offset_t gpu, vm_offset_t page_va, uint64_t page_pa, uint32_t shader_mask)
++rg_gpu_identity_write_job(vm_offset_t gpu, vm_offset_t page_va, uint64_t job_gpu_va, uint32_t shader_mask)
+ {
+ 	volatile uint32_t *job = (volatile uint32_t *)page_va;
+ 	volatile uint32_t *target = (volatile uint32_t *)(page_va + 0x800u);
+@@ -362,7 +373,7 @@
+ 	bzero((void *)page_va, PAGE_SIZE);
+ 	job[4] = (2u << 1) | 1u | (1u << 16); /* WRITE_VALUE, 64-bit pointers, slot 1 */
+-	job[8] = (uint32_t)(page_pa + 0x800u);
+-	job[9] = (uint32_t)((page_pa + 0x800u) >> 32);
++	job[8] = (uint32_t)(job_gpu_va + 0x800u);
++	job[9] = (uint32_t)((job_gpu_va + 0x800u) >> 32);
+ 	job[10] = 6u;                         /* 32-bit immediate */
+ 	job[12] = 0xc0ffee01u;
+ 	FlushPoC_DcacheRegion(page_va, PAGE_SIZE);
+@@ -371,7 +382,7 @@
+ 	rg_wr(gpu, RG_GPU_JOB_INT_MASK, 0);
+ 	rg_wr(gpu, RG_GPU_JOB_INT_CLEAR, 0xffffffffu);
+-	rg_wr(gpu, RG_GPU_JS1 + RG_GPU_JS_HEAD_NEXT_LO, (uint32_t)page_pa);
+-	rg_wr(gpu, RG_GPU_JS1 + RG_GPU_JS_HEAD_NEXT_HI, (uint32_t)(page_pa >> 32));
++	rg_wr(gpu, RG_GPU_JS1 + RG_GPU_JS_HEAD_NEXT_LO, (uint32_t)job_gpu_va);
++	rg_wr(gpu, RG_GPU_JS1 + RG_GPU_JS_HEAD_NEXT_HI, (uint32_t)(job_gpu_va >> 32));
+ 	rg_wr(gpu, RG_GPU_JS1 + RG_GPU_JS_AFFINITY_NEXT_LO, shader_mask);
+ 	rg_wr(gpu, RG_GPU_JS1 + RG_GPU_JS_AFFINITY_NEXT_HI, 0);
+ 	rg_wr(gpu, RG_GPU_JS1 + RG_GPU_JS_CONFIG_NEXT, RG_GPU_JS_CONFIG);
+@@ -410,6 +421,207 @@
+ 	return ((irq & RG_GPU_JOB_DONE) != 0 && (irq & RG_GPU_JOB_EXCEPTION) == 0 &&
+ 	    *target == 0xc0ffee01u) ? 1 : 0;
+ }
++
++/* One separately allocated 4-KiB GPU page-table page. */
++struct rg_gpu_pt_page {
++	vm_offset_t va;
++	uint64_t pa;
++};
++
++#define RG_GPU_PTE_TABLE       3ULL
++#define RG_GPU_PTE_PAGE        3ULL
++#define RG_GPU_PTE_AF          (1ULL << 10)
++#define RG_GPU_PTE_SH_INNER    (3ULL << 8)
++#define RG_GPU_PTE_AP_RW       (1ULL << 6)
++#define RG_GPU_PTE_ADDRESS     0x0000fffffffff000ULL
++#define RG_GPU_MMU_TEST_VA     0x0000008000100000ULL
++
++static int
++rg_gpu_pt_page_alloc(struct rg_gpu_pt_page *page)
++{
++	kern_return_t kr;
++
++	page->va = 0;
++	page->pa = 0;
++	kr = kmem_alloc(kernel_map, &page->va, PAGE_SIZE,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS || page->va == 0) {
++		printf("ROSEMARY GPU: MMU page-table allocation failed (kr=%d)\n", kr);
++		return 0;
++	}
++	page->pa = kvtophys(page->va);
++	if (page->pa == 0 || (page->pa & 0xfffu) != 0 || page->pa >= (1ULL << 40)) {
++		printf("ROSEMARY GPU: invalid page-table PA=%llx\n",
++		    (unsigned long long)page->pa);
++		kmem_free(kernel_map, page->va, PAGE_SIZE);
++		page->va = 0;
++		page->pa = 0;
++		return 0;
++	}
++	return 1;
++}
++
++static void
++rg_gpu_pt_page_free(struct rg_gpu_pt_page *page)
++{
++	if (page->va != 0) {
++		kmem_free(kernel_map, page->va, PAGE_SIZE);
++		page->va = 0;
++		page->pa = 0;
++	}
++}
++
++/*
++ * Install one 4-KiB mapping in a four-level AArch64 stage-1 table.
++ * MMU_FEATURES=0x2830 reports a 48-bit VA, so levels 0..3 are used.
++ */
++static void
++rg_gpu_pt_map_one_4k(struct rg_gpu_pt_page *root,
++	    struct rg_gpu_pt_page *l1, struct rg_gpu_pt_page *l2,
++	    struct rg_gpu_pt_page *l3, uint64_t gpu_va, uint64_t page_pa)
++{
++	uint64_t *root_entries = (uint64_t *)root->va;
++	uint64_t *l1_entries = (uint64_t *)l1->va;
++	uint64_t *l2_entries = (uint64_t *)l2->va;
++	uint64_t *l3_entries = (uint64_t *)l3->va;
++	uint32_t i0 = (uint32_t)((gpu_va >> 39) & 0x1ffu);
++	uint32_t i1 = (uint32_t)((gpu_va >> 30) & 0x1ffu);
++	uint32_t i2 = (uint32_t)((gpu_va >> 21) & 0x1ffu);
++	uint32_t i3 = (uint32_t)((gpu_va >> 12) & 0x1ffu);
++
++	root_entries[i0] = l1->pa | RG_GPU_PTE_TABLE;
++	l1_entries[i1] = l2->pa | RG_GPU_PTE_TABLE;
++	l2_entries[i2] = l3->pa | RG_GPU_PTE_TABLE;
++	l3_entries[i3] = (page_pa & RG_GPU_PTE_ADDRESS) | RG_GPU_PTE_AF |
++	    RG_GPU_PTE_SH_INNER | RG_GPU_PTE_AP_RW | RG_GPU_PTE_PAGE;
++
++	/* The GPU's page-table walker is configured non-cacheable below. */
++	FlushPoC_DcacheRegion(root->va, PAGE_SIZE);
++	FlushPoC_DcacheRegion(l1->va, PAGE_SIZE);
++	FlushPoC_DcacheRegion(l2->va, PAGE_SIZE);
++	FlushPoC_DcacheRegion(l3->va, PAGE_SIZE);
++}
++
++/* Flush all AS0 translations and outstanding GPU memory accesses (Panfrost sequence). */
++static int
++rg_gpu_as0_flush_all(vm_offset_t gpu)
++{
++	vm_offset_t as0 = gpu + RG_GPU_AS0;
++
++	if (!rg_wait_for(gpu, RG_GPU_AS0 + RG_GPU_AS_STATUS, 1u, 0u, 100000u)) {
++		return 0;
++	}
++	rg_wr(as0, RG_GPU_AS_LOCKADDR_LO, 63u); /* whole 64-bit VA range */
++	rg_wr(as0, RG_GPU_AS_LOCKADDR_HI, 0);
++	rg_wr(as0, RG_GPU_AS_COMMAND, RG_GPU_AS_COMMAND_LOCK);
++	if (!rg_wait_for(gpu, RG_GPU_AS0 + RG_GPU_AS_STATUS, 1u, 0u, 100000u)) {
++		printf("ROSEMARY GPU: AS0 lock timeout status=%08x\n",
++		    rg_rd(gpu, RG_GPU_AS0 + RG_GPU_AS_STATUS));
++		return 0;
++	}
++	rg_wr(as0, RG_GPU_AS_COMMAND, RG_GPU_AS_COMMAND_FLUSH_MEM);
++	if (!rg_wait_for(gpu, RG_GPU_AS0 + RG_GPU_AS_STATUS, 1u, 0u, 100000u)) {
++		printf("ROSEMARY GPU: AS0 memory flush timeout status=%08x\n",
++		    rg_rd(gpu, RG_GPU_AS0 + RG_GPU_AS_STATUS));
++		return 0;
++	}
++	return 1;
++}
++
++static int
++rg_gpu_as0_aarch64_4k(vm_offset_t gpu, uint64_t root_pa)
++{
++	vm_offset_t as0 = gpu + RG_GPU_AS0;
++	uint32_t transcfg;
++
++	if (!rg_gpu_as0_flush_all(gpu)) {
++		printf("ROSEMARY GPU: AS0 pre-map flush failed\n");
++		return 0;
++	}
++	/* 55 - 48 input-address bits; non-cacheable table walks for bring-up. */
++	transcfg = RG_GPU_AS_AARCH64_4K | RG_GPU_AS_INA_BITS(7) |
++	    RG_GPU_AS_PTW_MEMATTR_NC;
++	rg_wr(as0, RG_GPU_AS_TRANSTAB_LO, (uint32_t)root_pa);
++	rg_wr(as0, RG_GPU_AS_TRANSTAB_HI, (uint32_t)(root_pa >> 32));
++	/* Attribute index 0 is normal memory; keep the remaining indices valid too. */
++	rg_wr(as0, RG_GPU_AS_MEMATTR_LO, 0x88888888u);
++	rg_wr(as0, RG_GPU_AS_MEMATTR_HI, 0x88888888u);
++	rg_wr(as0, RG_GPU_AS_TRANSCFG_LO, transcfg);
++	rg_wr(as0, RG_GPU_AS_TRANSCFG_HI, 0);
++	rg_wr(as0, RG_GPU_AS_COMMAND, RG_GPU_AS_COMMAND_UPDATE);
++	if (!rg_wait_for(gpu, RG_GPU_AS0 + RG_GPU_AS_STATUS, 1u, 0u, 100000u)) {
++		printf("ROSEMARY GPU: AArch64 AS0 update timeout status=%08x fault=%08x\n",
++		    rg_rd(gpu, RG_GPU_AS0 + RG_GPU_AS_STATUS),
++		    rg_rd(gpu, RG_GPU_AS0 + RG_GPU_AS_FAULTSTATUS));
++		return 0;
++	}
++	printf("ROSEMARY GPU: AS0 AArch64-4K enabled root=%llx transcfg=%08x VA_BITS=48 PA_BITS=40\n",
++	    (unsigned long long)root_pa, transcfg);
++	return 1;
++}
++
++/* Repeat WRITE_VALUE with a GPU VA that is not its physical address. */
++static int
++rg_gpu_test_aarch64_mmu(vm_offset_t gpu, vm_offset_t job_page_va,
++	    uint64_t job_page_pa, uint32_t shader_mask)
++{
++	struct rg_gpu_pt_page pt[4] = { { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 } };
++	uint64_t fault_va;
++	int allocated = 0, job_result = 0;
++
++	if ((job_page_pa & 0xfffu) != 0 || job_page_pa >= (1ULL << 40)) {
++		printf("ROSEMARY GPU: invalid data page PA for MMU test: %llx\n",
++		    (unsigned long long)job_page_pa);
++		return 0;
++	}
++	for (allocated = 0; allocated < 4; allocated++) {
++		if (!rg_gpu_pt_page_alloc(&pt[allocated])) {
++			goto out_free;
++		}
++	}
++
++	rg_gpu_pt_map_one_4k(&pt[0], &pt[1], &pt[2], &pt[3],
++	    RG_GPU_MMU_TEST_VA, job_page_pa);
++	FlushPoC_DcacheRegion(job_page_va, PAGE_SIZE);
++	if (!rg_gpu_as0_aarch64_4k(gpu, pt[0].pa)) {
++		goto out_recover;
++	}
++
++	job_result = rg_gpu_identity_write_job(gpu, job_page_va,
++	    RG_GPU_MMU_TEST_VA, shader_mask);
++	fault_va = ((uint64_t)rg_rd(gpu, RG_GPU_AS0 + RG_GPU_AS_FAULTADDRESS_HI) << 32) |
++	    rg_rd(gpu, RG_GPU_AS0 + RG_GPU_AS_FAULTADDRESS_LO);
++	printf("ROSEMARY GPU: AArch64 MMU job result=%d irq=%08x mmu_irq=%08x fault=%08x fault_va=%llx\n",
++	    job_result, rg_rd(gpu, RG_GPU_JOB_INT_RAWSTAT), rg_rd(gpu, 0x2000u),
++	    rg_rd(gpu, RG_GPU_AS0 + RG_GPU_AS_FAULTSTATUS), (unsigned long long)fault_va);
++
++out_recover:
++	/* Stop a failed/timed-out job before changing AS0 or releasing its tables. */
++	if (job_result != 1 && !rg_gpu_soft_reset(gpu)) {
++		printf("ROSEMARY GPU: MMU test reset failed; retaining page tables\n");
++		return -1;
++	}
++	if (!rg_gpu_as0_flush_all(gpu)) {
++		printf("ROSEMARY GPU: cannot flush AS0; retaining page tables\n");
++		return -1;
++	}
++	if (!rg_gpu_as0_identity(gpu)) {
++		printf("ROSEMARY GPU: cannot restore identity AS0; retaining page tables\n");
++		return -1;
++	}
++	printf("ROSEMARY GPU: AS0 restored to identity mode\n");
++
++out_free:
++	for (int i = allocated - 1; i >= 0; i--) {
++		rg_gpu_pt_page_free(&pt[i]);
++	}
++	if (job_result == 1) {
++		printf("ROSEMARY GPU: AArch64 4K MMU job SUCCESS\n");
++	} else {
++		printf("ROSEMARY GPU: AArch64 4K MMU job FAILED\n");
++	}
++	return job_result == 1 ? 1 : 0;
++}
+ 
+ /* Mode 3 is opt-in and runs only after the already-tested MT6785 power sequence. */
+ static void
+@@ -416,2 +628,2 @@
+-rg_gpu_test_identity_job(vm_offset_t gpu)
++rg_gpu_test_identity_job(vm_offset_t gpu, int mmu_test)
+ {
+@@ -440,7 +652,14 @@
+ 		return;
+ 	}
+ 
+ 	result = rg_gpu_identity_write_job(gpu, page_va, page_pa, shader_mask);
++	if (mmu_test && result == 1) {
++		int mmu_result = rg_gpu_test_aarch64_mmu(gpu, page_va, page_pa, shader_mask);
++		if (mmu_result < 0) {
++			/* AS0 may still reference the data page if recovery did not complete. */
++			safe_to_free = 0;
++		}
++	}
+ 	if (result < 0) {
+ 		/* Never free a page while an uncompleted GPU job may still reference it. */
+ 		safe_to_free = rg_gpu_soft_reset(gpu);
+@@ -470,3 +689,3 @@
+ 	if (mode >= 3) {
+-		rg_gpu_test_identity_job(gpu);
++		rg_gpu_test_identity_job(gpu, mode >= 4);
+ 	}
