@@ -1,16 +1,20 @@
 diff --git a/bsd/dev/rosemary_mali.c b/bsd/dev/rosemary_mali.c
-index ffb833c..712ee1e 100644
+index ffb833c..a3fd1c6 100644
 --- a/bsd/dev/rosemary_mali.c
 +++ b/bsd/dev/rosemary_mali.c
-@@ -43,6 +43,7 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+@@ -41,8 +41,11 @@ extern uint64_t kvtophys(vm_offset_t va);
+ extern vm_offset_t phystokv(uint64_t pa);
+ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
  extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern kern_return_t thread_terminate(thread_t);                 /* osfmk/kern/thread.c, not in the headers this file sees */
++extern wait_result_t thread_block(thread_continue_t);
  
  int rosemary_mali_attach(vm_offset_t gpu_regs, uint32_t shader_mask);
 +extern bool RosemaryMaliStart(void);            /* iokit/Kernel/arm/RosemaryMali.cpp */
  bool rosemary_mali_ready(void);
  bool rosemary_mali_parameter(uint32_t which, uint64_t *value);
  uint64_t rosemary_mali_address(uint64_t size);
-@@ -729,6 +730,29 @@ rm_log_parameters(void)
+@@ -729,6 +732,29 @@ rm_log_parameters(void)
  	}
  }
  
@@ -40,7 +44,7 @@ index ffb833c..712ee1e 100644
  /*
   * Called by rosemary_gpu.c in mode 5 once the domains are up, the gate is open and GPU_ID says G76:
   * reset, cores on, tables on, and the self-test. Returns 1 when the GPU is left running.
-@@ -786,6 +810,15 @@ rosemary_mali_attach(vm_offset_t gpu_regs, uint32_t shader_mask)
+@@ -786,6 +812,15 @@ rosemary_mali_attach(vm_offset_t gpu_regs, uint32_t shader_mask)
  	rm_selftest();
  	rm_log_parameters();
  	printf("ROSEMARY GPU: persistent mode up to step %u of 4; GPU left powered\n", rm_reached);
@@ -739,7 +743,7 @@ index 0000000..8043dcb
 +}
 +#endif /* SWEET && ROSEMARY */
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index a62416c..533e697 100644
+index a62416c..65169cd 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -48,6 +48,10 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
@@ -747,25 +751,27 @@ index a62416c..533e697 100644
  #include <IOKit/system.h>
  #include <pexpert/pexpert.h>
 +#if defined(ROSEMARY)
-+extern "C" void InvalidatePoC_DcacheRegion(vm_offset_t va, size_t length);       /* osfmk/arm64/caches_asm.s */
++extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);            /* osfmk/arm64/caches_asm.s */
 +bool rosemary_surface_wait_gpu(SweetSurface *s);                               /* RosemaryMali.cpp */
 +#endif
  #include <kern/clock.h>
  #include <sys/proc.h>
  
-@@ -390,6 +394,19 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -390,6 +394,21 @@ AppleCLCD::present(const uint8_t *rec)
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
 +#if defined(ROSEMARY)
 +		/*
 +		 * A surface the Mali draws into is shown only once its last job has finished, and what the GPU
-+		 * wrote to memory is read past the processor's cache (which may hold older lines of it).
++		 * wrote to memory is read past the processor's cache (which may hold older lines of it): the rows
++		 * are cleaned and invalidated first. Nothing dirties these lines (the surface was flushed when it
++		 * was made, and with malisurfwc=1 programs write it write-combined), so the clean writes nothing.
 +		 */
 +		bool gpuDrawn = src != 0 && bpe == 4 && rosemary_surface_wait_gpu(s);
 +		if (gpuDrawn) {
 +			for (int32_t y = 0; y < h; y++) {
-+				InvalidatePoC_DcacheRegion(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4,
++				FlushPoC_DcacheRegion(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4,
 +				    (size_t)w * 4);
 +			}
 +		}
