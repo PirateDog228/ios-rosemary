@@ -1,0 +1,846 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 5618068..1a2c7bb 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -3,6 +3,7 @@ bsd/dev/rosemary_rtc.c		standard
+ bsd/dev/rosemary_touch.c		standard
+ bsd/dev/rosemary_usb.c		standard
+ bsd/dev/rosemary_gpu.c		standard
++bsd/dev/rosemary_mali.c		standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+diff --git a/bsd/dev/rosemary_gpu.c b/bsd/dev/rosemary_gpu.c
+index 733ba2e..830fdf5 100644
+--- a/bsd/dev/rosemary_gpu.c
++++ b/bsd/dev/rosemary_gpu.c
+@@ -14,6 +14,8 @@
+  *                  minimal write-value job through identity-mapped AS0
+  *   rosemarygpu=4  mode 3 + one WRITE_VALUE job through a four-level
+  *                  AArch64 4-KiB page table using a non-identity GPU VA
++ *   rosemarygpu=5  modes 2 + reset/cores, then rosemary_mali.c keeps the GPU: persistent
++ *                  four-level tables, job queue, panfrost parameters (sysctl kern.rosemary.mali)
+  *
+  * Reading a Mali register while its domain is off can hang a MediaTek bus,
+  * so mode 2 is opt-in. The mfg_sel mux and the PLLs are left alone: the
+@@ -31,6 +33,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern uint64_t kvtophys(vm_offset_t va);
+ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+ void rosemary_gpu_probe(void);
++extern int rosemary_mali_attach(vm_offset_t gpu_regs, uint32_t shader_mask);   /* rosemary_mali.c */
+ 
+ #define RG_SPM_PA            0x10006000u
+ #define RG_INFRA_PA          0x10001000u   /* infracfg_ao */
+@@ -720,7 +723,14 @@ rosemary_gpu_probe(void)
+ 	rg_wr(mfgcfg, RG_MFG_CG_CLR, RG_MFG_CG_BG3D);
+ 	printf("ROSEMARY GPU: MFG_CG_CON after ungate=%08x\n", rg_rd(mfgcfg, RG_MFG_CG_CON));
+ 	rg_read_gpu(gpu);
+-	if (mode >= 3) {
++	if (mode >= 5) {
++		/* keep the GPU: persistent tables, job queue, panfrost parameters (rosemary_mali.c) */
++		if (!rg_gpu_is_g76(gpu)) {
++			printf("ROSEMARY GPU: refusing persistent mode on an unexpected GPU model\n");
++			return;
++		}
++		(void)rosemary_mali_attach(gpu, rg_rd(gpu, RG_GPU_SHADER_PRESENT));
++	} else if (mode >= 3) {
+ 		rg_gpu_test_identity_job(gpu, mode >= 4);
+ 	}
+ }
+diff --git a/bsd/dev/rosemary_mali.c b/bsd/dev/rosemary_mali.c
+new file mode 100644
+index 0000000..ffb833c
+--- /dev/null
++++ b/bsd/dev/rosemary_mali.c
+@@ -0,0 +1,791 @@
++/*
++ * ROSEMARY (Redmi Note 10S, MT6785): the Mali-G76 MC4 as a running GPU, not a test.
++ *
++ * rosemary_gpu.c (rosemarygpu=2..4) powers the MFG domains and proves that a job runs, first through
++ * identity addressing and then through AArch64 page tables, and then tears everything down again.
++ * With rosemarygpu=5 it hands the powered GPU to this file instead, which keeps it:
++ *
++ *   - address space 0 stays on a four-level AArch64-4K table (48-bit VA, 40-bit PA, 4 KB GPU pages
++ *     inside the kernel's 16 KB ones), with map / unmap and a GPU-VA allocator for what comes next;
++ *   - jobs are submitted to slot 0 (fragment) or slot 1 (everything else) and waited for, with the
++ *     whole recovery path (soft reset, cores back on, AS0 back on the table) when one does not finish;
++ *   - a queue and a worker thread, so a submission returns at once with a number to wait for: the
++ *     processor and the GPU work in turn otherwise, which is what limits a window server to ~20 fps;
++ *   - the panfrost DRM parameters (DRM_PANFROST_PARAM_*), read from this GPU's own registers, which
++ *     is what Mesa's panfrost asks for before it draws anything.
++ *
++ * The structure follows hakios' bsd/dev/redwood_mali.c (a G52, MT6768), generalized from its three
++ * table levels to four and from its four power domains to the six this SoC has (rosemary_gpu.c).
++ * Everything is polled, there are no interrupts yet. Entry points for the IOKit service that
++ * programs talk to are the rosemary_mali_* functions at the end of the file.
++ *
++ *   sysctl kern.rosemary.mali       how far it got: 1 ready (cores on), 2 tables on, 3 a job ran
++ *                                   through them, 4 a second job ran after a recovery reset
++ *   sysctl kern.rosemary.mali_id    GPU_ID
++ *   sysctl kern.rosemary.mali_jobs  jobs finished / failed
++ */
++#if defined(ROSEMARY)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/locks.h>
++#include <mach/mach_types.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <vm/vm_kern.h>
++
++extern uint64_t kvtophys(vm_offset_t va);
++extern vm_offset_t phystokv(uint64_t pa);
++extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++
++int rosemary_mali_attach(vm_offset_t gpu_regs, uint32_t shader_mask);
++bool rosemary_mali_ready(void);
++bool rosemary_mali_parameter(uint32_t which, uint64_t *value);
++uint64_t rosemary_mali_address(uint64_t size);
++bool rosemary_mali_map(uint64_t gpu, uint64_t phys);
++bool rosemary_mali_unmap(uint64_t gpu, uint64_t size);
++uint32_t rosemary_mali_submit(uint64_t chain, bool fragment);
++uint64_t rosemary_mali_enqueue(uint64_t chain, bool fragment);
++bool rosemary_mali_wait(uint64_t seq, uint64_t timeout_ns, uint32_t *status);
++
++SYSCTL_NODE(_kern, OID_AUTO, rosemary, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "rosemary");
++
++/* ---- registers (Bifrost, as in Linux panfrost_regs.h) ---- */
++#define RM_GPU_ID               0x000u
++#define RM_GPU_INT_RAWSTAT      0x020u
++#define RM_GPU_INT_CLEAR        0x024u
++#define RM_GPU_INT_MASK         0x028u
++#define RM_GPU_CMD              0x030u
++#define RM_RESET_COMPLETED      (1u << 8)
++#define RM_SHADER_PRESENT       0x100u
++#define RM_TILER_PRESENT        0x110u
++#define RM_L2_PRESENT           0x120u
++#define RM_SHADER_READY         0x140u
++#define RM_TILER_READY          0x150u
++#define RM_L2_READY             0x160u
++#define RM_SHADER_PWRON         0x180u
++#define RM_TILER_PWRON          0x190u
++#define RM_L2_PWRON             0x1a0u
++
++#define RM_JOB_INT_RAWSTAT      0x1000u
++#define RM_JOB_INT_CLEAR        0x1004u
++#define RM_JOB_INT_MASK         0x1008u
++#define RM_JS(n)                (0x1800u + (n) * 0x80u)
++#define RM_JS_STATUS            0x24u
++#define RM_JS_HEAD_NEXT_LO      0x40u
++#define RM_JS_HEAD_NEXT_HI      0x44u
++#define RM_JS_AFFINITY_NEXT_LO  0x50u
++#define RM_JS_AFFINITY_NEXT_HI  0x54u
++#define RM_JS_CONFIG_NEXT       0x58u
++#define RM_JS_COMMAND_NEXT      0x60u
++#define RM_JS_CONFIG            ((3u << 8) | (3u << 12) | (8u << 16))   /* AS 0, caches cleaned both ends */
++
++#define RM_MMU_INT_RAWSTAT      0x2000u
++#define RM_MMU_INT_CLEAR        0x2004u
++#define RM_AS0                  0x2400u
++#define RM_AS_TRANSTAB_LO       0x00u
++#define RM_AS_TRANSTAB_HI       0x04u
++#define RM_AS_MEMATTR_LO        0x08u
++#define RM_AS_MEMATTR_HI        0x0cu
++#define RM_AS_COMMAND           0x18u
++#define RM_AS_FAULTSTATUS       0x1cu
++#define RM_AS_FAULTADDR_LO      0x20u
++#define RM_AS_FAULTADDR_HI      0x24u
++#define RM_AS_STATUS            0x28u
++#define RM_AS_TRANSCFG_LO       0x30u
++#define RM_AS_TRANSCFG_HI       0x34u
++#define RM_AS_UPDATE            1u
++
++/* AArch64 4K, 55 - 48 = 7 input-address bits to ignore, page-table walks not cached (fastmap) */
++#define RM_TRANSCFG             (6u | (7u << 6) | (1u << 24))
++
++/* ---- state ---- */
++static LCK_GRP_DECLARE(rm_grp, "rosemary-mali");
++static LCK_MTX_DECLARE(rm_lock, &rm_grp);           /* tables and the address allocator */
++static LCK_MTX_DECLARE(rm_job_lock, &rm_grp);       /* the job slots and AS0's configuration; taken before rm_lock */
++static LCK_MTX_DECLARE(rm_queue_lock, &rm_grp);
++static LCK_MTX_DECLARE(rm_wait_lock, &rm_grp);
++
++static vm_offset_t rm_gpu;
++static uint32_t rm_shader_mask, rm_gpu_id;
++static uint32_t rm_reached;
++static uint32_t rm_jobs_done, rm_jobs_failed;
++static uint64_t *rm_root;
++static uint64_t rm_root_pa;
++static int rm_wait_event;
++
++SYSCTL_UINT(_kern_rosemary, OID_AUTO, mali, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_reached, 0, "how far the Mali came up");
++SYSCTL_UINT(_kern_rosemary, OID_AUTO, mali_id, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_gpu_id, 0, "GPU_ID");
++SYSCTL_UINT(_kern_rosemary, OID_AUTO, mali_jobs, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_jobs_done, 0, "jobs finished");
++SYSCTL_UINT(_kern_rosemary, OID_AUTO, mali_failed, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_jobs_failed, 0, "jobs that did not");
++
++static inline uint32_t
++rm_rd(uint32_t at)
++{
++	return *(volatile uint32_t *)(rm_gpu + at);
++}
++
++static inline void
++rm_wr(uint32_t at, uint32_t v)
++{
++	*(volatile uint32_t *)(rm_gpu + at) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++rm_delay_us(uint32_t us)
++{
++	uint64_t hz, start, ticks, now;
++
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(hz));
++	__asm__ volatile ("isb; mrs %0, cntpct_el0" : "=r"(start));
++	ticks = (hz * us) / 1000000ULL;
++	if (ticks == 0) {
++		ticks = 1;
++	}
++	do {
++		__asm__ volatile ("isb; mrs %0, cntpct_el0" : "=r"(now));
++	} while ((now - start) < ticks);
++}
++
++static bool
++rm_wait_reg(uint32_t at, uint32_t mask, uint32_t want, uint32_t timeout_us)
++{
++	for (uint32_t elapsed = 0; elapsed < timeout_us; elapsed += 10) {
++		if ((rm_rd(at) & mask) == want) {
++			return true;
++		}
++		rm_delay_us(10);
++	}
++	return (rm_rd(at) & mask) == want;
++}
++
++/* ---- soft reset and core power: the same as rosemary_gpu.c's, which ran on the phone ---- */
++
++static bool
++rm_soft_reset(void)
++{
++	rm_wr(RM_GPU_INT_MASK, 0);
++	rm_wr(RM_GPU_INT_CLEAR, 0xffffffffu);
++	rm_wr(RM_GPU_CMD, 1u);
++	if (!rm_wait_reg(RM_GPU_INT_RAWSTAT, RM_RESET_COMPLETED, RM_RESET_COMPLETED, 100000u)) {
++		return false;
++	}
++	rm_wr(RM_GPU_INT_CLEAR, 0xffffffffu);
++	return true;
++}
++
++static bool
++rm_power_cores(void)
++{
++	uint32_t l2 = rm_rd(RM_L2_PRESENT), tiler = rm_rd(RM_TILER_PRESENT);
++
++	rm_wr(RM_L2_PWRON, l2);
++	rm_wr(RM_TILER_PWRON, tiler);
++	rm_wr(RM_SHADER_PWRON, rm_shader_mask);
++	return rm_wait_reg(RM_L2_READY, l2, l2, 50000u) &&
++	       rm_wait_reg(RM_TILER_READY, tiler, tiler, 50000u) &&
++	       rm_wait_reg(RM_SHADER_READY, rm_shader_mask, rm_shader_mask, 50000u);
++}
++
++/* AS0 onto the table. With rm_job_lock held (or before anyone else runs). */
++static bool
++rm_as0_update(uint64_t transtab)
++{
++	if (!rm_wait_reg(RM_AS0 + RM_AS_STATUS, 1u, 0u, 100000u)) {
++		return false;
++	}
++	rm_wr(RM_AS0 + RM_AS_TRANSTAB_LO, (uint32_t)transtab);
++	rm_wr(RM_AS0 + RM_AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
++	rm_wr(RM_AS0 + RM_AS_MEMATTR_LO, 0x88888888u);
++	rm_wr(RM_AS0 + RM_AS_MEMATTR_HI, 0x88888888u);
++	rm_wr(RM_AS0 + RM_AS_TRANSCFG_LO, RM_TRANSCFG);
++	rm_wr(RM_AS0 + RM_AS_TRANSCFG_HI, 0);
++	rm_wr(RM_AS0 + RM_AS_COMMAND, RM_AS_UPDATE);
++	return rm_wait_reg(RM_AS0 + RM_AS_STATUS, 1u, 0u, 100000u);
++}
++
++/*
++ * Drop every translation and outstanding GPU memory access of AS0: the LOCK / FLUSH_MEM sequence over the
++ * whole VA range that rosemary_gpu.c's MMU test ran on this phone. With rm_job_lock held.
++ */
++#define RM_AS_LOCKADDR_LO       0x10u
++#define RM_AS_LOCKADDR_HI       0x14u
++#define RM_AS_LOCK              2u
++#define RM_AS_FLUSH_MEM         5u
++
++static bool
++rm_as0_flush_all(void)
++{
++	if (!rm_wait_reg(RM_AS0 + RM_AS_STATUS, 1u, 0u, 100000u)) {
++		return false;
++	}
++	rm_wr(RM_AS0 + RM_AS_LOCKADDR_LO, 63u);
++	rm_wr(RM_AS0 + RM_AS_LOCKADDR_HI, 0);
++	rm_wr(RM_AS0 + RM_AS_COMMAND, RM_AS_LOCK);
++	if (!rm_wait_reg(RM_AS0 + RM_AS_STATUS, 1u, 0u, 100000u)) {
++		return false;
++	}
++	rm_wr(RM_AS0 + RM_AS_COMMAND, RM_AS_FLUSH_MEM);
++	return rm_wait_reg(RM_AS0 + RM_AS_STATUS, 1u, 0u, 100000u);
++}
++
++/* ---- four-level AArch64-4K page tables ---- */
++#define RM_PTE_TABLE            3ull
++#define RM_PTE_PAGE             3ull
++#define RM_PTE_AF               (1ull << 10)
++#define RM_PTE_SH_INNER         (3ull << 8)
++#define RM_PTE_AP_RW            (1ull << 6)
++#define RM_PTE_ADDR             0x0000fffffffff000ull
++
++static uint64_t *
++rm_pt_page(uint64_t *phys)
++{
++	vm_offset_t page = 0;
++
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return NULL;
++	}
++	*phys = kvtophys(page);
++	if (*phys == 0 || (*phys & 0xfffull) != 0 || *phys >= (1ull << 40)) {
++		printf("ROSEMARY GPU: unusable page-table PA %llx\n", (unsigned long long)*phys);
++		kmem_free(kernel_map, page, PAGE_SIZE);
++		*phys = 0;
++		return NULL;
++	}
++	FlushPoC_DcacheRegion(page, PAGE_SIZE);        /* the zeroes, in memory where the GPU's walk reads */
++	return (uint64_t *)page;
++}
++
++/* The table below `entry`, made if there is none yet (when `create`). */
++static uint64_t *
++rm_below(uint64_t *entry, bool create)
++{
++	uint64_t phys;
++	uint64_t *table;
++
++	if (*entry & 1) {
++		return (uint64_t *)phystokv(*entry & RM_PTE_ADDR);
++	}
++	if (!create || (table = rm_pt_page(&phys)) == NULL) {
++		return NULL;
++	}
++	*entry = phys | RM_PTE_TABLE;
++	FlushPoC_DcacheRegion((vm_offset_t)entry, sizeof(*entry));
++	return table;
++}
++
++/* The level-3 entry for `gpu`, with rm_lock held. */
++static uint64_t *
++rm_pte(uint64_t gpu, bool create)
++{
++	uint64_t *l1, *l2, *l3;
++
++	if (rm_root == NULL && (!create || (rm_root = rm_pt_page(&rm_root_pa)) == NULL)) {
++		return NULL;
++	}
++	if ((l1 = rm_below(&rm_root[(gpu >> 39) & 511], create)) == NULL ||
++	    (l2 = rm_below(&l1[(gpu >> 30) & 511], create)) == NULL ||
++	    (l3 = rm_below(&l2[(gpu >> 21) & 511], create)) == NULL) {
++		return NULL;
++	}
++	return &l3[(gpu >> 12) & 511];
++}
++
++bool
++rosemary_mali_map(uint64_t gpu, uint64_t phys)
++{
++	uint64_t *entry;
++
++	bool done = false;
++
++	if (phys == 0 || (phys & 0xfffu) != 0 || phys >= (1ull << 40) || (gpu & 0xfffu) != 0) {
++		return false;
++	}
++	/*
++	 * Lock order everywhere: rm_job_lock, then rm_lock. map() takes only rm_lock on purpose: it only ever
++	 * fills an entry that is empty, and an empty entry is one no TLB keeps, so a job running meanwhile
++	 * cannot see a half-change (the entry is one aligned 64-bit store, its table pages are written and
++	 * flushed first). Making a buffer therefore never waits for the job running -- on the G52 port that wait
++	 * cost 2.5 ms a buffer. Anything that could change an entry the GPU may hold (unmap, replacing a
++	 * mapping) takes rm_job_lock and flushes the MMU.
++	 */
++	lck_mtx_lock(&rm_lock);
++	entry = rm_pte(gpu, true);
++	if (entry != NULL && (*entry & 1) == 0) {
++		*entry = (phys & RM_PTE_ADDR) | RM_PTE_AF | RM_PTE_SH_INNER | RM_PTE_AP_RW | RM_PTE_PAGE;
++		FlushPoC_DcacheRegion((vm_offset_t)entry, sizeof(*entry));
++		done = true;
++	} else if (entry != NULL) {
++		printf("ROSEMARY GPU: map of GPU VA %llx refused: already mapped\n", (unsigned long long)gpu);
++	}
++	lck_mtx_unlock(&rm_lock);
++	return done;
++}
++
++bool
++rosemary_mali_unmap(uint64_t gpu, uint64_t size)
++{
++	bool flushed;
++
++	lck_mtx_lock(&rm_job_lock);                     /* nothing may run while entries are taken out */
++	lck_mtx_lock(&rm_lock);
++	for (uint64_t at = gpu; at < gpu + size; at += 4096) {
++		uint64_t *entry = rm_pte(at, false);
++
++		if (entry != NULL) {
++			*entry = 0;
++			FlushPoC_DcacheRegion((vm_offset_t)entry, sizeof(*entry));
++		}
++	}
++	/* a cleared entry may still be in the MMU's TLB: flush it, then reload AS0 from the table */
++	flushed = rm_as0_flush_all() && rm_as0_update(rm_root_pa);
++	if (!flushed) {
++		printf("ROSEMARY GPU: MMU flush after unmap of %llx failed\n", (unsigned long long)gpu);
++	}
++	lck_mtx_unlock(&rm_lock);
++	lck_mtx_unlock(&rm_job_lock);
++	return flushed;
++}
++
++/* `size` bytes of GPU addresses, never given out twice, 64 KB apart so an overrun faults. 0: none left. */
++#define RM_ADDR_FIRST   0x01000000ull
++#define RM_ADDR_END     (1ull << 35)
++static uint64_t rm_next_address = RM_ADDR_FIRST;
++
++uint64_t
++rosemary_mali_address(uint64_t size)
++{
++	uint64_t address;
++
++	lck_mtx_lock(&rm_lock);
++	address = rm_next_address;
++	if (address + size > RM_ADDR_END) {
++		address = 0;
++	} else {
++		rm_next_address += (size + 0xffffull) & ~0xffffull;
++	}
++	lck_mtx_unlock(&rm_lock);
++	return address;
++}
++
++/* ---- submitting a job chain ---- */
++
++/*
++ * Until a job slot says finished or failed, without keeping a core busy: a moment of polling for the
++ * short jobs, then asleep 200 us at a time. Returns the RAWSTAT bits found (0: nothing in `ms`).
++ */
++static uint32_t
++rm_wait_job(uint32_t mask, uint32_t ms)
++{
++	uint64_t deadline, nap;
++	uint32_t raw;
++
++	for (int i = 0; i < 20; i++) {
++		if ((raw = rm_rd(RM_JOB_INT_RAWSTAT) & mask) != 0) {
++			return raw;
++		}
++		rm_delay_us(10);
++	}
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		if ((raw = rm_rd(RM_JOB_INT_RAWSTAT) & mask) != 0) {
++			return raw;
++		}
++		clock_interval_to_deadline(200, NSEC_PER_USEC, &nap);
++		lck_mtx_lock(&rm_wait_lock);
++		(void)lck_mtx_sleep_deadline(&rm_wait_lock, LCK_SLEEP_DEFAULT, (event_t)&rm_wait_event, THREAD_UNINT, nap);
++		lck_mtx_unlock(&rm_wait_lock);
++	}
++	return rm_rd(RM_JOB_INT_RAWSTAT) & mask;
++}
++
++/* The GPU back as it was after a job that never finished. */
++static void
++rm_recover(void)
++{
++	rm_wr(RM_GPU_INT_CLEAR, 0xffffffffu);
++	/* a reset clears the MMU itself: no flush needed, only AS0 back on the table */
++	if (!rm_soft_reset() || !rm_power_cores() || !rm_as0_update(rm_root_pa)) {
++		printf("ROSEMARY GPU: recovery after a failed job did not complete\n");
++	}
++	rm_wr(RM_MMU_INT_CLEAR, 0xffffffffu);
++}
++
++/*
++ * One job chain from GPU address `chain`, run to its end before this returns: fragment jobs on slot 0,
++ * the rest on slot 1. 0: finished; otherwise the slot's status, or 0xff for no answer within a second
++ * (and then the GPU is reset, so the next one finds it working).
++ */
++uint32_t
++rosemary_mali_submit(uint64_t chain, bool fragment)
++{
++	uint32_t slot = fragment ? 0 : 1, js = RM_JS(slot), done_bit = 1u << slot, fail_bit = 1u << (slot + 16), raw, status = 0;
++
++	lck_mtx_lock(&rm_job_lock);
++	rm_wr(RM_JOB_INT_CLEAR, done_bit | fail_bit);
++	rm_wr(js + RM_JS_HEAD_NEXT_LO, (uint32_t)chain);
++	rm_wr(js + RM_JS_HEAD_NEXT_HI, (uint32_t)(chain >> 32));
++	rm_wr(js + RM_JS_AFFINITY_NEXT_LO, rm_shader_mask);
++	rm_wr(js + RM_JS_AFFINITY_NEXT_HI, 0);
++	rm_wr(js + RM_JS_CONFIG_NEXT, RM_JS_CONFIG);
++	rm_wr(js + RM_JS_COMMAND_NEXT, 1u);
++	raw = rm_wait_job(done_bit | fail_bit, 1000);
++	if (raw == done_bit) {
++		rm_jobs_done++;
++	} else {
++		uint64_t fa = rm_rd(RM_AS0 + RM_AS_FAULTADDR_LO) | ((uint64_t)rm_rd(RM_AS0 + RM_AS_FAULTADDR_HI) << 32);
++
++		status = (raw & fail_bit) ? rm_rd(js + RM_JS_STATUS) : 0xff;
++		if (status == 0) {
++			status = 0xfe;
++		}
++		rm_jobs_failed++;
++		printf("ROSEMARY GPU: job on slot %u at %llx did not finish: irq=%08x status=%08x mmu=%08x fault=%08x at %llx\n",
++		    slot, (unsigned long long)chain, raw, rm_rd(js + RM_JS_STATUS), rm_rd(RM_MMU_INT_RAWSTAT),
++		    rm_rd(RM_AS0 + RM_AS_FAULTSTATUS), (unsigned long long)fa);
++		rm_recover();
++	}
++	rm_wr(RM_JOB_INT_CLEAR, done_bit | fail_bit);
++	lck_mtx_unlock(&rm_job_lock);
++	return status;
++}
++
++/*
++ * The queue: submission returns at once with the job's number, and whoever needs the job done waits for
++ * that number. Jobs run one by one in the order given, which is what panfrost needs (a pass's vertex and
++ * tiler chain before its fragment chain, one pass before the next that reads it).
++ */
++#define RM_QUEUE        64
++static struct {
++	uint64_t chain, seq;
++	bool fragment;
++} rm_queue[RM_QUEUE];
++static unsigned rm_queue_head, rm_queue_count;
++static uint64_t rm_queued_seq, rm_done_seq;
++static bool rm_worker_started;
++/* The outcome of the last RM_RESULTS jobs, by number: 0 finished, otherwise submit()'s status. */
++#define RM_RESULTS      1024
++#define RM_STATUS_LOST  0xfdu           /* a result older than the ring: whether it failed is no longer known */
++static uint8_t rm_results[RM_RESULTS];
++
++static void
++rm_worker(__unused void *parameter, __unused wait_result_t result)
++{
++	for (;;) {
++		uint64_t chain, seq;
++		bool fragment;
++
++		lck_mtx_lock(&rm_queue_lock);
++		while (rm_queue_count == 0) {
++			lck_mtx_sleep(&rm_queue_lock, LCK_SLEEP_DEFAULT, (event_t)&rm_queue_count, THREAD_UNINT);
++		}
++		chain = rm_queue[rm_queue_head].chain;
++		seq = rm_queue[rm_queue_head].seq;
++		fragment = rm_queue[rm_queue_head].fragment;
++		lck_mtx_unlock(&rm_queue_lock);
++
++		uint32_t status = rosemary_mali_submit(chain, fragment);
++
++		lck_mtx_lock(&rm_queue_lock);
++		rm_results[seq % RM_RESULTS] = (uint8_t)(status == 0 ? 0 : ((status & 0xffu) != 0 ? (status & 0xffu) : 0xfeu));
++		rm_queue_head = (rm_queue_head + 1) % RM_QUEUE;
++		rm_queue_count--;
++		rm_done_seq = seq;
++		lck_mtx_unlock(&rm_queue_lock);
++		wakeup((caddr_t)&rm_done_seq);
++		wakeup((caddr_t)&rm_queue_head);               /* room in the queue */
++	}
++}
++
++uint64_t
++rosemary_mali_enqueue(uint64_t chain, bool fragment)
++{
++	uint64_t seq;
++	unsigned at;
++
++	lck_mtx_lock(&rm_queue_lock);
++	if (!rm_worker_started) {
++		thread_t thread;
++
++		if (kernel_thread_start(rm_worker, NULL, &thread) == KERN_SUCCESS) {
++			thread_set_thread_name(thread, "rosemary mali jobs");
++			thread_deallocate(thread);
++			rm_worker_started = true;
++		}
++	}
++	if (!rm_worker_started) {
++		/* nothing would ever run it: refuse the job rather than queue it for a thread that is not there */
++		lck_mtx_unlock(&rm_queue_lock);
++		printf("ROSEMARY GPU: no worker thread; job at %llx refused\n", (unsigned long long)chain);
++		return 0;
++	}
++	while (rm_queue_count == RM_QUEUE) {
++		lck_mtx_sleep(&rm_queue_lock, LCK_SLEEP_DEFAULT, (event_t)&rm_queue_head, THREAD_UNINT);
++	}
++	seq = ++rm_queued_seq;
++	at = (rm_queue_head + rm_queue_count) % RM_QUEUE;
++	rm_queue[at].chain = chain;
++	rm_queue[at].fragment = fragment;
++	rm_queue[at].seq = seq;
++	rm_queue_count++;
++	lck_mtx_unlock(&rm_queue_lock);
++	wakeup((caddr_t)&rm_queue_count);
++	return seq;
++}
++
++/*
++ * Until job `seq` (never 0: enqueue returns 0 for a refused job) is done: true when it is, and then
++ * *status says how it went (0: finished; else the slot's status, 0xff no answer, 0xfd result lost).
++ * With timeout 0 only a look.
++ */
++bool
++rosemary_mali_wait(uint64_t seq, uint64_t timeout_ns, uint32_t *status)
++{
++	uint64_t deadline;
++	bool done;
++
++	if (seq == 0) {
++		if (status != NULL) {
++			*status = 0xffu;
++		}
++		return false;
++	}
++	if (timeout_ns > 10ull * NSEC_PER_SEC) {
++		timeout_ns = 10ull * NSEC_PER_SEC;
++	}
++	nanoseconds_to_absolutetime(timeout_ns, &deadline);
++	deadline += mach_absolute_time();
++	lck_mtx_lock(&rm_queue_lock);
++	while (rm_done_seq < seq && timeout_ns != 0 && mach_absolute_time() < deadline) {
++		lck_mtx_sleep_deadline(&rm_queue_lock, LCK_SLEEP_DEFAULT, (event_t)&rm_done_seq, THREAD_UNINT, deadline);
++	}
++	done = rm_done_seq >= seq;
++	if (done && status != NULL) {
++		*status = (rm_done_seq - seq >= RM_RESULTS) ? RM_STATUS_LOST : rm_results[seq % RM_RESULTS];
++	}
++	lck_mtx_unlock(&rm_queue_lock);
++	return done;
++}
++
++/* ---- DRM_PANFROST_PARAM_* from this GPU's registers (Linux include/uapi/drm/panfrost_drm.h) ---- */
++
++bool
++rosemary_mali_ready(void)
++{
++	return rm_reached >= 3 && rm_worker_started;
++}
++
++bool
++rosemary_mali_parameter(uint32_t which, uint64_t *value)
++{
++	static const uint16_t simple[] = {
++		[6] = 0x018, [7] = 0x01c, [8] = 0x004, [9] = 0x008, [10] = 0x00c, [11] = 0x010, [12] = 0x014,
++		[13] = 0x0ac, [14] = 0x0a0, [15] = 0x0a4, [16] = 0x0a8, [17] = 0x300,
++		[18] = 0x0b0, [19] = 0x0b4, [20] = 0x0b8, [21] = 0x0bc,
++	};
++
++	if (!rosemary_mali_ready()) {
++		return false;
++	}
++	switch (which) {
++	case 0:
++		*value = rm_gpu_id >> 16;
++		return true;
++	case 1:
++		*value = rm_gpu_id & 0xffff;
++		return true;
++	case 2:
++	case 3:
++	case 4:
++		*value = rm_rd(0x100 + (which - 2) * 0x10) | ((uint64_t)rm_rd(0x104 + (which - 2) * 0x10) << 32);
++		return true;
++	case 5:                                        /* STACK_PRESENT: none on Bifrost */
++	case 40:                                       /* AFBC_FEATURES: not offered to Mesa yet */
++		*value = 0;
++		return true;
++	case 38:                                       /* NR_CORE_GROUPS: one L2, so one */
++		*value = 1;
++		return true;
++	case 39:
++		/*
++		 * THREAD_TLS_ALLOC, never less than THREAD_MAX_THREADS: on the G52 an answer smaller than the
++		 * stacks the cores really hand out made spilling shaders write past the end of their buffer.
++		 */
++		*value = rm_rd(0x310);
++		if (*value < rm_rd(0x0a0)) {
++			*value = rm_rd(0x0a0);
++		}
++		return true;
++	default:
++		if (which >= 22 && which <= 37) {
++			*value = rm_rd(0x0c0 + (which - 22) * 4);
++			return true;
++		}
++		if (which < sizeof(simple) / sizeof(simple[0]) && simple[which] != 0) {
++			*value = rm_rd(simple[which]);
++			return true;
++		}
++		return false;
++	}
++}
++
++/* ---- start ---- */
++
++/* The job of rosemary_gpu.c's test, through the live tables: write one immediate value into a mapped page. */
++static bool
++rm_write_job(vm_offset_t page, uint64_t gpu_va, uint32_t value)
++{
++	volatile uint32_t *job = (volatile uint32_t *)page, *target = (volatile uint32_t *)(page + 0x800);
++	bool ok;
++
++	bzero((void *)page, PAGE_SIZE);
++	job[4] = (2u << 1) | 1u | (1u << 16);           /* WRITE_VALUE, 64-bit pointers, job index 1 */
++	job[8] = (uint32_t)(gpu_va + 0x800);
++	job[9] = (uint32_t)((gpu_va + 0x800) >> 32);
++	job[10] = 6u;                                   /* a 32-bit immediate */
++	job[12] = value;
++	FlushPoC_DcacheRegion(page, PAGE_SIZE);
++	ok = rosemary_mali_submit(gpu_va, false) == 0;
++	FlushPoC_DcacheRegion(page, PAGE_SIZE);
++	return ok && *target == value;
++}
++
++static void
++rm_selftest(void)
++{
++	vm_offset_t page = 0;
++	uint64_t gpu_va;
++	bool mapped = true;
++
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("ROSEMARY GPU: no page for the self-test\n");
++		return;
++	}
++	gpu_va = rosemary_mali_address(PAGE_SIZE);
++	/* the kernel's page is 16 KB, the GPU's 4 KB: every one of them */
++	for (uint64_t off = 0; off < PAGE_SIZE && mapped; off += 4096) {
++		mapped = rosemary_mali_map(gpu_va + off, kvtophys(page) + off);
++	}
++	if (gpu_va == 0 || !mapped) {
++		printf("ROSEMARY GPU: self-test: cannot map its page\n");
++	} else if (!rm_write_job(page, gpu_va, 0xc0ffee02u)) {
++		printf("ROSEMARY GPU: self-test: job through the live tables FAILED\n");
++	} else {
++		rm_reached = 3;
++		printf("ROSEMARY GPU: self-test: job through the live tables at GPU VA %llx ok\n", (unsigned long long)gpu_va);
++		/* and once more after a full recovery reset, which is what a failed job in real use will do */
++		lck_mtx_lock(&rm_job_lock);
++		rm_recover();
++		lck_mtx_unlock(&rm_job_lock);
++		if (rm_write_job(page, gpu_va, 0xc0ffee03u)) {
++			rm_reached = 4;
++			printf("ROSEMARY GPU: self-test: job after a recovery reset ok\n");
++		} else {
++			printf("ROSEMARY GPU: self-test: job after a recovery reset FAILED\n");
++		}
++	}
++	/* only free the page when the MMU is known to have forgotten it */
++	if (rosemary_mali_unmap(gpu_va, PAGE_SIZE) && rm_reached >= 3) {
++		kmem_free(kernel_map, page, PAGE_SIZE);
++	}
++}
++
++static void
++rm_log_parameters(void)
++{
++	static const char *const names[] = {
++		"PROD_ID", "REVISION", "SHADER_PRESENT", "TILER_PRESENT", "L2_PRESENT", "STACK_PRESENT", "AS_PRESENT",
++		"JS_PRESENT", "L2_FEATURES", "CORE_FEATURES", "TILER_FEATURES", "MEM_FEATURES", "MMU_FEATURES",
++		"THREAD_FEATURES", "MAX_THREADS", "MAX_WORKGROUP_SZ", "MAX_BARRIER_SZ", "COHERENCY_FEATURES",
++		"TEXTURE_FEATURES0", "TEXTURE_FEATURES1", "TEXTURE_FEATURES2", "TEXTURE_FEATURES3",
++	};
++
++	for (uint32_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		uint64_t v;
++
++		if (rosemary_mali_parameter(i, &v)) {
++			printf("ROSEMARY GPU: param %u %s = %llx\n", i, names[i], (unsigned long long)v);
++		}
++	}
++	for (uint32_t i = 22; i < 25; i++) {
++		uint64_t v;
++
++		if (rosemary_mali_parameter(i, &v)) {
++			printf("ROSEMARY GPU: param %u JS_FEATURES%u = %llx\n", i, i - 22, (unsigned long long)v);
++		}
++	}
++	{
++		uint64_t v;
++
++		if (rosemary_mali_parameter(39, &v)) {
++			printf("ROSEMARY GPU: param 39 THREAD_TLS_ALLOC = %llx (register %08x, THREAD_MAX_THREADS %08x)\n",
++			    (unsigned long long)v, rm_rd(0x310), rm_rd(0x0a0));
++		}
++	}
++}
++
++/*
++ * Called by rosemary_gpu.c in mode 5 once the domains are up, the gate is open and GPU_ID says G76:
++ * reset, cores on, tables on, and the self-test. Returns 1 when the GPU is left running.
++ */
++int
++rosemary_mali_attach(vm_offset_t gpu_regs, uint32_t shader_mask)
++{
++	uint32_t as_present;
++
++	rm_gpu = gpu_regs;
++	rm_shader_mask = shader_mask;
++	rm_gpu_id = rm_rd(RM_GPU_ID);
++	as_present = rm_rd(0x018);
++	if ((as_present & 1u) == 0 || shader_mask == 0) {
++		printf("ROSEMARY GPU: unexpected topology, not attaching\n");
++		return 0;
++	}
++	if (!rm_soft_reset() || !rm_power_cores()) {
++		printf("ROSEMARY GPU: reset/cores failed, not attaching\n");
++		return 0;
++	}
++	rm_reached = 1;
++	lck_mtx_lock(&rm_lock);
++	if (rm_root == NULL && (rm_root = rm_pt_page(&rm_root_pa)) == NULL) {
++		lck_mtx_unlock(&rm_lock);
++		printf("ROSEMARY GPU: no memory for the root table\n");
++		return 0;
++	}
++	lck_mtx_unlock(&rm_lock);
++	lck_mtx_lock(&rm_job_lock);
++	if (!rm_as0_update(rm_root_pa)) {
++		lck_mtx_unlock(&rm_job_lock);
++		printf("ROSEMARY GPU: AS0 would not take the table\n");
++		return 0;
++	}
++	lck_mtx_unlock(&rm_job_lock);
++	rm_reached = 2;
++	/* the worker is started now, so ready() means that jobs can really be queued */
++	{
++		thread_t thread;
++
++		lck_mtx_lock(&rm_queue_lock);
++		if (!rm_worker_started && kernel_thread_start(rm_worker, NULL, &thread) == KERN_SUCCESS) {
++			thread_set_thread_name(thread, "rosemary mali jobs");
++			thread_deallocate(thread);
++			rm_worker_started = true;
++		}
++		lck_mtx_unlock(&rm_queue_lock);
++		if (!rm_worker_started) {
++			printf("ROSEMARY GPU: cannot start the job worker; GPU stays powered but not offered\n");
++		}
++	}
++	printf("ROSEMARY GPU: persistent mode: AS0 on tables at %llx, shaders %08x\n",
++	    (unsigned long long)rm_root_pa, rm_shader_mask);
++	rm_selftest();
++	rm_log_parameters();
++	printf("ROSEMARY GPU: persistent mode up to step %u of 4; GPU left powered\n", rm_reached);
++	return rm_reached >= 3;
++}
++#endif /* ROSEMARY */
