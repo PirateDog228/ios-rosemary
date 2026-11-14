@@ -1,0 +1,93 @@
+diff --git a/iokit/Kernel/arm/RosemaryMali.cpp b/iokit/Kernel/arm/RosemaryMali.cpp
+index 8043dcb..5116d3b 100644
+--- a/iokit/Kernel/arm/RosemaryMali.cpp
++++ b/iokit/Kernel/arm/RosemaryMali.cpp
+@@ -32,9 +32,12 @@
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <mach/vm_param.h>
+ #include <sys/systm.h>
++#include <pexpert/pexpert.h>
+ 
+ #include "SweetSurface.h"
+ 
++extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);            /* osfmk/arm64/caches_asm.s */
++
+ extern "C" {
+ /* bsd/dev/rosemary_mali.c */
+ bool rosemary_mali_ready(void);
+@@ -603,6 +606,35 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		fSubmits++;
+ 		gMaliSubmits++;
+ 		if (r.submit.jc != 0) {
++			/*
++			 * The Mali does not look into the processor's caches. Every surface the job names is cleaned and
++			 * invalidated first: what a program wrote into it (a texture) reaches memory, and no dirty line
++			 * of it is left to be evicted over what the GPU draws. Programs keep the default cache mode.
++			 */
++			static int noflush = -1;
++
++			if (noflush < 0) {
++				int v = 0;
++				noflush = PE_parse_boot_argn("malinoflush", &v, sizeof(v)) && v != 0;
++			}
++			for (uint32_t i = 0; !noflush && i < r.submit.bo_handle_count && i < MALI_SUBMIT_BOS_MAX; i += 64) {
++				uint32_t handles[64];
++				uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
++
++				if (copyin((user_addr_t) (r.submit.bo_handles + i * sizeof(uint32_t)), handles, n * sizeof(uint32_t)) != 0) {
++					break;
++				}
++				for (uint32_t k = 0; k < n; k++) {
++					b = buffer(handles[k]);
++					if (b != NULL && b->surface != NULL) {
++						uintptr_t va = b->surface->kernelAddress();
++
++						if (va != 0) {
++							FlushPoC_DcacheRegion(va, (size_t) b->size);
++						}
++					}
++				}
++			}
+ 			seq = rosemary_mali_enqueue(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS);
+ 			if (seq == 0) {         /* refused: no worker to run it */
+ 				fFailed++;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 65169cd..2d7d03f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -398,8 +398,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 		/*
+ 		 * A surface the Mali draws into is shown only once its last job has finished, and what the GPU
+ 		 * wrote to memory is read past the processor's cache (which may hold older lines of it): the rows
+-		 * are cleaned and invalidated first. Nothing dirties these lines (the surface was flushed when it
+-		 * was made, and with malisurfwc=1 programs write it write-combined), so the clean writes nothing.
++		 * are cleaned and invalidated first. The surface's lines were also flushed when the job was
++		 * submitted (RosemaryMali.cpp), so nothing dirty can be written back over the GPU's pixels.
+ 		 */
+ 		bool gpuDrawn = src != 0 && bpe == 4 && rosemary_surface_wait_gpu(s);
+ 		if (gpuDrawn) {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index f3ece45..e1ce84a 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -706,17 +706,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ #if defined(ROSEMARY)
+ 			/*
+ 			 * The Mali does not snoop the processor's caches. The zeroes just written must be in memory, or
+-			 * a dirty line could be evicted later over what the GPU has drawn; and with malisurfwc=1 (set
+-			 * when the Mali is what draws) programs map the pixels write-combined, so what they write
+-			 * reaches memory where the GPU reads it.
++			 * a dirty line could be evicted later over what the GPU has drawn. (Programs keep the default
++			 * cache mode: changing the mode of kernel pages through a mapping panicked in phystokv. The
++			 * Mali's jobs are bracketed by explicit cache maintenance instead: RosemaryMali.cpp.)
+ 			 */
+ 			FlushPoC_DcacheRegion((vm_offset_t)mem->getBytesNoCopy(), s->allocSize);
+-			{
+-				int wc = 0;
+-				if (PE_parse_boot_argn("malisurfwc", &wc, sizeof(wc)) && wc != 0) {
+-					s->mapCache = kIOMapWriteCombineCache;
+-				}
+-			}
+ #endif
+ 			if (!sweet_surface_publish(s)) {
+ 				ret = kIOReturnNoResources;
