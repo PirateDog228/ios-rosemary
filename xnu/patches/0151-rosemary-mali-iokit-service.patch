@@ -1,0 +1,838 @@
+diff --git a/bsd/dev/rosemary_mali.c b/bsd/dev/rosemary_mali.c
+index ffb833c..712ee1e 100644
+--- a/bsd/dev/rosemary_mali.c
++++ b/bsd/dev/rosemary_mali.c
+@@ -43,6 +43,7 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ 
+ int rosemary_mali_attach(vm_offset_t gpu_regs, uint32_t shader_mask);
++extern bool RosemaryMaliStart(void);            /* iokit/Kernel/arm/RosemaryMali.cpp */
+ bool rosemary_mali_ready(void);
+ bool rosemary_mali_parameter(uint32_t which, uint64_t *value);
+ uint64_t rosemary_mali_address(uint64_t size);
+@@ -729,6 +730,29 @@ rm_log_parameters(void)
+ 	}
+ }
+ 
++/*
++ * IOKit may not be running when the GPU comes up: a thread offers the service to programs as soon as it is
++ * (RosemaryMaliStart says false until then), for up to five minutes.
++ */
++static void
++rm_publish_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	for (int i = 0; i < 600; i++) {
++		uint64_t nap;
++
++		if (RosemaryMaliStart()) {
++			printf("ROSEMARY GPU: service published after %d ms\n", i * 500);
++			break;
++		}
++		clock_interval_to_deadline(500, NSEC_PER_MSEC, &nap);
++		lck_mtx_lock(&rm_wait_lock);
++		(void)lck_mtx_sleep_deadline(&rm_wait_lock, LCK_SLEEP_DEFAULT, (event_t)&rm_wait_event, THREAD_UNINT, nap);
++		lck_mtx_unlock(&rm_wait_lock);
++	}
++	thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ /*
+  * Called by rosemary_gpu.c in mode 5 once the domains are up, the gate is open and GPU_ID says G76:
+  * reset, cores on, tables on, and the self-test. Returns 1 when the GPU is left running.
+@@ -786,6 +810,15 @@ rosemary_mali_attach(vm_offset_t gpu_regs, uint32_t shader_mask)
+ 	rm_selftest();
+ 	rm_log_parameters();
+ 	printf("ROSEMARY GPU: persistent mode up to step %u of 4; GPU left powered\n", rm_reached);
++	if (rm_reached >= 3 && rm_worker_started) {
++		thread_t thread;
++
++		if (kernel_thread_start(rm_publish_thread, NULL, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			printf("ROSEMARY GPU: cannot start the thread that publishes the service\n");
++		}
++	}
+ 	return rm_reached >= 3;
+ }
+ #endif /* ROSEMARY */
+diff --git a/iokit/Kernel/arm/RosemaryMali.cpp b/iokit/Kernel/arm/RosemaryMali.cpp
+new file mode 100644
+index 0000000..8043dcb
+--- /dev/null
++++ b/iokit/Kernel/arm/RosemaryMali.cpp
+@@ -0,0 +1,676 @@
++/*
++ * ROSEMARY: the Mali-G76 for programs to draw with.
++ *
++ * bsd/dev/rosemary_mali.c brings the GPU up (rosemarygpu=5) and, once its self-test has passed, publishes
++ * this service. A program that opens it speaks the interface of Linux's panfrost DRM driver, the one
++ * Mesa's panfrost knows: every request is a call of the user client with the request's number as the
++ * selector and its structure passed in and back. What Linux does with mmap() on the device is the client
++ * memory whose type is the buffer's handle.
++ *
++ * The class names, the request numbers and the structures are those of hakios' RedwoodMali (which drives a
++ * Mali-G52 the same way), so that its Mesa patch (tools/mesa/redwood-drm) and its Metal driver talk to
++ * this service as they are.
++ *
++ * What there is: parameters, buffers (made, entered into the GPU's address space, told their address,
++ * mapped, given back), IOSurfaces as buffers, and job chains: queued, not run in the call -- the number of
++ * the job goes back and whoever needs it done waits for that number (kRedwoodWait / kPanfrostWaitBO), which
++ * reports whether the job finished or failed. A surface remembers the last job that draws into it
++ * (SweetSurface::maliSeq) and the display waits for it before it copies the surface to the panel.
++ *
++ * Not here yet: interrupts (everything is polled), an address space for each program, buffers shared
++ * between programs, and hakios' kRedwoodShow (a test's pixels straight to the panel).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET) && defined(ROSEMARY)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <mach/vm_param.h>
++#include <sys/systm.h>
++
++#include "SweetSurface.h"
++
++extern "C" {
++/* bsd/dev/rosemary_mali.c */
++bool rosemary_mali_ready(void);
++bool rosemary_mali_parameter(uint32_t which, uint64_t * value);
++uint64_t rosemary_mali_address(uint64_t size);
++bool rosemary_mali_map(uint64_t gpu, uint64_t phys);
++bool rosemary_mali_unmap(uint64_t gpu, uint64_t size);
++uint64_t rosemary_mali_enqueue(uint64_t chain, bool fragment);
++bool rosemary_mali_wait(uint64_t seq, uint64_t timeout_ns, uint32_t * status);
++
++bool RosemaryMaliStart(void);
++}
++
++/* Linux's include/uapi/drm/panfrost_drm.h and drm.h: the requests' numbers and structures. */
++enum {
++	kDrmGemClose            = 0x09,
++	kPanfrostSubmit         = 0x40,
++	kPanfrostWaitBO         = 0x41,
++	kPanfrostCreateBO       = 0x42,
++	kPanfrostMmapBO         = 0x43,
++	kPanfrostGetParam       = 0x44,
++	kPanfrostGetBOOffset    = 0x45,
++	kPanfrostMadvise        = 0x48,
++	kRedwoodSurfaceSeq      = 0x7c,         /* hakios': a surface's last job, or "drawing, not yet sent" (struct redwood_surface_seq) */
++	kRedwoodWait            = 0x7d,         /* hakios': wait for a job by its number (struct redwood_wait) */
++	kRedwoodSurface         = 0x7e,         /* hakios': an IOSurface's memory as a buffer */
++	kRedwoodShow            = 0x7f,         /* hakios': a test's pixels onto the panel -- not here */
++};
++
++struct redwood_surface {
++	uint32_t surface;                       /* the IOSurface's ID */
++	uint32_t handle;                        /* kRedwoodDescribe: no buffer is wanted; else, back: the buffer, */
++	uint64_t size;                          /* how big it is, */
++	uint32_t offset, rowBytes;              /* where the pixels start in it and how long a row of them is, */
++	uint32_t width, height, pixelFormat, planes;    /* and what they are */
++};
++#define kRedwoodDescribe        0xffffffffu
++
++/* kRedwoodWait: job `seq` (what kPanfrostSubmit gave back in `jc`) done within timeout_ns, or kIOReturnTimeout */
++struct redwood_wait {
++	uint64_t seq;
++	int64_t timeout_ns;
++};
++
++/* kRedwoodSurfaceSeq: the job after which the surface is drawn, or REDWOOD_SEQ_PENDING while the driver
++ * still has its frame to send */
++struct redwood_surface_seq {
++	uint32_t surface, pad;
++	uint64_t seq;
++};
++#define REDWOOD_SEQ_PENDING     (~0ull)
++
++struct redwood_show {
++	uint64_t pixels;
++	uint32_t width, height, rowBytes, pad;
++};
++
++struct drm_gem_close {
++	uint32_t handle, pad;
++};
++
++struct drm_panfrost_submit {
++	uint64_t jc;
++	uint64_t in_syncs;
++	uint32_t in_sync_count;
++	uint32_t out_sync;
++	uint64_t bo_handles;
++	uint32_t bo_handle_count;
++	uint32_t requirements;
++};
++#define PANFROST_JD_REQ_FS      (1u << 0)
++
++struct drm_panfrost_wait_bo {
++	uint32_t handle, pad;
++	int64_t timeout_ns;
++};
++
++struct drm_panfrost_create_bo {
++	uint32_t size, flags, handle, pad;
++	uint64_t offset;
++};
++
++struct drm_panfrost_mmap_bo {
++	uint32_t handle, flags;
++	uint64_t offset;
++};
++
++struct drm_panfrost_get_param {
++	uint32_t param, pad;
++	uint64_t value;
++};
++
++struct drm_panfrost_get_bo_offset {
++	uint32_t handle, pad;
++	uint64_t offset;
++};
++
++struct drm_panfrost_madvise {
++	uint32_t handle, madv, retained;
++};
++
++#define MALI_BUFFERS            4096
++#define MALI_BUFFER_MAX         (256ull << 20)
++#define MALI_SUBMIT_BOS_MAX     4096
++
++struct mali_buffer {
++	IOMemoryDescriptor * memory;            /* made here, or the pixels of an IOSurface (`surface`) */
++	SweetSurface * surface;
++	uint64_t address, size;
++	uint64_t last_seq;                      /* the last job given it (kPanfrostSubmit's bo_handles) */
++};
++
++static IOLock * gMaliLock;
++static uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliRefused;
++
++/*
++ * The display's side: before it copies a surface to the panel, wait for the Mali's last job that draws into
++ * it. True when the surface is one the Mali draws (the caller then reads past the processor's cache).
++ */
++bool
++rosemary_surface_wait_gpu(SweetSurface * s)
++{
++	volatile uint64_t * seqp = &s->maliSeq;
++	uint64_t seq = *seqp;
++	uint32_t status = 0;
++
++	if (seq == 0) {
++		return false;
++	}
++	/* still being drawn by the driver's thread, its jobs not yet sent (kRedwoodSurfaceSeq): up to 100 ms */
++	for (int waited = 0; *seqp == REDWOOD_SEQ_PENDING && waited < 100; waited++) {
++		IOSleep(1);
++	}
++	seq = *seqp;
++	if (seq == REDWOOD_SEQ_PENDING) {
++		return true;                    /* never sent: show what is there */
++	}
++	if (seq != 0 && !rosemary_mali_wait(seq, 200ull * NSEC_PER_MSEC, &status)) {
++		static uint32_t late;
++
++		if (late++ < 8) {
++			IOLog("RedwoodMali: the display waited 200 ms for job %llu\n", seq);
++		}
++	} else if (status != 0) {
++		static uint32_t failed;
++
++		if (failed++ < 8) {
++			IOLog("RedwoodMali: the job %llu behind a displayed surface failed (%#x)\n", seq, status);
++		}
++	}
++	return true;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++class RedwoodMali : public IOService
++{
++	OSDeclareDefaultStructors(RedwoodMali);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(RedwoodMali, IOService);
++
++bool
++RedwoodMali::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "RedwoodMaliUserClient");
++	setName("RedwoodMali");
++	registerService();
++	return true;
++}
++
++/*
++ * Called (repeatedly, until it says true) by a kernel thread of rosemary_mali.c once the GPU is up: IOKit
++ * itself may not be running yet when the GPU comes up. false: not yet.
++ */
++bool
++RosemaryMaliStart(void)
++{
++	static bool started;
++	IOService * provider = IOService::getPlatform();
++	RedwoodMali * gpu;
++
++	if (started) {
++		return true;
++	}
++	if (provider == NULL || !rosemary_mali_ready()) {
++		return false;
++	}
++	if (gMaliLock == NULL) {
++		gMaliLock = IOLockAlloc();
++		if (gMaliLock == NULL) {
++			return false;
++		}
++	}
++	gpu = OSTypeAlloc(RedwoodMali);
++	if (gpu == NULL || !gpu->init() || !gpu->attach(provider)) {
++		OSSafeReleaseNULL(gpu);
++		IOLog("RedwoodMali: cannot create the service\n");
++		return false;
++	}
++	if (!gpu->start(provider)) {
++		gpu->detach(provider);
++		gpu->release();
++		IOLog("RedwoodMali: the service did not start\n");
++		return false;
++	}
++	gpu->release();
++	started = true;
++	IOLog("RedwoodMali: the GPU is there for programs to draw with\n");
++	return true;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++class RedwoodMaliUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(RedwoodMaliUserClient);
++
++	struct mali_buffer *    fBuffers;               /* handle n is fBuffers[n - 1] */
++	uint32_t                fNextBuffer;
++	uint32_t                fSubmits, fFailed, fRequests;
++
++	struct mali_buffer * buffer(uint32_t handle);
++	void freeBuffer(struct mali_buffer * b);
++	IOReturn createBO(struct drm_panfrost_create_bo * request);
++	struct mali_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t size, uint32_t * handle);
++	IOReturn surfaceBuffer(struct redwood_surface * request);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(RedwoodMaliUserClient, IOUserClient);
++
++bool
++RedwoodMaliUserClient::start(IOService * provider)
++{
++	if (!rosemary_mali_ready() || !IOUserClient::start(provider)) {
++		IOLog("RedwoodMali: a client could not be started\n");
++		return false;
++	}
++	IOLog("RedwoodMali: a client opened the GPU\n");
++	OSIncrementAtomic((SInt32 *) &gMaliClients);
++	fBuffers = IONewZero(struct mali_buffer, MALI_BUFFERS);
++	return fBuffers != NULL;
++}
++
++struct mali_buffer *
++RedwoodMaliUserClient::buffer(uint32_t handle)
++{
++	if (handle == 0 || handle > MALI_BUFFERS || fBuffers[handle - 1].memory == NULL) {
++		return NULL;
++	}
++	return &fBuffers[handle - 1];
++}
++
++/*
++ * With the lock held. Not while a job queued or running may still use it: wait for the last one given to
++ * it. If the GPU's MMU cannot be told to forget its pages the memory is NOT given back (the GPU might still
++ * reach it): it stays, retained, and the handle is lost.
++ */
++void
++RedwoodMaliUserClient::freeBuffer(struct mali_buffer * b)
++{
++	if (b->last_seq != 0) {
++		uint32_t status = 0;
++
++		if (!rosemary_mali_wait(b->last_seq, 2ull * NSEC_PER_SEC, &status)) {
++			IOLog("RedwoodMali: a buffer is freed with its last job %llu still unfinished; kept\n", b->last_seq);
++			bzero(b, sizeof(*b));       /* the memory and the surface stay referenced, on purpose */
++			return;
++		}
++	}
++	if (!rosemary_mali_unmap(b->address, b->size)) {
++		IOLog("RedwoodMali: GPU address %#llx could not be unmapped; its memory is kept\n", b->address);
++		bzero(b, sizeof(*b));
++		return;
++	}
++	b->memory->release();
++	if (b->surface != NULL) {
++		b->surface->release();
++	}
++	bzero(b, sizeof(*b));
++}
++
++/*
++ * A handle and GPU addresses for `size` bytes of `memory`, every 4 KB page of them entered into the GPU's
++ * tables. With the lock held; NULL: no handle, no addresses, or a page that would not go in. The caller sets
++ * `memory` (and `surface`) of what comes back.
++ */
++struct mali_buffer *
++RedwoodMaliUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t size, uint32_t * handle)
++{
++	struct mali_buffer * b = NULL;
++	bool mapped = true;
++
++	for (uint32_t n = 0; n < MALI_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % MALI_BUFFERS;
++
++		if (fBuffers[i].memory == NULL && fBuffers[i].address == 0) {
++			b = &fBuffers[i];
++			*handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL) {
++		IOLog("RedwoodMali: no handles left\n");
++		return NULL;
++	}
++	b->address = rosemary_mali_address(size);
++	for (uint64_t offset = 0; offset < size && mapped && b->address != 0; offset += 4096) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++
++		mapped = phys != 0 && rosemary_mali_map(b->address + offset, phys);
++	}
++	if (b->address == 0 || !mapped) {
++		if (b->address != 0) {
++			(void)rosemary_mali_unmap(b->address, size);
++		}
++		bzero(b, sizeof(*b));
++		IOLog("RedwoodMali: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
++		return NULL;
++	}
++	OSIncrementAtomic((SInt32 *) &gMaliBuffers);
++	b->size = size;
++	return b;
++}
++
++/* With the lock held. */
++IOReturn
++RedwoodMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
++{
++	uint64_t size = round_page_64(request->size);
++	IOBufferMemoryDescriptor * memory;
++	struct mali_buffer * b;
++
++	if (size == 0 || size > MALI_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	/* wired kernel memory, zero when made, write-combined: what the program writes goes to memory where the GPU reads it */
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++	    kIOMapWriteCombineCache, (vm_size_t) size, PAGE_SIZE);
++	if (memory == NULL) {
++		IOLog("RedwoodMali: no memory for a buffer of %llu bytes\n", size);
++		return kIOReturnNoMemory;
++	}
++	b = newBuffer(memory, size, &request->handle);
++	if (b == NULL) {
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	b->memory = memory;
++	request->offset = b->address;
++	return kIOReturnSuccess;
++}
++
++/*
++ * The pixels of an IOSurface as a buffer: what the window server draws into, and what is shown. The surface
++ * is held for as long as the buffer is there; a surface that is a buffer of this client's already is that
++ * buffer again. Asked only to describe (kRedwoodDescribe), no buffer is made.
++ */
++IOReturn
++RedwoodMaliUserClient::surfaceBuffer(struct redwood_surface * request)
++{
++	SweetSurface * s = sweet_surface_copy(request->surface);
++	struct mali_buffer * b = NULL;
++	uint64_t size;
++
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	if (s->memory == NULL) {
++		s->release();
++		return kIOReturnUnsupported;
++	}
++	size = round_page_64(s->allocSize);
++	if (size > s->memory->getLength()) {
++		size = s->memory->getLength() & ~(uint64_t)(PAGE_SIZE - 1);
++	}
++	if (size == 0 || size > MALI_BUFFER_MAX) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	request->size = size;
++	request->offset = s->offset;
++	request->rowBytes = s->bytesPerRow;
++	request->width = s->width;
++	request->height = s->height;
++	request->pixelFormat = s->pixelFormat;
++	request->planes = s->planeCount;
++	if (request->handle == kRedwoodDescribe) {
++		request->handle = 0;
++		s->release();
++		return kIOReturnSuccess;
++	}
++	for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
++			b = &fBuffers[i];
++			request->handle = i + 1;
++			break;
++		}
++	}
++	if (b != NULL) {
++		s->release();
++		return kIOReturnSuccess;
++	}
++	b = newBuffer(s->memory, size, &request->handle);
++	if (b == NULL) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	s->memory->retain();
++	b->memory = s->memory;
++	b->surface = s;                         /* holds the reference sweet_surface_copy gave */
++	return kIOReturnSuccess;
++}
++
++IOReturn
++RedwoodMaliUserClient::clientClose(void)
++{
++	IOLockLock(gMaliLock);
++	for (uint32_t i = 0; fBuffers != NULL && i < MALI_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL) {
++			freeBuffer(&fBuffers[i]);
++		}
++	}
++	IOLockUnlock(gMaliLock);
++	if (fSubmits != 0) {
++		IOLog("RedwoodMali: a client goes after %u job chains, %u of them refused\n", fSubmits, fFailed);
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++RedwoodMaliUserClient::free(void)
++{
++	if (fBuffers != NULL) {
++		IODelete(fBuffers, struct mali_buffer, MALI_BUFFERS);
++		fBuffers = NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++RedwoodMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory)
++{
++	struct mali_buffer * b;
++	IOReturn ret = kIOReturnBadArgument;
++
++	if (fBuffers == NULL) {
++		return ret;
++	}
++	IOLockLock(gMaliLock);
++	b = buffer(type);
++	if (b != NULL) {
++		b->memory->retain();
++		*memory = b->memory;
++		*options = 0;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gMaliLock);
++	return ret;
++}
++
++IOReturn
++RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
++{
++	union {
++		struct drm_gem_close close;
++		struct drm_panfrost_submit submit;
++		struct drm_panfrost_wait_bo wait;
++		struct drm_panfrost_create_bo create;
++		struct drm_panfrost_mmap_bo mmap;
++		struct drm_panfrost_get_param param;
++		struct drm_panfrost_get_bo_offset offset;
++		struct drm_panfrost_madvise madvise;
++		struct redwood_show show;
++		struct redwood_surface surface;
++		struct redwood_wait waitseq;
++		struct redwood_surface_seq sseq;
++	} r;
++	size_t size = args->structureInputSize;
++	struct mali_buffer * b;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!rosemary_mali_ready()) {
++		return kIOReturnNotReady;
++	}
++	bzero(&r, sizeof(r));
++	memcpy(&r, args->structureInput, size);
++
++	/* the two waits, without holding everybody else up */
++	if (selector == kRedwoodWait || selector == kPanfrostWaitBO) {
++		uint64_t seq = r.waitseq.seq;
++		int64_t timeout = r.waitseq.timeout_ns;
++		uint32_t status = 0;
++
++		if (selector == kPanfrostWaitBO) {
++			IOLockLock(gMaliLock);
++			b = buffer(r.wait.handle);
++			seq = b != NULL ? b->last_seq : 0;
++			IOLockUnlock(gMaliLock);
++			timeout = r.wait.timeout_ns;
++			if (b == NULL) {
++				return kIOReturnNotFound;
++			}
++		}
++		if (seq == 0) {
++			ret = kIOReturnSuccess;         /* nothing was ever given to it */
++		} else if (!rosemary_mali_wait(seq, timeout > 0 ? (uint64_t) timeout : 0, &status)) {
++			ret = kIOReturnTimeout;
++		} else {
++			ret = status == 0 ? kIOReturnSuccess : kIOReturnIOError;        /* done, but did it finish */
++		}
++		if (args->structureOutput != NULL && args->structureOutputSize >= size) {
++			memcpy(args->structureOutput, &r, size);
++			args->structureOutputSize = (uint32_t) size;
++		}
++		return ret;
++	}
++	IOLockLock(gMaliLock);
++	if (fRequests++ < 32) {                 /* the first ones a client makes, for following it from the log */
++		IOLog("RedwoodMali: request %#x, %zu bytes\n", selector, size);
++	}
++	switch (selector) {
++	case kPanfrostGetParam:
++		if (!rosemary_mali_parameter(r.param.param, &r.param.value)) {
++			ret = kIOReturnBadArgument;
++		}
++		break;
++	case kPanfrostCreateBO:
++		ret = createBO(&r.create);
++		break;
++	case kPanfrostMmapBO:                   /* the offset is the handle: the program maps client memory of that type */
++		ret = buffer(r.mmap.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		r.mmap.offset = (uint64_t) r.mmap.handle << 12;
++		break;
++	case kPanfrostGetBOOffset:
++		b = buffer(r.offset.handle);
++		ret = b != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		r.offset.offset = b != NULL ? b->address : 0;
++		break;
++	case kPanfrostSubmit: {
++		/* queued, not run here: the job's number goes back in `jc`, and every buffer it names remembers it
++		 * (kPanfrostWaitBO, and no buffer is freed under a job that uses it) */
++		uint64_t seq = 0;
++
++		fSubmits++;
++		gMaliSubmits++;
++		if (r.submit.jc != 0) {
++			seq = rosemary_mali_enqueue(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS);
++			if (seq == 0) {         /* refused: no worker to run it */
++				fFailed++;
++				gMaliRefused++;
++				ret = kIOReturnNotReady;
++				break;
++			}
++		}
++		for (uint32_t i = 0; seq != 0 && i < r.submit.bo_handle_count && i < MALI_SUBMIT_BOS_MAX; i += 64) {
++			uint32_t handles[64];
++			uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
++
++			if (copyin((user_addr_t) (r.submit.bo_handles + i * sizeof(uint32_t)), handles, n * sizeof(uint32_t)) != 0) {
++				break;
++			}
++			for (uint32_t k = 0; k < n; k++) {
++				b = buffer(handles[k]);
++				if (b != NULL) {
++					b->last_seq = seq;
++					if (b->surface != NULL) {
++						b->surface->maliSeq = seq;      /* the display waits for it */
++					}
++				}
++			}
++		}
++		r.submit.jc = seq;
++		break;
++	}
++	case kRedwoodSurface:
++		ret = surfaceBuffer(&r.surface);
++		break;
++	case kRedwoodSurfaceSeq: {
++		SweetSurface * surface = sweet_surface_copy(r.sseq.surface);
++
++		if (surface != NULL) {
++			surface->maliSeq = r.sseq.seq;
++			wakeup((caddr_t) &surface->maliSeq);
++			surface->release();
++		} else {
++			ret = kIOReturnNotFound;
++		}
++		break;
++	}
++	case kRedwoodShow:
++		ret = kIOReturnUnsupported;
++		break;
++	case kPanfrostMadvise:
++		r.madvise.retained = 1;
++		break;
++	case kDrmGemClose:
++		b = buffer(r.close.handle);
++		if (b != NULL) {
++			freeBuffer(b);
++		} else {
++			ret = kIOReturnNotFound;
++		}
++		break;
++	default:
++		IOLog("RedwoodMali: request %#x (%zu bytes) is not known here\n", selector, size);
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(gMaliLock);
++
++	if (args->structureOutput != NULL && args->structureOutputSize >= size) {
++		memcpy(args->structureOutput, &r, size);
++		args->structureOutputSize = (uint32_t) size;
++	}
++	return ret;
++}
++#endif /* SWEET && ROSEMARY */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..533e697 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -48,6 +48,10 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
++#if defined(ROSEMARY)
++extern "C" void InvalidatePoC_DcacheRegion(vm_offset_t va, size_t length);       /* osfmk/arm64/caches_asm.s */
++bool rosemary_surface_wait_gpu(SweetSurface *s);                               /* RosemaryMali.cpp */
++#endif
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
+@@ -390,6 +394,19 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
++#if defined(ROSEMARY)
++		/*
++		 * A surface the Mali draws into is shown only once its last job has finished, and what the GPU
++		 * wrote to memory is read past the processor's cache (which may hold older lines of it).
++		 */
++		bool gpuDrawn = src != 0 && bpe == 4 && rosemary_surface_wait_gpu(s);
++		if (gpuDrawn) {
++			for (int32_t y = 0; y < h; y++) {
++				InvalidatePoC_DcacheRegion(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4,
++				    (size_t)w * 4);
++			}
++		}
++#endif
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index ccefc06..f3ece45 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -39,6 +39,10 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>
++#if defined(ROSEMARY)
++extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
++#endif
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -699,6 +703,21 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			bzero(mem->getBytesNoCopy(), s->allocSize);
+ 			s->memory = mem;
+ 			s->mapCache = kIOMapDefaultCache;
++#if defined(ROSEMARY)
++			/*
++			 * The Mali does not snoop the processor's caches. The zeroes just written must be in memory, or
++			 * a dirty line could be evicted later over what the GPU has drawn; and with malisurfwc=1 (set
++			 * when the Mali is what draws) programs map the pixels write-combined, so what they write
++			 * reaches memory where the GPU reads it.
++			 */
++			FlushPoC_DcacheRegion((vm_offset_t)mem->getBytesNoCopy(), s->allocSize);
++			{
++				int wc = 0;
++				if (PE_parse_boot_argn("malisurfwc", &wc, sizeof(wc)) && wc != 0) {
++					s->mapCache = kIOMapWriteCombineCache;
++				}
++			}
++#endif
+ 			if (!sweet_surface_publish(s)) {
+ 				ret = kIOReturnNoResources;
+ 			}
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..678591f 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -34,6 +34,9 @@ public:
+ 	uint8_t  elementWidth, elementHeight;
+ 	uint32_t cacheMode, planeCount, parentID;
+ 	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
++	/* ROSEMARY: number of the last Mali job that draws into this surface (0: none; ~0: a frame is
++	 * being drawn whose jobs are not sent yet), set by RedwoodMaliUserClient, waited for by the display */
++	uint64_t                  maliSeq;
+ 
+ 	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index a25d156..851c952 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -3,6 +3,7 @@ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitc
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/RosemaryUSBHost.cpp                              optional iokitcpp
++iokit/Kernel/arm/RosemaryMali.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
