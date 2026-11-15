@@ -1,0 +1,98 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index e1ce84a..f7cdcd8 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -47,6 +47,9 @@ extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+ 	kSweetSurfaceLookup             = 4,
++	kSweetSurfaceWrapClientImage    = 6,
++	kSweetSurfaceWrapClientMemory   = 7,
++	kSweetSurfaceSetBulkAttachments = 27,
+ 	kSweetSurfaceLimits             = 13,
+ 	kSweetSurfaceLookupFromPort     = 34,
+ 	kSweetSurfaceCreatePort         = 35,
+@@ -796,6 +799,83 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case kSweetSurfaceSetBulkAttachments: {
++		/*
++		 * Colour space, transfer function and the like: a fixed structure that the clients read from the
++		 * shared page (+0x30, 0x70 bytes: IOSurfaceClientGetBulkAttachments). The request is the structure
++		 * (0x70 bytes), its size, a mask of the fields that changed, the surface id (+0x70, +0x78, +0x80).
++		 */
++		static const struct {
++			uint8_t from, to;
++		} fields[15] = {
++			{ 0x00, 0x20 }, { 0x20, 0x30 }, { 0x30, 0x38 }, { 0x38, 0x39 }, { 0x39, 0x3a }, { 0x3a, 0x3b },
++			{ 0x3b, 0x3c }, { 0x3c, 0x3d }, { 0x3d, 0x3e }, { 0x3e, 0x3f }, { 0x3f, 0x40 }, { 0x40, 0x58 },
++			{ 0x58, 0x5c }, { 0x5c, 0x64 }, { 0x64, 0x65 },
++		};
++		uint8_t in[0x100];
++		uint32_t len = args->structureInputSize;
++		uint64_t size, mask;
++		uint32_t sid;
++		SweetSurfaceRef *ref;
++		IOReturn ret = kIOReturnNotFound;
++
++		bzero(in, sizeof(in));
++		if (args->structureInputDescriptor != NULL) {
++			len = (uint32_t)args->structureInputDescriptor->getLength();
++			if (len > sizeof(in)) {
++				len = sizeof(in);
++			}
++			args->structureInputDescriptor->readBytes(0, in, len);
++		} else if (args->structureInput != NULL && len <= sizeof(in)) {
++			memcpy(in, args->structureInput, len);
++		} else {
++			len = 0;
++		}
++		sweet_surf_log_once("sel", selector);
++		if (len < 0x88) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(&size, in + 0x70, sizeof(size));
++		memcpy(&mask, in + 0x78, sizeof(mask));
++		memcpy(&sid, in + 0x80, sizeof(sid));
++		if (size > 0x70) {
++			return kIOReturnBadArgument;
++		}
++		IOLockLock(fLock);
++		ref = findRef(sid, NULL);
++		if (ref != NULL) {
++			uint8_t *attachments = (uint8_t *)ref->surface->state->getBytesNoCopy() + 0x30;
++
++			for (unsigned i = 0; i < 15; i++) {
++				if ((mask & (1ULL << i)) && fields[i].to <= size) {
++					memcpy(attachments + fields[i].from, in + fields[i].from, fields[i].to - fields[i].from);
++				}
++			}
++			ret = kIOReturnSuccess;
++		}
++		IOLockUnlock(fLock);
++		return ret;
++	}
++	case kSweetSurfaceWrapClientImage:
++	case kSweetSurfaceWrapClientMemory: {
++		/*
++		 * Making a surface of memory a client already has. Nothing here does that: a "success" with an
++		 * empty result made the library build a surface with no shared page, and CoreAnimation died reading
++		 * its attachments (IOSurfaceClientGetBulkAttachments at address 0x30). Refused, the call fails the
++		 * way it can. The first calls are written down, to see what is asked.
++		 */
++		static int said;
++
++		if (said++ < 6) {
++			char name[32];
++
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET SURF: %s sel %u refused: scalars %u in, %u out; struct %u in, %u out%s\n", name, selector,
++			    args->scalarInputCount, args->scalarOutputCount, args->structureInputSize,
++			    args->structureOutputSize, args->structureInputDescriptor != NULL ? " (descriptor in)" : "");
++		}
++		return kIOReturnUnsupported;
++	}
+ 	default:
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
