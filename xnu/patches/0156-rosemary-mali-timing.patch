@@ -1,0 +1,163 @@
+diff --git a/bsd/dev/rosemary_mali.c b/bsd/dev/rosemary_mali.c
+index a3fd1c6..72582f8 100644
+--- a/bsd/dev/rosemary_mali.c
++++ b/bsd/dev/rosemary_mali.c
+@@ -124,6 +124,28 @@ static int rm_wait_event;
+ SYSCTL_UINT(_kern_rosemary, OID_AUTO, mali, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_reached, 0, "how far the Mali came up");
+ SYSCTL_UINT(_kern_rosemary, OID_AUTO, mali_id, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_gpu_id, 0, "GPU_ID");
+ SYSCTL_UINT(_kern_rosemary, OID_AUTO, mali_jobs, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_jobs_done, 0, "jobs finished");
++/* Where the time goes (kern.rosemary.mali_*_us): job run times, and the processor-cache cleaning around jobs */
++static uint64_t rm_job_ns, rm_job_max_ns, rm_flush_ns, rm_flush_bytes, rm_flush_calls;
++static uint32_t rm_spin;                        /* boot-arg malispin=1: poll for a job's end, never sleep */
++SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_job_ns, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_job_ns, "total time in jobs, ns");
++SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_job_max_ns, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_job_max_ns, "longest job, ns");
++SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_flush_ns, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_flush_ns, "total time cleaning caches, ns");
++SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_flush_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_flush_bytes, "bytes cleaned");
++SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_flush_calls, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_flush_calls, "cache cleanings");
++SYSCTL_UINT(_kern_rosemary, OID_AUTO, mali_spin, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_spin, 0, "polling instead of sleeping");
++
++/* RosemaryMali.cpp: a cache cleaning of `bytes` that took `ticks` of the clock */
++void
++rosemary_mali_account_flush(uint64_t ticks, uint64_t bytes)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(ticks, &ns);
++	rm_flush_ns += ns;
++	rm_flush_bytes += bytes;
++	rm_flush_calls++;
++}
++
+ SYSCTL_UINT(_kern_rosemary, OID_AUTO, mali_failed, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_jobs_failed, 0, "jobs that did not");
+ 
+ static inline uint32_t
+@@ -399,6 +421,10 @@ rm_wait_job(uint32_t mask, uint32_t ms)
+ 		if ((raw = rm_rd(RM_JOB_INT_RAWSTAT) & mask) != 0) {
+ 			return raw;
+ 		}
++		if (rm_spin) {
++			rm_delay_us(5);
++			continue;
++		}
+ 		clock_interval_to_deadline(200, NSEC_PER_USEC, &nap);
+ 		lck_mtx_lock(&rm_wait_lock);
+ 		(void)lck_mtx_sleep_deadline(&rm_wait_lock, LCK_SLEEP_DEFAULT, (event_t)&rm_wait_event, THREAD_UNINT, nap);
+@@ -429,6 +455,8 @@ rosemary_mali_submit(uint64_t chain, bool fragment)
+ {
+ 	uint32_t slot = fragment ? 0 : 1, js = RM_JS(slot), done_bit = 1u << slot, fail_bit = 1u << (slot + 16), raw, status = 0;
+ 
++	uint64_t t0 = mach_absolute_time(), t1, ns;
++
+ 	lck_mtx_lock(&rm_job_lock);
+ 	rm_wr(RM_JOB_INT_CLEAR, done_bit | fail_bit);
+ 	rm_wr(js + RM_JS_HEAD_NEXT_LO, (uint32_t)chain);
+@@ -438,6 +466,12 @@ rosemary_mali_submit(uint64_t chain, bool fragment)
+ 	rm_wr(js + RM_JS_CONFIG_NEXT, RM_JS_CONFIG);
+ 	rm_wr(js + RM_JS_COMMAND_NEXT, 1u);
+ 	raw = rm_wait_job(done_bit | fail_bit, 1000);
++	t1 = mach_absolute_time();
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	rm_job_ns += ns;
++	if (ns > rm_job_max_ns) {
++		rm_job_max_ns = ns;
++	}
+ 	if (raw == done_bit) {
+ 		rm_jobs_done++;
+ 	} else {
+@@ -766,6 +800,11 @@ rosemary_mali_attach(vm_offset_t gpu_regs, uint32_t shader_mask)
+ 
+ 	rm_gpu = gpu_regs;
+ 	rm_shader_mask = shader_mask;
++	{
++		uint32_t v = 0;
++
++		rm_spin = PE_parse_boot_argn("malispin", &v, sizeof(v)) && v != 0;
++	}
+ 	rm_gpu_id = rm_rd(RM_GPU_ID);
+ 	as_present = rm_rd(0x018);
+ 	if ((as_present & 1u) == 0 || shader_mask == 0) {
+diff --git a/iokit/Kernel/arm/RosemaryMali.cpp b/iokit/Kernel/arm/RosemaryMali.cpp
+index a9ec12c..81d72a8 100644
+--- a/iokit/Kernel/arm/RosemaryMali.cpp
++++ b/iokit/Kernel/arm/RosemaryMali.cpp
+@@ -37,6 +37,30 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);            /* osfmk/arm64/caches_asm.s */
++extern "C" uint64_t mach_absolute_time(void);
++extern "C" void rosemary_mali_account_flush(uint64_t ticks, uint64_t bytes);       /* bsd/dev/rosemary_mali.c */
++
++/*
++ * The processor's cache cleaned for the GPU (which does not look into it), counted and timed
++ * (sysctl kern.rosemary.mali_flush_*). Boot-arg malinoflush=1: not at all, to see what it costs.
++ */
++static void
++mali_flush(uintptr_t va, size_t length)
++{
++	static int noflush = -1;
++	uint64_t t0;
++
++	if (noflush < 0) {
++		int v = 0;
++		noflush = PE_parse_boot_argn("malinoflush", &v, sizeof(v)) && v != 0;
++	}
++	if (noflush || va == 0 || length == 0) {
++		return;
++	}
++	t0 = mach_absolute_time();
++	FlushPoC_DcacheRegion((vm_offset_t) va, length);
++	rosemary_mali_account_flush(mach_absolute_time() - t0, length);
++}
+ 
+ extern "C" {
+ /* bsd/dev/rosemary_mali.c */
+@@ -408,9 +432,7 @@ RedwoodMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
+ 	}
+ 	b->memory = memory;
+ 	b->kva = (uintptr_t) memory->getBytesNoCopy();
+-	if (b->kva != 0) {
+-		FlushPoC_DcacheRegion(b->kva, (size_t) size);   /* the zeros are in memory, not in a line */
+-	}
++	mali_flush(b->kva, (size_t) size);              /* the zeros are in memory, not in a line */
+ 	request->offset = b->address;
+ 	return kIOReturnSuccess;
+ }
+@@ -580,9 +602,7 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		} else if (!rosemary_mali_wait(seq, timeout > 0 ? (uint64_t) timeout : 0, &status)) {
+ 			ret = kIOReturnTimeout;
+ 		} else {
+-			if (waitva != 0) {
+-				FlushPoC_DcacheRegion(waitva, waitsize);        /* what the GPU wrote, not a stale line */
+-			}
++			mali_flush(waitva, waitsize);           /* what the GPU wrote, not a stale line */
+ 			ret = status == 0 ? kIOReturnSuccess : kIOReturnIOError;        /* done, but did it finish */
+ 		}
+ 		if (args->structureOutput != NULL && args->structureOutputSize >= size) {
+@@ -626,13 +646,7 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 			 * invalidated first: what a program wrote into it (a texture) reaches memory, and no dirty line
+ 			 * of it is left to be evicted over what the GPU draws. Programs keep the default cache mode.
+ 			 */
+-			static int noflush = -1;
+-
+-			if (noflush < 0) {
+-				int v = 0;
+-				noflush = PE_parse_boot_argn("malinoflush", &v, sizeof(v)) && v != 0;
+-			}
+-			for (uint32_t i = 0; !noflush && i < r.submit.bo_handle_count && i < MALI_SUBMIT_BOS_MAX; i += 64) {
++			for (uint32_t i = 0; i < r.submit.bo_handle_count && i < MALI_SUBMIT_BOS_MAX; i += 64) {
+ 				uint32_t handles[64];
+ 				uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
+ 
+@@ -642,11 +656,7 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 				for (uint32_t k = 0; k < n; k++) {
+ 					b = buffer(handles[k]);
+ 					if (b != NULL) {
+-						uintptr_t va = b->surface != NULL ? b->surface->kernelAddress() : b->kva;
+-
+-						if (va != 0) {
+-							FlushPoC_DcacheRegion(va, (size_t) b->size);
+-						}
++						mali_flush(b->surface != NULL ? b->surface->kernelAddress() : b->kva, (size_t) b->size);
+ 					}
+ 				}
+ 			}
