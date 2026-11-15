@@ -1,0 +1,107 @@
+diff --git a/bsd/dev/rosemary_mali.c b/bsd/dev/rosemary_mali.c
+index 72582f8..2df621d 100644
+--- a/bsd/dev/rosemary_mali.c
++++ b/bsd/dev/rosemary_mali.c
+@@ -126,14 +126,22 @@ SYSCTL_UINT(_kern_rosemary, OID_AUTO, mali_id, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_
+ SYSCTL_UINT(_kern_rosemary, OID_AUTO, mali_jobs, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_jobs_done, 0, "jobs finished");
+ /* Where the time goes (kern.rosemary.mali_*_us): job run times, and the processor-cache cleaning around jobs */
+ static uint64_t rm_job_ns, rm_job_max_ns, rm_flush_ns, rm_flush_bytes, rm_flush_calls;
++static uint64_t rm_skip_bytes;                  /* cache cleanings not needed: bytes of buffers no program ever mapped */
+ static uint32_t rm_spin;                        /* boot-arg malispin=1: poll for a job's end, never sleep */
+ SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_job_ns, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_job_ns, "total time in jobs, ns");
+ SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_job_max_ns, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_job_max_ns, "longest job, ns");
+ SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_flush_ns, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_flush_ns, "total time cleaning caches, ns");
+ SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_flush_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_flush_bytes, "bytes cleaned");
+ SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_flush_calls, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_flush_calls, "cache cleanings");
++SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_skip_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_skip_bytes, "bytes not cleaned: never mapped by a program");
+ SYSCTL_UINT(_kern_rosemary, OID_AUTO, mali_spin, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_spin, 0, "polling instead of sleeping");
+ 
++void
++rosemary_mali_account_skip(uint64_t bytes)
++{
++	rm_skip_bytes += bytes;
++}
++
+ /* RosemaryMali.cpp: a cache cleaning of `bytes` that took `ticks` of the clock */
+ void
+ rosemary_mali_account_flush(uint64_t ticks, uint64_t bytes)
+diff --git a/iokit/Kernel/arm/RosemaryMali.cpp b/iokit/Kernel/arm/RosemaryMali.cpp
+index 3528855..d99e0f3 100644
+--- a/iokit/Kernel/arm/RosemaryMali.cpp
++++ b/iokit/Kernel/arm/RosemaryMali.cpp
+@@ -37,6 +37,7 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);            /* osfmk/arm64/caches_asm.s */
++extern "C" void rosemary_mali_account_skip(uint64_t bytes);
+ extern "C" uint64_t mach_absolute_time(void);
+ extern "C" void rosemary_mali_account_flush(uint64_t ticks, uint64_t bytes);       /* bsd/dev/rosemary_mali.c */
+ 
+@@ -173,26 +174,11 @@ struct mali_buffer {
+ 	uint64_t address, size;
+ 	uint64_t last_seq;                      /* the last job given it (kPanfrostSubmit's bo_handles) */
+ 	uintptr_t kva;                          /* its kernel address, for cleaning the processor's cache around jobs */
+-	bool wc;                                /* the programs see it write-combined: the cache never holds it */
++	bool mapped;                            /* a program has mapped it: only then can the processor's cache hold a line of it
++	                                         * the GPU has not seen (the Mali's own tiler heap, scratch and the like never are) */
+ 	uint32_t flushed_seed;                  /* a surface: its seed when its cache lines were last cleaned */
+ };
+ 
+-/*
+- * Boot-arg malibowc=1: buffers a program makes are mapped for it write-combined, as Linux's panfrost
+- * does, so that no cache holds them and nothing is cleaned around jobs. Without it they are cached and
+- * cleaned whole at every job that names them (which costs more than the jobs).
+- */
+-static bool
+-mali_bo_wc(void)
+-{
+-	static int wc = -1;
+-
+-	if (wc < 0) {
+-		int v = 0;
+-		wc = PE_parse_boot_argn("malibowc", &v, sizeof(v)) && v != 0;
+-	}
+-	return wc != 0;
+-}
+ 
+ static IOLock * gMaliLock;
+ static uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliRefused;
+@@ -451,7 +437,6 @@ RedwoodMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
+ 	}
+ 	b->memory = memory;
+ 	b->kva = (uintptr_t) memory->getBytesNoCopy();
+-	b->wc = mali_bo_wc();
+ 	mali_flush(b->kva, (size_t) size);              /* the zeros are in memory, not in a line */
+ 	request->offset = b->address;
+ 	return kIOReturnSuccess;
+@@ -560,7 +545,8 @@ RedwoodMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options,
+ 	if (b != NULL) {
+ 		b->memory->retain();
+ 		*memory = b->memory;
+-		*options = (b->wc && b->surface == NULL) ? kIOMapWriteCombineCache : 0;
++		*options = 0;
++		b->mapped = true;               /* from now on the processor may hold lines of it */
+ 		ret = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(gMaliLock);
+@@ -610,7 +596,7 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 			IOLockLock(gMaliLock);
+ 			b = buffer(r.wait.handle);
+ 			seq = b != NULL ? b->last_seq : 0;
+-			waitva = b != NULL && b->surface == NULL && !b->wc ? b->kva : 0;
++			waitva = b != NULL && b->surface == NULL && b->mapped ? b->kva : 0;
+ 			waitsize = b != NULL ? b->size : 0;
+ 			IOLockUnlock(gMaliLock);
+ 			timeout = r.wait.timeout_ns;
+@@ -687,8 +673,10 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 							mali_flush(b->surface->kernelAddress(), (size_t) b->size);
+ 							b->flushed_seed = seed;
+ 						}
+-					} else if (!b->wc) {
++					} else if (b->mapped) {
+ 						mali_flush(b->kva, (size_t) b->size);
++					} else {
++						rosemary_mali_account_skip(b->size);
+ 					}
+ 				}
+ 			}
