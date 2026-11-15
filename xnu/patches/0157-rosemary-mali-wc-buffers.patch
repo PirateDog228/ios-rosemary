@@ -1,0 +1,121 @@
+diff --git a/iokit/Kernel/arm/RosemaryMali.cpp b/iokit/Kernel/arm/RosemaryMali.cpp
+index 81d72a8..3528855 100644
+--- a/iokit/Kernel/arm/RosemaryMali.cpp
++++ b/iokit/Kernel/arm/RosemaryMali.cpp
+@@ -173,8 +173,27 @@ struct mali_buffer {
+ 	uint64_t address, size;
+ 	uint64_t last_seq;                      /* the last job given it (kPanfrostSubmit's bo_handles) */
+ 	uintptr_t kva;                          /* its kernel address, for cleaning the processor's cache around jobs */
++	bool wc;                                /* the programs see it write-combined: the cache never holds it */
++	uint32_t flushed_seed;                  /* a surface: its seed when its cache lines were last cleaned */
+ };
+ 
++/*
++ * Boot-arg malibowc=1: buffers a program makes are mapped for it write-combined, as Linux's panfrost
++ * does, so that no cache holds them and nothing is cleaned around jobs. Without it they are cached and
++ * cleaned whole at every job that names them (which costs more than the jobs).
++ */
++static bool
++mali_bo_wc(void)
++{
++	static int wc = -1;
++
++	if (wc < 0) {
++		int v = 0;
++		wc = PE_parse_boot_argn("malibowc", &v, sizeof(v)) && v != 0;
++	}
++	return wc != 0;
++}
++
+ static IOLock * gMaliLock;
+ static uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliRefused;
+ 
+@@ -432,6 +451,7 @@ RedwoodMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
+ 	}
+ 	b->memory = memory;
+ 	b->kva = (uintptr_t) memory->getBytesNoCopy();
++	b->wc = mali_bo_wc();
+ 	mali_flush(b->kva, (size_t) size);              /* the zeros are in memory, not in a line */
+ 	request->offset = b->address;
+ 	return kIOReturnSuccess;
+@@ -495,6 +515,7 @@ RedwoodMaliUserClient::surfaceBuffer(struct redwood_surface * request)
+ 	s->memory->retain();
+ 	b->memory = s->memory;
+ 	b->surface = s;                         /* holds the reference sweet_surface_copy gave */
++	b->flushed_seed = ~0u;                  /* the first job that names it cleans its cache lines */
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -539,7 +560,7 @@ RedwoodMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options,
+ 	if (b != NULL) {
+ 		b->memory->retain();
+ 		*memory = b->memory;
+-		*options = 0;
++		*options = (b->wc && b->surface == NULL) ? kIOMapWriteCombineCache : 0;
+ 		ret = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(gMaliLock);
+@@ -589,7 +610,7 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 			IOLockLock(gMaliLock);
+ 			b = buffer(r.wait.handle);
+ 			seq = b != NULL ? b->last_seq : 0;
+-			waitva = b != NULL && b->surface == NULL ? b->kva : 0;
++			waitva = b != NULL && b->surface == NULL && !b->wc ? b->kva : 0;
+ 			waitsize = b != NULL ? b->size : 0;
+ 			IOLockUnlock(gMaliLock);
+ 			timeout = r.wait.timeout_ns;
+@@ -655,11 +676,23 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 				}
+ 				for (uint32_t k = 0; k < n; k++) {
+ 					b = buffer(handles[k]);
+-					if (b != NULL) {
+-						mali_flush(b->surface != NULL ? b->surface->kernelAddress() : b->kva, (size_t) b->size);
++					if (b == NULL) {
++						continue;
++					}
++					if (b->surface != NULL) {
++						/* only when somebody has written the pixels since: the unlock changes the seed */
++						uint32_t seed = b->surface->pixelSeed();
++
++						if (seed != b->flushed_seed) {
++							mali_flush(b->surface->kernelAddress(), (size_t) b->size);
++							b->flushed_seed = seed;
++						}
++					} else if (!b->wc) {
++						mali_flush(b->kva, (size_t) b->size);
+ 					}
+ 				}
+ 			}
++			__asm__ volatile ("dsb sy" ::: "memory");       /* the write buffers out before the GPU looks */
+ 			seq = rosemary_mali_enqueue(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS);
+ 			if (seq == 0) {         /* refused: no worker to run it */
+ 				fFailed++;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index f7cdcd8..010f368 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -118,6 +118,12 @@ sweet_surface_seed(SweetSurface *s)
+ 	return (uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED);
+ }
+ 
++uint32_t
++SweetSurface::pixelSeed()
++{
++	return *(volatile uint32_t *)sweet_surface_seed(this);
++}
++
+ /*
+  * Give the surface an id and a table slot; the table holds one retain and a
+  * user count (creators, client mappings, kernel holders). Lock held.
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 678591f..dbde5d3 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -48,6 +48,7 @@ public:
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+ 	uintptr_t kernelAddress();
++	uint32_t pixelSeed();                   /* ROSEMARY: changes when a client has unlocked the pixels after writing */
+ };
+ 
+ /* Retained surface for an id, or NULL. */
