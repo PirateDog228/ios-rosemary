@@ -1,0 +1,87 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 99e2ca1..3e84de5 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -35,6 +35,7 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
++#include <pexpert/pexpert.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -317,6 +318,62 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ }
+ 
++/*
++ * Policy "AMFI": dyld asks it, before it reads DYLD_* variables, which of them this process may use:
++ * amfi_check_dyld_policy_self() is __mac_syscall("AMFI", 0x5a, &{input flags, &output flags}). Without a
++ * policy of that name the call fails and dyld treats every process as restricted: DYLD_INSERT_LIBRARIES is
++ * ignored without a word. SWEET answers like AppleMobileFileIntegrity does for an unrestricted process
++ * (0x5f: at-paths, path and print variables, custom shared cache, fallback paths, and the "valid" bit).
++ * Boot-arg amfidyld=0 turns it off (the call then fails as before).
++ */
++#define SWEET_AMFI_DYLD_POLICY_CALL   0x5a
++#define SWEET_AMFI_DYLD_ALLOW_ALL     0x5fULL
++
++static int sweet_amfi_dyld_open = 1;
++
++static int
++sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	struct {
++		uint64_t input;
++		user_addr_t output;
++	} args;
++	static int seen;
++
++	if (call != SWEET_AMFI_DYLD_POLICY_CALL || !sweet_amfi_dyld_open) {
++		return ENOSYS;
++	}
++	if (copyin(arg, &args, sizeof(args)) != 0) {
++		return EFAULT;
++	}
++	if (args.output != 0) {
++		uint64_t out = SWEET_AMFI_DYLD_ALLOW_ALL;
++
++		if (copyout(&out, args.output, sizeof(out)) != 0) {
++			return EFAULT;
++		}
++	}
++	if (seen++ < 8) {
++		char name[32];
++
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET AMFI: dyld policy for %s (input %#llx): everything allowed\n", name, args.input);
++	}
++	return 0;
++}
++
++static const struct mac_policy_ops sweet_dyld_mac_ops = {
++	.mpo_policy_syscall = sweet_amfi_syscall,
++};
++
++static struct mac_policy_conf sweet_dyld_mac_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "SWEET dyld policy stand-in",
++	.mpc_ops = &sweet_dyld_mac_ops,
++};
++
++static mac_policy_handle_t sweet_dyld_mac_handle;
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
+ };
+@@ -391,5 +448,11 @@ sweet_amfi_policy_register(void)
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	int v = 1;
++	if (PE_parse_boot_argn("amfidyld", &v, sizeof(v)) && v == 0) {
++		sweet_amfi_dyld_open = 0;
++	}
++	error = mac_policy_register(&sweet_dyld_mac_conf, &sweet_dyld_mac_handle, NULL);
++	printf("SWEET AMFI: dyld policy %s (%d)\n", error ? "NOT registered" : "registered", error);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
