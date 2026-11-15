@@ -1,0 +1,16 @@
+name: userland-gpu
+on:
+  workflow_dispatch:
+  push:
+    paths: ['userland/**', 'tools/build-userland-ios.sh', '.github/workflows/userland-gpu.yml']
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: bash tools/build-userland-ios.sh out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: userland-gpu
+          path: out/
