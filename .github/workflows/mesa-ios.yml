@@ -1,0 +1,26 @@
+name: mesa-ios
+on:
+  workflow_dispatch:
+  push:
+    paths: ['tools/mesa/**', 'tools/mk-mesa-ios.sh', 'userland/src/eagl*', 'userland/src/gl_osmesa.c', 'userland/src/redwood_gl.h', 'userland/mkeagl.py', '.github/workflows/mesa-ios.yml']
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Mesa and libredwood-gl
+        run: bash tools/mk-mesa-ios.sh out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mesa-ios
+          path: out/
+      - name: Build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-logs
+          path: |
+            mesa-work/meson-setup.log
+            mesa-work/ninja.log
+          if-no-files-found: ignore
