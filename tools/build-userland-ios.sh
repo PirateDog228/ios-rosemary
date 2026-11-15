@@ -23,6 +23,10 @@ $CC -O2 -Wall "$here/userland/src/bbwrap.c" -o "$out/bbwrap"
 check_weak "$out/bbwrap"
 sign "$out/bbwrap"
 
+$CC -O2 -Wall -dynamiclib -install_name /usr/local/lib/libbbload.dylib "$here/userland/src/bbload.c" -o "$out/libbbload.dylib" -lobjc
+check_weak "$out/libbbload.dylib"
+sign "$out/libbbload.dylib"
+
 # empty injection test dylib: prints a line to the log when loaded into a process
 cat >"$out/inject_test.c" <<'EOT'
 #include <stdio.h>
