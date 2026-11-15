@@ -92,7 +92,8 @@ case "$DRIVERS" in *panfrost*) OPT=-Doptimization=s ;; esac
 ninja -C $BUILD >ninja.log 2>&1 || { tail -80 ninja.log; exit 1; }
 
 check_weak() {
-	local w; w=$(nm -mu "$1" 2>/dev/null | grep -i 'weak' || true)
+	# pthread_mutexattr_*: in every iOS since 2.0; the SDK of Xcode 16 only marks them weak
+	local w; w=$(nm -mu "$1" 2>/dev/null | grep -i 'weak' | grep -v -E '_pthread_mutexattr_(init|destroy|settype)( |$)' || true)
 	if [[ -n $w ]]; then
 		echo "error: $1 has weak imports (NULL on iOS 16 => crash):" >&2
 		echo "$w" >&2
