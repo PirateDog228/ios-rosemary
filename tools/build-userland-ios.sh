@@ -19,6 +19,10 @@ $CC -O2 -Wall "$here/userland/src/mali_test.c" -o "$out/mali_test" -framework IO
 check_weak "$out/mali_test"
 sign "$out/mali_test"
 
+$CC -O2 -Wall "$here/userland/src/bbwrap.c" -o "$out/bbwrap"
+check_weak "$out/bbwrap"
+sign "$out/bbwrap"
+
 # empty injection test dylib: prints a line to the log when loaded into a process
 cat >"$out/inject_test.c" <<'EOT'
 #include <stdio.h>
