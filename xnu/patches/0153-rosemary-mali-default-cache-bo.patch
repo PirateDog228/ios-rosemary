@@ -1,0 +1,76 @@
+diff --git a/iokit/Kernel/arm/RosemaryMali.cpp b/iokit/Kernel/arm/RosemaryMali.cpp
+index 5116d3b..a9ec12c 100644
+--- a/iokit/Kernel/arm/RosemaryMali.cpp
++++ b/iokit/Kernel/arm/RosemaryMali.cpp
+@@ -148,6 +148,7 @@ struct mali_buffer {
+ 	SweetSurface * surface;
+ 	uint64_t address, size;
+ 	uint64_t last_seq;                      /* the last job given it (kPanfrostSubmit's bo_handles) */
++	uintptr_t kva;                          /* its kernel address, for cleaning the processor's cache around jobs */
+ };
+ 
+ static IOLock * gMaliLock;
+@@ -390,9 +391,12 @@ RedwoodMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
+ 	if (size == 0 || size > MALI_BUFFER_MAX) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	/* wired kernel memory, zero when made, write-combined: what the program writes goes to memory where the GPU reads it */
+-	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
+-	    kIOMapWriteCombineCache, (vm_size_t) size, PAGE_SIZE);
++	/*
++	 * wired kernel memory, zero when made, in the default cache mode (a write-combine mapping of kernel pages
++	 * panics this port in phystokv_range): the cache is cleaned at submit instead (kPanfrostSubmit)
++	 */
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
++	    (vm_size_t) size, PAGE_SIZE);
+ 	if (memory == NULL) {
+ 		IOLog("RedwoodMali: no memory for a buffer of %llu bytes\n", size);
+ 		return kIOReturnNoMemory;
+@@ -403,6 +407,10 @@ RedwoodMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
+ 		return kIOReturnNoMemory;
+ 	}
+ 	b->memory = memory;
++	b->kva = (uintptr_t) memory->getBytesNoCopy();
++	if (b->kva != 0) {
++		FlushPoC_DcacheRegion(b->kva, (size_t) size);   /* the zeros are in memory, not in a line */
++	}
+ 	request->offset = b->address;
+ 	return kIOReturnSuccess;
+ }
+@@ -552,11 +560,15 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		uint64_t seq = r.waitseq.seq;
+ 		int64_t timeout = r.waitseq.timeout_ns;
+ 		uint32_t status = 0;
++		uintptr_t waitva = 0;
++		size_t waitsize = 0;
+ 
+ 		if (selector == kPanfrostWaitBO) {
+ 			IOLockLock(gMaliLock);
+ 			b = buffer(r.wait.handle);
+ 			seq = b != NULL ? b->last_seq : 0;
++			waitva = b != NULL && b->surface == NULL ? b->kva : 0;
++			waitsize = b != NULL ? b->size : 0;
+ 			IOLockUnlock(gMaliLock);
+ 			timeout = r.wait.timeout_ns;
+ 			if (b == NULL) {
+@@ -568,6 +580,9 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		} else if (!rosemary_mali_wait(seq, timeout > 0 ? (uint64_t) timeout : 0, &status)) {
+ 			ret = kIOReturnTimeout;
+ 		} else {
++			if (waitva != 0) {
++				FlushPoC_DcacheRegion(waitva, waitsize);        /* what the GPU wrote, not a stale line */
++			}
+ 			ret = status == 0 ? kIOReturnSuccess : kIOReturnIOError;        /* done, but did it finish */
+ 		}
+ 		if (args->structureOutput != NULL && args->structureOutputSize >= size) {
+@@ -626,8 +641,8 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 				}
+ 				for (uint32_t k = 0; k < n; k++) {
+ 					b = buffer(handles[k]);
+-					if (b != NULL && b->surface != NULL) {
+-						uintptr_t va = b->surface->kernelAddress();
++					if (b != NULL) {
++						uintptr_t va = b->surface != NULL ? b->surface->kernelAddress() : b->kva;
+ 
+ 						if (va != 0) {
+ 							FlushPoC_DcacheRegion(va, (size_t) b->size);
