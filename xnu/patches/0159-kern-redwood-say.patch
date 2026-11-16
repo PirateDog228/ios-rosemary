@@ -1,0 +1,41 @@
+diff --git a/bsd/dev/rosemary_mali.c b/bsd/dev/rosemary_mali.c
+index 2df621d..531c111 100644
+--- a/bsd/dev/rosemary_mali.c
++++ b/bsd/dev/rosemary_mali.c
+@@ -57,6 +57,36 @@ bool rosemary_mali_wait(uint64_t seq, uint64_t timeout_ns, uint32_t *status);
+ 
+ SYSCTL_NODE(_kern, OID_AUTO, rosemary, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "rosemary");
+ 
++/*
++ * kern.redwood.say: what the graphics libraries (Mesa's drm layer, libredwood-gl) tell the kernel's log, as hakios's
++ * kernel has it: a string written by anybody (backboardd runs as mobile), one line in the log.
++ */
++SYSCTL_NODE(_kern, OID_AUTO, redwood, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "redwood");
++
++static int
++rm_sysctl_say SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	char line[600];
++	size_t length;
++	int error;
++
++	if (req->newptr == USER_ADDR_NULL) {
++		return 0;
++	}
++	length = req->newlen < sizeof(line) - 1 ? req->newlen : sizeof(line) - 1;
++	error = SYSCTL_IN(req, line, length);
++	if (error != 0) {
++		return error;
++	}
++	line[length] = '\0';
++	printf("redwood: %s\n", line);
++	return 0;
++}
++
++SYSCTL_PROC(_kern_redwood, OID_AUTO, say, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
++    rm_sysctl_say, "A", "a line for the log");
++
+ /* ---- registers (Bifrost, as in Linux panfrost_regs.h) ---- */
+ #define RM_GPU_ID               0x000u
+ #define RM_GPU_INT_RAWSTAT      0x020u
