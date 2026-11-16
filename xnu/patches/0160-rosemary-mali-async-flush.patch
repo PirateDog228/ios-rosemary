@@ -1,0 +1,182 @@
+diff --git a/bsd/dev/rosemary_mali.c b/bsd/dev/rosemary_mali.c
+index 531c111..0fa3cd3 100644
+--- a/bsd/dev/rosemary_mali.c
++++ b/bsd/dev/rosemary_mali.c
+@@ -52,7 +52,7 @@ uint64_t rosemary_mali_address(uint64_t size);
+ bool rosemary_mali_map(uint64_t gpu, uint64_t phys);
+ bool rosemary_mali_unmap(uint64_t gpu, uint64_t size);
+ uint32_t rosemary_mali_submit(uint64_t chain, bool fragment);
+-uint64_t rosemary_mali_enqueue(uint64_t chain, bool fragment);
++uint64_t rosemary_mali_enqueue(uint64_t chain, bool fragment, void (*prepare)(void *), void *argument);
+ bool rosemary_mali_wait(uint64_t seq, uint64_t timeout_ns, uint32_t *status);
+ 
+ SYSCTL_NODE(_kern, OID_AUTO, rosemary, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "rosemary");
+@@ -539,6 +539,8 @@ rosemary_mali_submit(uint64_t chain, bool fragment)
+ static struct {
+ 	uint64_t chain, seq;
+ 	bool fragment;
++	void (*prepare)(void *);        /* run by the worker, on its own processor, before the job: the cache cleaning */
++	void *argument;
+ } rm_queue[RM_QUEUE];
+ static unsigned rm_queue_head, rm_queue_count;
+ static uint64_t rm_queued_seq, rm_done_seq;
+@@ -554,6 +556,8 @@ rm_worker(__unused void *parameter, __unused wait_result_t result)
+ 	for (;;) {
+ 		uint64_t chain, seq;
+ 		bool fragment;
++		void (*prepare)(void *);
++		void *argument;
+ 
+ 		lck_mtx_lock(&rm_queue_lock);
+ 		while (rm_queue_count == 0) {
+@@ -562,8 +566,13 @@ rm_worker(__unused void *parameter, __unused wait_result_t result)
+ 		chain = rm_queue[rm_queue_head].chain;
+ 		seq = rm_queue[rm_queue_head].seq;
+ 		fragment = rm_queue[rm_queue_head].fragment;
++		prepare = rm_queue[rm_queue_head].prepare;
++		argument = rm_queue[rm_queue_head].argument;
+ 		lck_mtx_unlock(&rm_queue_lock);
+ 
++		if (prepare != NULL) {
++			prepare(argument);
++		}
+ 		uint32_t status = rosemary_mali_submit(chain, fragment);
+ 
+ 		lck_mtx_lock(&rm_queue_lock);
+@@ -578,7 +587,7 @@ rm_worker(__unused void *parameter, __unused wait_result_t result)
+ }
+ 
+ uint64_t
+-rosemary_mali_enqueue(uint64_t chain, bool fragment)
++rosemary_mali_enqueue(uint64_t chain, bool fragment, void (*prepare)(void *), void *argument)
+ {
+ 	uint64_t seq;
+ 	unsigned at;
+@@ -606,6 +615,8 @@ rosemary_mali_enqueue(uint64_t chain, bool fragment)
+ 	at = (rm_queue_head + rm_queue_count) % RM_QUEUE;
+ 	rm_queue[at].chain = chain;
+ 	rm_queue[at].fragment = fragment;
++	rm_queue[at].prepare = prepare;
++	rm_queue[at].argument = argument;
+ 	rm_queue[at].seq = seq;
+ 	rm_queue_count++;
+ 	lck_mtx_unlock(&rm_queue_lock);
+diff --git a/iokit/Kernel/arm/RosemaryMali.cpp b/iokit/Kernel/arm/RosemaryMali.cpp
+index d99e0f3..3ac80b4 100644
+--- a/iokit/Kernel/arm/RosemaryMali.cpp
++++ b/iokit/Kernel/arm/RosemaryMali.cpp
+@@ -41,6 +41,23 @@ extern "C" void rosemary_mali_account_skip(uint64_t bytes);
+ extern "C" uint64_t mach_absolute_time(void);
+ extern "C" void rosemary_mali_account_flush(uint64_t ticks, uint64_t bytes);       /* bsd/dev/rosemary_mali.c */
+ 
++/*
++ * What a job needs cleaned from the processor's cache, made when it is submitted and done by the worker thread
++ * just before the job runs, on another processor than the program's: the program's call of submit no longer
++ * waits for it. What the program wrote before it called is in the cache before the worker looks, and the
++ * buffers cannot go away meanwhile: freeBuffer waits for the last job a buffer was named in.
++ */
++struct mali_flush_item {
++	uintptr_t va;
++	size_t length;
++};
++
++struct mali_flush_list {
++	uint32_t count;
++	uint32_t allocated;
++	struct mali_flush_item items[1];
++};
++
+ /*
+  * The processor's cache cleaned for the GPU (which does not look into it), counted and timed
+  * (sysctl kern.rosemary.mali_flush_*). Boot-arg malinoflush=1: not at all, to see what it costs.
+@@ -63,6 +80,18 @@ mali_flush(uintptr_t va, size_t length)
+ 	rosemary_mali_account_flush(mach_absolute_time() - t0, length);
+ }
+ 
++static void
++mali_flush_run(void * argument)
++{
++	struct mali_flush_list * list = (struct mali_flush_list *) argument;
++
++	for (uint32_t i = 0; i < list->count; i++) {
++		mali_flush(list->items[i].va, list->items[i].length);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");       /* the write buffers out before the GPU looks */
++	IOFreeData(list, list->allocated);
++}
++
+ extern "C" {
+ /* bsd/dev/rosemary_mali.c */
+ bool rosemary_mali_ready(void);
+@@ -70,7 +99,7 @@ bool rosemary_mali_parameter(uint32_t which, uint64_t * value);
+ uint64_t rosemary_mali_address(uint64_t size);
+ bool rosemary_mali_map(uint64_t gpu, uint64_t phys);
+ bool rosemary_mali_unmap(uint64_t gpu, uint64_t size);
+-uint64_t rosemary_mali_enqueue(uint64_t chain, bool fragment);
++uint64_t rosemary_mali_enqueue(uint64_t chain, bool fragment, void (*prepare)(void *), void *argument);
+ bool rosemary_mali_wait(uint64_t seq, uint64_t timeout_ns, uint32_t * status);
+ 
+ bool RosemaryMaliStart(void);
+@@ -653,9 +682,24 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 			 * invalidated first: what a program wrote into it (a texture) reaches memory, and no dirty line
+ 			 * of it is left to be evicted over what the GPU draws. Programs keep the default cache mode.
+ 			 */
+-			for (uint32_t i = 0; i < r.submit.bo_handle_count && i < MALI_SUBMIT_BOS_MAX; i += 64) {
++			struct mali_flush_list * list = NULL;
++			uint32_t room = r.submit.bo_handle_count < MALI_SUBMIT_BOS_MAX ? r.submit.bo_handle_count : MALI_SUBMIT_BOS_MAX;
++			size_t listsize = sizeof(*list) + room * sizeof(struct mali_flush_item);
++
++			if (room != 0) {
++				list = (struct mali_flush_list *) IOMallocData(listsize);
++			}
++			if (room != 0 && list == NULL) {
++				ret = kIOReturnNoMemory;        /* no way to clean the cache for it: not run */
++				break;
++			}
++			if (list != NULL) {
++				list->count = 0;
++				list->allocated = (uint32_t) listsize;
++			}
++			for (uint32_t i = 0; list != NULL && i < room; i += 64) {
+ 				uint32_t handles[64];
+-				uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
++				uint32_t n = room - i < 64 ? room - i : 64;
+ 
+ 				if (copyin((user_addr_t) (r.submit.bo_handles + i * sizeof(uint32_t)), handles, n * sizeof(uint32_t)) != 0) {
+ 					break;
+@@ -670,18 +714,30 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 						uint32_t seed = b->surface->pixelSeed();
+ 
+ 						if (seed != b->flushed_seed) {
+-							mali_flush(b->surface->kernelAddress(), (size_t) b->size);
++							list->items[list->count].va = b->surface->kernelAddress();
++							list->items[list->count].length = (size_t) b->size;
++							list->count++;
+ 							b->flushed_seed = seed;
+ 						}
+-					} else if (b->mapped) {
+-						mali_flush(b->kva, (size_t) b->size);
++					} else if (b->mapped && b->kva != 0) {
++						list->items[list->count].va = b->kva;
++						list->items[list->count].length = (size_t) b->size;
++						list->count++;
+ 					} else {
+ 						rosemary_mali_account_skip(b->size);
+ 					}
+ 				}
+ 			}
+-			__asm__ volatile ("dsb sy" ::: "memory");       /* the write buffers out before the GPU looks */
+-			seq = rosemary_mali_enqueue(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS);
++			__asm__ volatile ("dsb sy" ::: "memory");       /* what the program wrote is in the cache for the worker to see */
++			if (list != NULL && list->count == 0) {
++				IOFreeData(list, listsize);
++				list = NULL;
++			}
++			seq = rosemary_mali_enqueue(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS,
++			    list != NULL ? mali_flush_run : NULL, list);
++			if (seq == 0 && list != NULL) {
++				IOFreeData(list, listsize);         /* refused: nobody will run it */
++			}
+ 			if (seq == 0) {         /* refused: no worker to run it */
+ 				fFailed++;
+ 				gMaliRefused++;
