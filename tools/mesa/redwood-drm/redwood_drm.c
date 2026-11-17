@@ -120,8 +120,9 @@ calls_say(uint64_t now)
 		call_count[best] = 0;
 		call_ns[best] = 0;
 	}
-	length += snprintf(line + length, sizeof(line) - (size_t)length, " maps x%llu %llu ms; made by size:",
-	    (unsigned long long)map_count, (unsigned long long)(map_ns / 1000000));
+	length += snprintf(line + length, sizeof(line) - (size_t)length, " waits answered here x%llu; maps x%llu %llu ms; made by size:",
+	    (unsigned long long)__atomic_exchange_n(&waits_skipped, 0, __ATOMIC_RELAXED), (unsigned long long)map_count,
+	    (unsigned long long)(map_ns / 1000000));
 	for (int i = 0; i < 32 && length < (int)sizeof(line) - 24; i++) {
 		if (create_sizes[i] != 0) {
 			length += snprintf(line + length, sizeof(line) - (size_t)length, " %uK x%llu", (1u << i) >> 10,
@@ -254,6 +255,16 @@ static struct { uint32_t handle, size, flags; uint64_t offset, since; } parked[P
 static unsigned parked_count;
 static uint64_t parked_bytes;
 static uint8_t made_here[MAPS];
+/*
+ * Which buffers a job may still have: `used` counts the submissions that named a buffer, `seen` is the count
+ * at which a wait for it last came back done (the kernel then also invalidated the processor's cache lines of
+ * what the GPU wrote). A wait for a buffer of ours with used == seen -- never named by a job, or waited for
+ * since the last one -- would only be answered "done" by the kernel (1 800 of them every second in the window
+ * server, 50 us each, run 214): it is answered here. Only that buffer's own waits count: another buffer
+ * being done says nothing of this one's cache lines.
+ */
+static uint32_t wait_used[MAPS], wait_seen[MAPS];
+static uint64_t waits_skipped;
 static uint32_t made_size[MAPS], made_flags[MAPS];
 static uint64_t made_offset[MAPS];
 
@@ -344,8 +355,19 @@ parked_take(struct panfrost_create *create)
 	for (unsigned i = 0; i < parked_count; i++) {
 		struct { uint32_t handle, pad; int64_t timeout; } wait = { parked[i].handle, 0, 0 };
 
-		if (parked[i].size != size || parked[i].flags != create->flags || call(0x41, &wait, sizeof(wait)) != 0) {
-			continue;       /* another size or kind, or a job still has it */
+		uint32_t handle = parked[i].handle;
+		uint32_t used = handle < MAPS ? __atomic_load_n(&wait_used[handle], __ATOMIC_ACQUIRE) : 0;
+		bool idle = handle < MAPS && used == __atomic_load_n(&wait_seen[handle], __ATOMIC_ACQUIRE);
+
+		if (parked[i].size != size || parked[i].flags != create->flags) {
+			continue;       /* another size or kind */
+		}
+		if (idle) {
+			__atomic_fetch_add(&waits_skipped, 1, __ATOMIC_RELAXED);
+		} else if (call(0x41, &wait, sizeof(wait)) != 0) {
+			continue;       /* a job still has it */
+		} else if (handle < MAPS) {
+			__atomic_store_n(&wait_seen[handle], used, __ATOMIC_RELEASE);
 		}
 		create->handle = parked[i].handle;
 		create->offset = parked[i].offset;
@@ -414,6 +436,39 @@ drmIoctl(int fd, unsigned long request, void *arg)
 		if (mmap_bo->handle < MAPS && made_here[mmap_bo->handle]) {
 			mmap_bo->offset = (uint64_t)mmap_bo->handle << 12;
 			return 0;
+		}
+	}
+	if (mali && (request & 0xff) == 0x41 && IOCPARM_LEN(request) >= 16) {
+		uint32_t handle = *(uint32_t *)arg;     /* DRM_IOCTL_PANFROST_WAIT_BO: handle, pad, timeout */
+
+		if (handle < MAPS && made_here[handle] &&
+		    __atomic_load_n(&wait_used[handle], __ATOMIC_ACQUIRE) == __atomic_load_n(&wait_seen[handle], __ATOMIC_ACQUIRE)) {
+			__atomic_fetch_add(&waits_skipped, 1, __ATOMIC_RELAXED);
+			return 0;
+		}
+		if (handle < MAPS && made_here[handle]) {
+			uint32_t used = __atomic_load_n(&wait_used[handle], __ATOMIC_ACQUIRE);
+
+			error = call(0x41, arg, IOCPARM_LEN(request));
+			if (error == 0) {
+				__atomic_store_n(&wait_seen[handle], used, __ATOMIC_RELEASE);      /* (not past a submission that came meanwhile) */
+			}
+			if (error != 0) {
+				errno = error;
+				return -1;
+			}
+			return 0;
+		}
+	}
+	if (mali && (request & 0xff) == 0x40 && IOCPARM_LEN(request) >= sizeof(struct redwood_submit)) {
+		struct redwood_submit *submit = arg;
+		const uint32_t *handles = (const uint32_t *)(uintptr_t)submit->bo_handles;
+
+		/* marked before the call: a wait on another thread must not be answered past a job on its way */
+		for (uint32_t i = 0; handles != NULL && i < submit->bo_handle_count; i++) {
+			if (handles[i] < MAPS) {
+				__atomic_fetch_add(&wait_used[handles[i]], 1, __ATOMIC_ACQ_REL);
+			}
 		}
 	}
 	error = call((unsigned)(request & 0xff), arg, IOCPARM_LEN(request));
