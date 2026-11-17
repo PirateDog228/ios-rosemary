@@ -1,0 +1,73 @@
+diff --git a/iokit/Kernel/arm/RosemaryMali.cpp b/iokit/Kernel/arm/RosemaryMali.cpp
+index 3ac80b4..d771a06 100644
+--- a/iokit/Kernel/arm/RosemaryMali.cpp
++++ b/iokit/Kernel/arm/RosemaryMali.cpp
+@@ -50,11 +50,13 @@ extern "C" void rosemary_mali_account_flush(uint64_t ticks, uint64_t bytes);
+ struct mali_flush_item {
+ 	uintptr_t va;
+ 	size_t length;
++	uint64_t * stamp;       /* the buffer's flush_stamp (NULL for a surface, which is cleaned by its seed) */
+ };
+ 
+ struct mali_flush_list {
+ 	uint32_t count;
+ 	uint32_t allocated;
++	uint64_t submitted;     /* the clock when the program called submit: what it wrote was in the cache by then */
+ 	struct mali_flush_item items[1];
+ };
+ 
+@@ -86,6 +88,21 @@ mali_flush_run(void * argument)
+ 	struct mali_flush_list * list = (struct mali_flush_list *) argument;
+ 
+ 	for (uint32_t i = 0; i < list->count; i++) {
++		uint64_t * stamp = list->items[i].stamp;
++
++		/*
++		 * A buffer cleaned after this job was submitted has had everything the program wrote before the call
++		 * cleaned with it (the lines go to memory whichever processor holds them), and the jobs that were
++		 * queued behind each other share one cleaning. The stamp is the time the cleaning began: what is
++		 * written while it runs is not counted as covered.
++		 */
++		if (stamp != NULL && *stamp >= list->submitted) {
++			rosemary_mali_account_skip(list->items[i].length);
++			continue;
++		}
++		if (stamp != NULL) {
++			*stamp = mach_absolute_time();
++		}
+ 		mali_flush(list->items[i].va, list->items[i].length);
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");       /* the write buffers out before the GPU looks */
+@@ -203,6 +220,7 @@ struct mali_buffer {
+ 	uint64_t address, size;
+ 	uint64_t last_seq;                      /* the last job given it (kPanfrostSubmit's bo_handles) */
+ 	uintptr_t kva;                          /* its kernel address, for cleaning the processor's cache around jobs */
++	uint64_t flush_stamp;                   /* when the worker last began to clean its cache lines (a clock reading) */
+ 	bool mapped;                            /* a program has mapped it: only then can the processor's cache hold a line of it
+ 	                                         * the GPU has not seen (the Mali's own tiler heap, scratch and the like never are) */
+ 	uint32_t flushed_seed;                  /* a surface: its seed when its cache lines were last cleaned */
+@@ -716,12 +734,14 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 						if (seed != b->flushed_seed) {
+ 							list->items[list->count].va = b->surface->kernelAddress();
+ 							list->items[list->count].length = (size_t) b->size;
++							list->items[list->count].stamp = NULL;
+ 							list->count++;
+ 							b->flushed_seed = seed;
+ 						}
+ 					} else if (b->mapped && b->kva != 0) {
+ 						list->items[list->count].va = b->kva;
+ 						list->items[list->count].length = (size_t) b->size;
++						list->items[list->count].stamp = &b->flush_stamp;
+ 						list->count++;
+ 					} else {
+ 						rosemary_mali_account_skip(b->size);
+@@ -729,6 +749,9 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 				}
+ 			}
+ 			__asm__ volatile ("dsb sy" ::: "memory");       /* what the program wrote is in the cache for the worker to see */
++			if (list != NULL) {
++				list->submitted = mach_absolute_time();
++			}
+ 			if (list != NULL && list->count == 0) {
+ 				IOFreeData(list, listsize);
+ 				list = NULL;
