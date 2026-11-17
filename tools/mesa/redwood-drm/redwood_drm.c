@@ -82,6 +82,7 @@ drmOpenWithType(const char *name, const char *busid, int type)
  * profiler found a fraction of that in Mesa's own code (25 October).
  */
 static uint64_t call_count[256], call_ns[256], map_count, map_ns, calls_said, create_sizes[32];
+static uint64_t waits_skipped;                      /* waits answered without the kernel (wait_used/wait_seen below) */
 
 static uint64_t
 call_clock(void)
@@ -264,7 +265,6 @@ static uint8_t made_here[MAPS];
  * being done says nothing of this one's cache lines.
  */
 static uint32_t wait_used[MAPS], wait_seen[MAPS];
-static uint64_t waits_skipped;
 static uint32_t made_size[MAPS], made_flags[MAPS];
 static uint64_t made_offset[MAPS];
 
