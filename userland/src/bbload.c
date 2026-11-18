@@ -11,7 +11,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
-#include <ucontext.h>
+#include <sys/ucontext.h>   /* (<ucontext.h> is the deprecated routines and wants _XOPEN_SOURCE; the type is here) */
 
 static void say(const char *what, const char *detail)
 {
