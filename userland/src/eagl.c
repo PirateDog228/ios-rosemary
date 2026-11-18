@@ -61,7 +61,10 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
+#include <dlfcn.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <pthread.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdarg.h>
@@ -205,6 +208,165 @@ now_us(void)
 		mach_timebase_info(&base);
 	}
 	return mach_absolute_time() * base.numer / base.denom / 1000;
+}
+
+/*
+ * Boot-arg glprof=1: where the thread that draws spends its time. A thread of ours stops it about every
+ * millisecond, reads its program counter and lets it go; every ten seconds the log has the share of samples
+ * by image and nearest exported symbol, and the most frequent counters as IMAGE+OFFSET (llvm-symbolizer
+ * --obj=libOSMesa.8.dylib OFFSET, with the build's unstripped copy). Samples in libsystem_kernel are the
+ * thread waiting or in a system call.
+ */
+#define PROF_BINS       4096
+static int prof_on;
+static mach_port_t prof_target;
+static struct { uintptr_t pc; uint32_t n; } prof_bin[PROF_BINS];
+static uint32_t prof_total;
+
+static void
+prof_note(uintptr_t pc)
+{
+	unsigned i = (unsigned)((pc >> 2) * 2654435761u) % PROF_BINS;
+
+	for (unsigned k = 0; k < PROF_BINS; k++, i = (i + 1) % PROF_BINS) {
+		if (prof_bin[i].n == 0) {
+			prof_bin[i].pc = pc;
+			prof_bin[i].n = 1;
+			return;
+		}
+		if (prof_bin[i].pc == pc) {
+			prof_bin[i].n++;
+			return;
+		}
+	}
+}
+
+static const char *
+prof_image(const Dl_info *info)
+{
+	const char *slash = info->dli_fname != NULL ? strrchr(info->dli_fname, '/') : NULL;
+
+	return slash != NULL ? slash + 1 : (info->dli_fname != NULL ? info->dli_fname : "?");
+}
+
+static void
+prof_report(void)
+{
+	struct { void *base; void *symbol; uint32_t n; const char *image, *name; } group[96];
+	unsigned groups = 0;
+	uint32_t kernel = 0;
+
+	for (unsigned i = 0; i < PROF_BINS; i++) {
+		Dl_info info;
+		unsigned g;
+
+		if (prof_bin[i].n == 0) {
+			continue;
+		}
+		memset(&info, 0, sizeof(info));
+		(void)dladdr((void *)prof_bin[i].pc, &info);
+		if (info.dli_fname != NULL && strstr(info.dli_fname, "libsystem_kernel") != NULL) {
+			kernel += prof_bin[i].n;
+		}
+		for (g = 0; g < groups; g++) {
+			if (group[g].base == info.dli_fbase && group[g].symbol == info.dli_saddr) {
+				break;
+			}
+		}
+		if (g == groups && groups < 96) {
+			group[groups].base = info.dli_fbase;
+			group[groups].symbol = info.dli_saddr;
+			group[groups].n = 0;
+			group[groups].image = prof_image(&info);
+			group[groups].name = info.dli_sname != NULL ? info.dli_sname : "?";
+			groups++;
+		}
+		if (g < groups) {
+			group[g].n += prof_bin[i].n;
+		}
+	}
+	say("redwood-gl: prof: %u samples, %u (%u%%) in libsystem_kernel\n", prof_total, kernel, prof_total != 0 ? kernel * 100 / prof_total : 0);
+	for (unsigned top = 0; top < 18; top++) {
+		unsigned best = groups;
+
+		for (unsigned g = 0; g < groups; g++) {
+			if (group[g].n != 0 && (best == groups || group[g].n > group[best].n)) {
+				best = g;
+			}
+		}
+		if (best == groups) {
+			break;
+		}
+		say("redwood-gl: prof: %5.1f%% %s %s (+%#lx)\n", 100.0 * group[best].n / (prof_total != 0 ? prof_total : 1), group[best].image,
+		    group[best].name, (unsigned long)((uintptr_t)group[best].symbol - (uintptr_t)group[best].base));
+		group[best].n = 0;
+	}
+	for (unsigned top = 0; top < 24; top++) {
+		unsigned best = PROF_BINS;
+		Dl_info info;
+
+		for (unsigned i = 0; i < PROF_BINS; i++) {
+			if (prof_bin[i].n != 0 && (best == PROF_BINS || prof_bin[i].n > prof_bin[best].n)) {
+				best = i;
+			}
+		}
+		if (best == PROF_BINS) {
+			break;
+		}
+		memset(&info, 0, sizeof(info));
+		(void)dladdr((void *)prof_bin[best].pc, &info);
+		say("redwood-gl: prof: pc %s+%#lx x%u\n", prof_image(&info), (unsigned long)(prof_bin[best].pc - (uintptr_t)info.dli_fbase),
+		    prof_bin[best].n);
+		prof_bin[best].n = 0;
+	}
+	memset(prof_bin, 0, sizeof(prof_bin));
+	prof_total = 0;
+}
+
+static void *
+prof_main(void *unused)
+{
+	uint64_t window = now_us();
+
+	(void)unused;
+	for (;;) {
+		arm_thread_state64_t state;
+		mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+
+		usleep(1000);
+		if (thread_suspend(prof_target) != KERN_SUCCESS) {
+			continue;
+		}
+		if (thread_get_state(prof_target, ARM_THREAD_STATE64, (thread_state_t)&state, &count) == KERN_SUCCESS) {
+			prof_note((uintptr_t)__darwin_arm_thread_state64_get_pc(state));
+			prof_total++;
+		}
+		thread_resume(prof_target);
+		if (now_us() - window >= 10000000) {
+			window = now_us();
+			prof_report();
+		}
+	}
+	return NULL;
+}
+
+/* (from the thread that draws, at the end of a frame: the first time starts it) */
+static void
+prof_start(void)
+{
+	pthread_t thread;
+
+	if (!prof_on || prof_target != 0) {
+		return;
+	}
+	prof_target = mach_thread_self();
+	if (pthread_create(&thread, NULL, prof_main, NULL) == 0) {
+		pthread_detach(thread);
+		say("redwood-gl: prof: sampling thread %#x\n", prof_target);
+	} else {
+		prof_target = 0;
+		prof_on = 0;
+	}
 }
 
 /* ---- a context -------------------------------------------------------------------------------- */
@@ -626,10 +788,26 @@ surface_shared(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
 
-	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
-	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
-	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
-	    !redwood_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+	static unsigned said_refused;
+	const char *why = !share_surfaces ? "glcopy" : image->invert ? "inverted" : image->alpha_first ? "alpha first" :
+	    image->format != GL_BGRA ? "format" : image->type != GL_UNSIGNED_BYTE ? "type" : image->plane != 0 ? "plane" :
+	    ((size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface)) ? "part of it" :
+	    NULL;
+
+	if (why == NULL && !redwood_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+		why = "the library";
+	}
+	if (why != NULL) {
+		/* "refused:" -- which surfaces are copied and why (the library's own reason, if it is that, is on the lines before) */
+		if (said_refused++ < 80) {
+			uint32_t pf = IOSurfaceGetPixelFormat(surface);
+
+			say("redwood-gl: refused: surface %u %zux%zu bpr %zu fmt %c%c%c%c (%#x) planes %zu, image %dx%d format %#x type %#x plane %d: %s\n",
+			    IOSurfaceGetID(surface), IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), IOSurfaceGetBytesPerRow(surface),
+			    (char)(pf >> 24 & 0x7f ? pf >> 24 : '?'), (char)(pf >> 16 & 0x7f ? pf >> 16 : '?'), (char)(pf >> 8 & 0x7f ? pf >> 8 : '?'),
+			    (char)(pf & 0x7f ? pf : '?'), pf, IOSurfaceGetPlaneCount(surface), image->width, image->height, image->format,
+			    image->type, image->plane, why);
+		}
 		e->refused++;
 		return false;
 	}
@@ -1030,6 +1208,7 @@ frame_end(struct eagl *e, bool finished)
 	uint64_t before, waited, after;
 	unsigned copied = 0, in_place = 0;
 
+	prof_start();
 	clear_now(e);
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
@@ -4115,6 +4294,7 @@ install(void)
 		}
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
 		census_on = strstr(arguments, "glcensus=1") != NULL;
+		prof_on = strstr(arguments, "glprof=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
 		if ((argument = strstr(arguments, "glslow=")) != NULL) {
