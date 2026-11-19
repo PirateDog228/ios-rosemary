@@ -922,6 +922,30 @@ surface_to_texture(struct eagl *e, struct image *image)
 			say("gl-at:     a table; sixteen of its entries, first to last:%s\n", entries);
 		}
 	}
+	{
+		/* "upload:" -- what a copy of a surface took with it: bytes that are not zero (a picture that was not there yet is all zero) */
+		static unsigned said_upload;
+		size_t size = row * (size_t)(image->height - 1) + (size_t)image->width * pixel;
+
+		if (said_upload < 120 && size <= (1u << 20)) {
+			size_t lit = 0, first = size;
+
+			for (size_t at = 0; at < size; at++) {
+				if (base[at] != 0) {
+					lit++;
+					if (first == size) {
+						first = at;
+					}
+				}
+			}
+			said_upload++;
+			say("redwood-gl: upload: surface %u %dx%d (%zu bytes a row, format %#x type %#x%s%s) seed %u: %zu of %zu bytes not zero%s\n",
+			    IOSurfaceGetID(surface), image->width, image->height, row, image->format, image->type, image->wrapped ? ", wrapped" : "",
+			    image->target ? ", drawn into" : "", (unsigned)IOSurfaceGetSeed(surface), lit, size,
+			    lit == 0 ? " -- EMPTY" : "");
+			(void)first;
+		}
+	}
 	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
 	free(flipped);
 	image->seed = IOSurfaceGetSeed(surface);
