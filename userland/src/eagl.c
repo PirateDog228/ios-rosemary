@@ -850,6 +850,10 @@ surface_changed(struct eagl *e, struct image *image)
 }
 
 /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
+/* Switches for finding out why a picture is not there (kernel boot-args; all off): glup_swap=1 red and blue the other way round in what a copy of
+ * a surface takes with it, glup_opaque=1 its opacity as full, glup_always=1 a copy again at every glBindTexture of a texture that is one. */
+static bool up_swap, up_opaque, up_always;
+
 static void
 surface_to_texture(struct eagl *e, struct image *image)
 {
@@ -888,6 +892,27 @@ surface_to_texture(struct eagl *e, struct image *image)
 			}
 		}
 		base = flipped;
+	}
+	if ((up_swap || up_opaque) && pixel == 4 && !planar) {
+		uint8_t *tweaked = calloc(row, (size_t)image->height);
+
+		if (tweaked != NULL) {
+			memcpy(tweaked, base, row * (size_t)(image->height - 1) + (size_t)image->width * 4);
+			for (size_t at = 0; at + 4 <= row * (size_t)image->height; at += 4) {
+				if (up_swap) {
+					uint8_t t = tweaked[at];
+
+					tweaked[at] = tweaked[at + 2];
+					tweaked[at + 2] = t;
+				}
+				if (up_opaque) {
+					tweaked[at + 3] = 255;
+				}
+			}
+			free(flipped);
+			flipped = tweaked;
+			base = tweaked;
+		}
 	}
 	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
 	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
@@ -1404,7 +1429,7 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
 		e->bound[e->unit] = texture;
 	}
 	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && !image->shared &&
-	    (!image->target ? IOSurfaceGetSeed(image->surface) != image->seed || surface_changed(e, image) :
+	    (!image->target ? up_always || IOSurfaceGetSeed(image->surface) != image->seed || surface_changed(e, image) :
 	    image->wrapped && !image->painted && surface_changed(e, image))) {
 		surface_to_texture(e, image);
 	}
@@ -4319,6 +4344,9 @@ install(void)
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		prof_on = strstr(arguments, "glprof=1") != NULL;
+		up_swap = strstr(arguments, "glup_swap=1") != NULL;
+		up_opaque = strstr(arguments, "glup_opaque=1") != NULL;
+		up_always = strstr(arguments, "glup_always=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
 		if ((argument = strstr(arguments, "glslow=")) != NULL) {
