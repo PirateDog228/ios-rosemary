@@ -1,0 +1,120 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -360,6 +360,58 @@
+ 	s->allocSize = (uint32_t)alloc;
+ 	return kIOReturnSuccess;
+ }
++
++/*
++ * Use the creator's existing pages as the IOSurface backing store.
++ * Keep the same unaligned-range convention as Rosemary's selector-6
++ * wrapImage() implementation (0164), so wrapOffset and the returned base
++ * address have identical semantics.
++ *
++ * A few CoreAnimation image pages are read-only in the creating task. Try
++ * writable first, then read-only persistent, then read-only non-persistent,
++ * matching the fallback already used by wrapImage() (0165).
++ */
++static IOReturn
++sweet_surface_use_task_memory(SweetSurface *s, task_t task, uint64_t address, uint64_t size)
++{
++	static const struct {
++		IOOptionBits options;
++		bool readOnly;
++	} passes[3] = {
++		{ kIODirectionInOut | kIOMemoryPersistent, false },
++		{ kIODirectionOut | kIOMemoryPersistent, true },
++		{ kIODirectionOut, true },
++	};
++	IOReturn ret = kIOReturnVMError;
++
++	if (address == 0 || size == 0 || size > SWEET_SURFACE_MAX_ALLOC ||
++	    address > (~(uint64_t)0) - size) {
++		return kIOReturnBadArgument;
++	}
++	for (unsigned pass = 0; pass < 3; pass++) {
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(address, size, passes[pass].options, task);
++		if (md == NULL) {
++			ret = kIOReturnNoMemory;
++			continue;
++		}
++		ret = md->prepare();
++		if (ret != kIOReturnSuccess) {
++			md->release();
++			continue;
++		}
++
++		s->memory = md;
++		s->wrapped = true;                 /* free() calls complete() */
++		s->wrapReadOnly = passes[pass].readOnly;
++		s->wrapOffset = (uint32_t)(address & (page_size - 1));
++		s->mapCache = kIOMapDefaultCache;
++		if (s->wrapReadOnly) {
++			s->mapCache |= kIOMapReadOnly;
++		}
++		return kIOReturnSuccess;
++	}
++	return ret == kIOReturnNoMemory ? kIOReturnNoMemory : kIOReturnVMError;
++}
+ 
+ /* Per-client mapping of one surface. */
+ class SweetSurfaceRef : public OSObject {
+@@ -700,6 +700,55 @@
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	OSObject *address_object = props->getObject("IOSurfaceAddress");
++	OSNumber *client_address = OSDynamicCast(OSNumber, address_object);
++	if (ret == kIOReturnSuccess && address_object != NULL && client_address == NULL) {
++		ret = kIOReturnBadArgument;
++	}
++	if (ret == kIOReturnSuccess && client_address != NULL) {
++		bool client_read_only = false;
++		uint64_t used = (uint64_t)s->offset + (uint64_t)s->bytesPerRow *
++		    sweet_div_up(s->height, s->elementHeight);
++		for (uint32_t i = 0; i < s->planeCount; i++) {
++			uint64_t plane_end = (uint64_t)s->planes[i].offset + s->planes[i].size;
++			if (plane_end > used) {
++				used = plane_end;
++			}
++		}
++		/* IOSurfaceAllocSize is the creator's actual allocation size, not our rounded estimate. */
++		OSNumber *owner_size_number = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAllocSize"));
++		if (owner_size_number != NULL) {
++			uint64_t owner_size = owner_size_number->unsigned64BitValue();
++			if (owner_size != 0) {
++				if (owner_size < used) {
++					ret = kIOReturnBadArgument;
++				} else {
++					used = owner_size;
++				}
++			}
++		}
++		if (ret == kIOReturnSuccess && (used == 0 || used > SWEET_SURFACE_MAX_ALLOC)) {
++			ret = kIOReturnBadArgument;
++		}
++		if (ret == kIOReturnSuccess) {
++			ret = sweet_surface_use_task_memory(s, fTask,
++			    client_address->unsigned64BitValue(), used);
++			if (ret == kIOReturnSuccess) {
++				client_read_only = s->wrapReadOnly;
++			}
++		}
++		/* A client-backed surface must be in the global id table before returnSurface(). */
++		if (ret == kIOReturnSuccess && !sweet_surface_publish(s)) {
++			ret = kIOReturnNoResources;
++		}
++		static uint32_t client_address_logged;
++		if (client_address_logged++ < 8) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET SURF: %s create around client memory %#llx (%llu bytes) %ux%u fmt 0x%x -> 0x%x%s\n",
++			    name, client_address->unsigned64BitValue(), used, s->width, s->height, s->pixelFormat, ret,
++			    client_read_only ? " (read-only)" : "");
++		}
++	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+*** End Patch
