@@ -1,0 +1,30 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 010f368..59c4602 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -872,13 +872,24 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		 */
+ 		static int said;
+ 
+-		if (said++ < 6) {
++		if (said++ < 24) {
+ 			char name[32];
++			char hex[3 * 64 + 1];
++			const uint8_t *in = (const uint8_t *)args->structureInput;
++			uint32_t shown = args->structureInputSize < 64 ? args->structureInputSize : 64, used = 0;
+ 
+ 			proc_selfname(name, sizeof(name));
++			for (uint32_t i = 0; in != NULL && i < shown; i++) {
++				used += (uint32_t)snprintf(hex + used, sizeof(hex) - used, "%02x%s", in[i], (i & 7) == 7 ? " " : "");
++			}
++			hex[used] = 0;
+ 			IOLog("SWEET SURF: %s sel %u refused: scalars %u in, %u out; struct %u in, %u out%s\n", name, selector,
+ 			    args->scalarInputCount, args->scalarOutputCount, args->structureInputSize,
+ 			    args->structureOutputSize, args->structureInputDescriptor != NULL ? " (descriptor in)" : "");
++			/* the words of the call: what a wrap would be given (an address and a size in the caller's memory, a surface to put it in?) */
++			IOLog("SWEET SURF:   %s sel %u: scalars %llx %llx %llx %llx; struct in: %s\n", name, selector,
++			    args->scalarInputCount > 0 ? args->scalarInput[0] : 0, args->scalarInputCount > 1 ? args->scalarInput[1] : 0,
++			    args->scalarInputCount > 2 ? args->scalarInput[2] : 0, args->scalarInputCount > 3 ? args->scalarInput[3] : 0, hex);
+ 		}
+ 		return kIOReturnUnsupported;
+ 	}

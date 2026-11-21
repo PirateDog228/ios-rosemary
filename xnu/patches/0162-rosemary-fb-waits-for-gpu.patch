@@ -1,0 +1,20 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2d7d03f..5ff451d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -204,6 +204,15 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++#if defined(ROSEMARY)
++	/* present() waits for the Mali's last job of a surface itself (rosemary_surface_wait_gpu): the GL library
++	 * (libredwood-gl, display_waits()) then does not glFinish at the end of each frame. Boot-arg sweetfb_gpuwait=0 */
++	int gpuwait = 1;
++	PE_parse_boot_argn("sweetfb_gpuwait", &gpuwait, sizeof(gpuwait));
++	if (gpuwait != 0) {
++		setProperty("RedwoodWaitsForGPU", kOSBooleanTrue);
++	}
++#endif
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
