@@ -1,0 +1,48 @@
+Subject: rosemary-0175: boot-arg rosemary_mfgpll=MHZ sets the Mali's PLL (the bootloader left it at 270 MHz: 132 MHz measured)
+
+diff --git a/bsd/dev/rosemary_gpu.c b/bsd/dev/rosemary_gpu.c
+--- a/bsd/dev/rosemary_gpu.c
++++ b/bsd/dev/rosemary_gpu.c
+@@ -746,6 +746,42 @@
+ 	printf("ROSEMARY GPU: MFG_CG_CON=%08x\n", rg_rd(mfgcfg, RG_MFG_CG_CON));
+ 	rg_wr(mfgcfg, RG_MFG_CG_CLR, RG_MFG_CG_BG3D);
+ 	printf("ROSEMARY GPU: MFG_CG_CON after ungate=%08x\n", rg_rd(mfgcfg, RG_MFG_CG_CON));
++	{
++		/*
++		 * 0175: the Mali's clock. mfg_sel (CLK_CFG_3 at topckgen 0x50, bits 17:16) was 1 = mfgpll_ck (clk-mt6785.c:
++		 * clk26m, mfgpll_ck, univpll_d3, mainpll_d5), and MFGPLL (APMIXEDSYS: CON0 0x250, CON1 0x254) was left by the
++		 * bootloader at 270 MHz (posdiv 3, PCW 0x14c4ec): the cycle counter read 132 MHz. Boot-arg rosemary_mfgpll=MHZ
++		 * (200..900) sets MFGPLL to that: VCO = MHz << POSDIV kept between 1500 and 3000, PCW = VCO * 2^14 / 26,
++		 * the new value written with the change bit (31) set, then 30 us. Done before any job runs. The GPU's
++		 * voltage is not touched: go up in steps (400, 540, 700) and watch kern.rosemary.mali_failed.
++		 */
++		int want = 0;
++
++		PE_parse_boot_argn("rosemary_mfgpll", &want, sizeof(want));
++		if (want >= 200 && want <= 900) {
++			vm_offset_t apmix = ml_io_map(0x1000c000u, RG_PAGE);
++
++			if (apmix != 0) {
++				uint32_t con1 = rg_rd(apmix, 0x254), post = 3, pcw;
++				uint64_t vco;
++
++				while (post > 0 && ((uint64_t)want << post) > 3000) {
++					post--;
++				}
++				while (post < 3 && ((uint64_t)want << post) < 1500) {
++					post++;
++				}
++				vco = (uint64_t)want << post;
++				pcw = (uint32_t)((vco * 16384ULL + 13ULL) / 26ULL);
++				printf("ROSEMARY GPU: MFGPLL CON0=%08x CON1=%08x; asking %d MHz: posdiv %u pcw %06x\n", rg_rd(apmix, 0x250), con1,
++				    want, post, pcw);
++				con1 = (con1 & ~((7u << 24) | 0x3fffffu)) | (post << 24) | (pcw & 0x3fffffu) | (1u << 31);
++				rg_wr(apmix, 0x254, con1);
++				rg_delay_us(30);
++				printf("ROSEMARY GPU: MFGPLL CON1 now %08x\n", rg_rd(apmix, 0x254));
++			}
++		}
++	}
+ 	rg_read_gpu(gpu);
+ 	if (mode >= 5) {
+ 		/* keep the GPU: persistent tables, job queue, panfrost parameters (rosemary_mali.c) */
