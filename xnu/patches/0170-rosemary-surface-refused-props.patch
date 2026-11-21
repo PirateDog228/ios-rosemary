@@ -1,0 +1,28 @@
+Subject: rosemary-0170: log the property dictionary of a refused IOSurface create
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -881,6 +881,22 @@
+ 		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
++		if (ret != kIOReturnSuccess) {
++			/* 0170: what was asked for, when it was refused (up to 700 bytes, in pieces of 120) */
++			static uint32_t dumped;
++			OSSerialize *ser = dumped < 12 ? OSSerialize::withCapacity(2048) : NULL;
++			if (ser != NULL) {
++				dumped++;
++				if (props->serialize(ser)) {
++					const char *text = ser->text();
++					size_t n = text != NULL ? strnlen(text, 700) : 0;
++					for (size_t i = 0; i < n; i += 120) {
++						IOLog("SWEET SURF: refused create (%s) props[%lu]: %.120s\n", name, (unsigned long)i, text + i);
++					}
++				}
++				ser->release();
++			}
++		}
+ 	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
