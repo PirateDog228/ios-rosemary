@@ -1,0 +1,22 @@
+Subject: rosemary-0171: IOSurfaceAddress create: the last row needs only its pixels (QuartzCore 256x1 tables were refused: bytesPerRow 0x2a0, AllocSize 0x200)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -794,8 +794,14 @@
+ 	}
+ 	if (ret == kIOReturnSuccess && client_address != NULL) {
+ 		bool client_read_only = false;
+-		uint64_t used = (uint64_t)s->offset + (uint64_t)s->bytesPerRow *
+-		    sweet_div_up(s->height, s->elementHeight);
++		/*
++		 * 0171: what the creator's memory must hold at least: the last row is only as long as the pixels
++		 * in it, not bytesPerRow (QuartzCore's 256x1 tables: bytesPerRow 0x2a0, IOSurfaceAllocSize 0x200;
++		 * a whole last row made 0166 refuse them all).
++		 */
++		uint64_t rows = sweet_div_up(s->height, s->elementHeight);
++		uint64_t last_row = (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement;
++		uint64_t used = (uint64_t)s->offset + (rows > 0 ? (rows - 1) * (uint64_t)s->bytesPerRow + last_row : 0);
+ 		for (uint32_t i = 0; i < s->planeCount; i++) {
+ 			uint64_t plane_end = (uint64_t)s->planes[i].offset + s->planes[i].size;
+ 			if (plane_end > used) {
