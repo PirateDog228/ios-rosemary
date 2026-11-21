@@ -1,0 +1,131 @@
+Subject: rosemary-0172: vsync timer re-armed one period after the START of a tick, not a fixed delay after its end (period was 16.7 ms + present time: 40 Hz); rosefps=1 prints a line a second; sweetfb_abs=0 for the old way
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -247,12 +247,89 @@
+ 	return true;
+ }
+ 
++#if defined(ROSEMARY)
++/*
++ * 0172: the vsync timer was re-armed at the END of each tick with a fixed delay (16.667 ms): a tick that took
++ * 8 ms (wait for the Mali, then the copy of the whole frame to the panel) made the period 25 ms, 40 Hz at best,
++ * and the vsync times backboardd paces itself by were uneven. Now the next tick is due one period after the
++ * START of this one (the delay is what is left of it); a tick that overran is followed by the next soon, not a whole period later.
++ * Boot-arg sweetfb_abs=0 brings the old way back. Boot-arg rosefps=1: a line a second, "ROSEMARY FPS:".
++ */
++static uint64_t rf_period_abs, rf_swaps, rf_shown, rf_ticks, rf_late, rf_present_sum, rf_present_max, rf_prev_tick, rf_last_log;
++static int rf_abs = -1, rf_on = -1;
++
++static void
++rosemary_fb_init(void)
++{
++	int v = 1;
++
++	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000ULL, &rf_period_abs);
++	PE_parse_boot_argn("sweetfb_abs", &v, sizeof(v));
++	rf_abs = v != 0;
++	v = 0;
++	PE_parse_boot_argn("rosefps", &v, sizeof(v));
++	rf_on = v != 0;
++}
++
++static void
++rosemary_fb_tick(uint64_t now)
++{
++	if (rf_abs < 0) {
++		rosemary_fb_init();
++	}
++	if (!rf_on) {
++		return;
++	}
++	rf_ticks++;
++	if (rf_prev_tick != 0 && now - rf_prev_tick > rf_period_abs + rf_period_abs / 2) {
++		rf_late++;
++	}
++	rf_prev_tick = now;
++	if (rf_last_log == 0) {
++		rf_last_log = now;
++	} else if (now - rf_last_log >= rf_period_abs * 60) {
++		uint64_t sum_ns, max_ns, span_ns;
++
++		absolutetime_to_nanoseconds(rf_present_sum, &sum_ns);
++		absolutetime_to_nanoseconds(rf_present_max, &max_ns);
++		absolutetime_to_nanoseconds(now - rf_last_log, &span_ns);
++		IOLog("ROSEMARY FPS: %llu ms: swaps %llu shown %llu ticks %llu late %llu; present avg %llu us max %llu us\n",
++		    span_ns / 1000000, rf_swaps, rf_shown, rf_ticks, rf_late,
++		    rf_shown ? sum_ns / rf_shown / 1000 : 0, max_ns / 1000);
++		rf_swaps = rf_shown = rf_ticks = rf_late = rf_present_sum = rf_present_max = 0;
++		rf_last_log = now;
++	}
++}
++
++static void
++rosemary_fb_rearm(IOTimerEventSource *sender, uint64_t tickStart)
++{
++	if (rf_abs > 0) {
++		uint64_t now = mach_absolute_time();
++		uint64_t next = tickStart + rf_period_abs;
++
++		if (next < now + rf_period_abs / 16) {
++			next = now + rf_period_abs / 16;        /* overran: the next one soon */
++		}
++		uint64_t ns;
++
++		absolutetime_to_nanoseconds(next - now, &ns);
++		sender->setTimeoutUS((uint32_t)(ns / 1000 > 0 ? ns / 1000 : 1));
++	} else {
++		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	}
++}
++#endif
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++#if defined(ROSEMARY)
++	rosemary_fb_tick(now);
++#endif
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -294,10 +371,25 @@
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++#if defined(ROSEMARY)
++		uint64_t t0 = mach_absolute_time();
++#endif
+ 		fb->present(rec);
++#if defined(ROSEMARY)
++		uint64_t took = mach_absolute_time() - t0;
++		rf_shown++;
++		rf_present_sum += took;
++		if (took > rf_present_max) {
++			rf_present_max = took;
++		}
++#endif
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
++#if defined(ROSEMARY)
++	rosemary_fb_rearm(sender, now);
++#else
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++#endif
+ }
+ 
+ void
+@@ -344,6 +436,9 @@
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++#if defined(ROSEMARY)
++	rf_swaps++;
++#endif
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
