@@ -1,0 +1,51 @@
+Subject: rosemary-0174: sysctl kern.rosemary.mali_clk_khz, the Mali's clock measured with its cycle counter
+
+diff --git a/bsd/dev/rosemary_mali.c b/bsd/dev/rosemary_mali.c
+--- a/bsd/dev/rosemary_mali.c
++++ b/bsd/dev/rosemary_mali.c
+@@ -227,6 +227,45 @@
+ 	return (rm_rd(at) & mask) == want;
+ }
+ 
++/*
++ * 0173: the Mali's own clock, measured: its CYCLE_COUNT register (0x90, counted from the command
++ * CYCLE_COUNT_START = 5) over 2 ms of the processor's time. sysctl kern.rosemary.mali_clk_khz (read it with the
++ * GPU busy and idle: a clock that is set by the load shows both). 0 = the Mali is not up yet.
++ */
++#define RM_CYCLE_COUNT_LO       0x090u
++#define RM_CMD_CYCLE_START      5u
++
++static int
++rm_sysctl_clk SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	static bool started;
++	uint32_t khz = 0;
++
++	if (rm_gpu != 0) {
++		uint64_t t0, t1, ns;
++		uint32_t c0, c1;
++
++		if (!started) {
++			rm_wr(RM_GPU_CMD, RM_CMD_CYCLE_START);
++			started = true;
++			rm_delay_us(100);
++		}
++		t0 = mach_absolute_time();
++		c0 = rm_rd(RM_CYCLE_COUNT_LO);
++		rm_delay_us(2000);
++		c1 = rm_rd(RM_CYCLE_COUNT_LO);
++		t1 = mach_absolute_time();
++		absolutetime_to_nanoseconds(t1 - t0, &ns);
++		if (ns != 0) {
++			khz = (uint32_t)(((uint64_t)(c1 - c0) * 1000000ULL) / ns);
++		}
++	}
++	return SYSCTL_OUT(req, &khz, sizeof(khz));
++}
++SYSCTL_PROC(_kern_rosemary, OID_AUTO, mali_clk_khz, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, rm_sysctl_clk, "I",
++    "the Mali's clock in kHz, measured with its cycle counter");
++
+ /* ---- soft reset and core power: the same as rosemary_gpu.c's, which ran on the phone ---- */
+ 
+ static bool
