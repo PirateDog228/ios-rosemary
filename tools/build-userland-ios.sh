@@ -27,6 +27,10 @@ $CC -O2 -Wall -dynamiclib -install_name /usr/local/lib/libbbload.dylib "$here/us
 check_weak "$out/libbbload.dylib"
 sign "$out/libbbload.dylib"
 
+$CC -O2 -Wall -dynamiclib -install_name /usr/local/lib/libpbhook.dylib "$here/userland/src/pbhook.m" -o "$out/libpbhook.dylib" -framework Foundation -lobjc
+check_weak "$out/libpbhook.dylib"
+sign "$out/libpbhook.dylib"
+
 # empty injection test dylib: prints a line to the log when loaded into a process
 cat >"$out/inject_test.c" <<'EOT'
 #include <stdio.h>
