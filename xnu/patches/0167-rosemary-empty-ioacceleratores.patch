@@ -1,0 +1,47 @@
+Subject: rosemary-0167: empty IOAcceleratorES service (QuartzCore 30 s wait; SpringBoard/PosterBoard find no accelerator); rosemaryaccel=0 turns it off
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -128,6 +128,19 @@
+ 	void present(const uint8_t *rec);
+ };
+ 
++#if defined(ROSEMARY)
++/*
++ * 0167: an (empty) graphics accelerator service. QuartzCore (CAMetalContextCreate) and SpringBoard look for
++ * IOAcceleratorES / AGXAccelerator; QuartzCore polls for the former 300 times, 100 ms apart (30 s at every
++ * start of backboardd, SpringBoard, PosterBoard). One without MetalPluginName/MetalPluginClassName is found
++ * and then passed over by Metal. Idea from ios-topaz 0138. Boot-arg rosemaryaccel=0 turns it off.
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++#endif
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -213,6 +226,21 @@
+ 		setProperty("RedwoodWaitsForGPU", kOSBooleanTrue);
+ 	}
+ #endif
++#if defined(ROSEMARY)
++	int accelOn = 1;
++	PE_parse_boot_argn("rosemaryaccel", &accelOn, sizeof(accelOn));
++	if (accelOn != 0) {
++		IOAcceleratorES *accel = OSTypeAlloc(IOAcceleratorES);
++		if (accel != NULL && accel->init()) {
++			accel->setName("rosemary-gpu");
++			if (accel->attach(this)) {
++				accel->registerService();
++				IOLog("ROSEMARY: empty IOAcceleratorES published (QuartzCore waits no 30 s for it)\n");
++			}
++		}
++		OSSafeReleaseNULL(accel);
++	}
++#endif
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
