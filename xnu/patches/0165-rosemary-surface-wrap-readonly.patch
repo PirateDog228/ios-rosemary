@@ -1,0 +1,83 @@
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -45,6 +45,7 @@
+ 	/* ROSEMARY: a surface made around memory a client already has (selector 6): the pixels are that client's
+ 	 * pages (a descriptor of its address range, wired), and wrapOffset is where the first byte sits in its page */
+ 	bool                      wrapped;
++	bool                      wrapReadOnly; /* the client's pages are read-only to it (a picture shared from another process) */
+ 	uint32_t                  wrapOffset;
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -109,7 +109,7 @@
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(wrapped ? kIOMapDefaultCache : kIOMapWriteCombineCache);
++		kernelMap = memory->map(wrapped ? (kIOMapDefaultCache | (wrapReadOnly ? kIOMapReadOnly : 0)) : kIOMapWriteCombineCache);
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -781,6 +781,7 @@
+ 	} in;
+ 	static uint32_t logged;
+ 	static int enabled = -1;
++	IOReturn tries[3] = { 0, 0, 0 };
+ 	char name[32];
+ 	IOReturn ret;
+ 
+@@ -815,19 +816,44 @@
+ 	s->allocSize = in.size;
+ 	s->wrapOffset = (uint32_t)(in.address & (page_size - 1));
+ 	s->mapCache = kIOMapDefaultCache;
+-	s->memory = IOMemoryDescriptor::withAddressRange(in.address, in.size, kIODirectionInOut | kIOMemoryPersistent, fTask);
+-	if (s->memory == NULL) {
+-		ret = kIOReturnVMError;
+-	} else if (s->memory->prepare() != kIOReturnSuccess) {
++	/*
++	 * The pages of a picture CoreAnimation was sent by another process are read-only here (the first try, to
++	 * write them too, failed with a VM error: 0164). So: read and write, then read only (the surface is then
++	 * mapped read-only too), then read only without keeping the memory entry. `tries` says what each came to.
++	 */
++	{
++		static const struct { IOOptionBits options; bool readOnly; } passes[3] = {
++			{ kIODirectionInOut | kIOMemoryPersistent, false },
++			{ kIODirectionOut | kIOMemoryPersistent, true },
++			{ kIODirectionOut, true },
++		};
++
+ 		ret = kIOReturnVMError;
+-	} else {
+-		s->wrapped = true;              /* (so that free() completes what is prepared) */
+-		ret = sweet_surface_publish(s) ? kIOReturnSuccess : kIOReturnNoResources;
++		for (unsigned pass = 0; pass < 3 && ret != kIOReturnSuccess; pass++) {
++			s->memory = IOMemoryDescriptor::withAddressRange(in.address, in.size, passes[pass].options, fTask);
++			if (s->memory == NULL) {
++				tries[pass] = kIOReturnNoMemory;
++				continue;
++			}
++			tries[pass] = s->memory->prepare();
++			if (tries[pass] != kIOReturnSuccess) {
++				OSSafeReleaseNULL(s->memory);
++				continue;
++			}
++			s->wrapped = true;              /* (so that free() completes what is prepared) */
++			s->wrapReadOnly = passes[pass].readOnly;
++			if (s->wrapReadOnly) {
++				s->mapCache |= kIOMapReadOnly;
++			}
++			ret = sweet_surface_publish(s) ? kIOReturnSuccess : kIOReturnNoResources;
++			break;
++		}
+ 	}
+ 	proc_selfname(name, sizeof(name));
+ 	if (ret != kIOReturnSuccess || logged++ < 32) {
+-		IOLog("SWEET SURF: %s wrap %ux%u fmt 0x%x bpe %u bpr %u size %u at 0x%llx -> id %u 0x%x\n", name, in.width, in.height, in.pixelFormat,
+-		    in.bytesPerElement, in.bytesPerRow, in.size, in.address, s->id, ret);
++		IOLog("SWEET SURF: %s wrap %ux%u fmt 0x%x bpe %u bpr %u size %u at 0x%llx -> id %u 0x%x (tries: 0x%x 0x%x 0x%x)%s\n", name, in.width,
++		    in.height, in.pixelFormat, in.bytesPerElement, in.bytesPerRow, in.size, in.address, s->id, ret, tries[0], tries[1], tries[2],
++		    s->wrapReadOnly ? ", read-only" : "");
+ 	}
+ 	if (ret != kIOReturnSuccess) {
+ 		s->release();
