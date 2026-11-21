@@ -1,0 +1,36 @@
+Subject: rosemary-0173: read-only dump of the GPU clock registers (topckgen mux, APMIXEDSYS PLLs) to find what clock the Mali runs at; rosemarygpu_clk=0 leaves it out
+
+diff --git a/bsd/dev/rosemary_gpu.c b/bsd/dev/rosemary_gpu.c
+--- a/bsd/dev/rosemary_gpu.c
++++ b/bsd/dev/rosemary_gpu.c
+@@ -697,6 +697,30 @@
+ 	printf("ROSEMARY GPU: mode %d, mfg_sel=%u, AXI PROTECTEN=%08x PROTECTEN_1=%08x\n", mode,
+ 	    (rg_rd(topck, RG_CK_CFG_3) >> 16) & 3u, rg_rd(infra, RG_PROTECTEN), rg_rd(infra, RG_PROTECTEN_1));
+ 	rg_log_status(spm, "before");
++	{
++		/*
++		 * 0173 (read only): what clock the Mali runs from. mfg_sel (CLK_CFG_3 [17:16]) picks the mux input,
++		 * and the PLLs are in APMIXEDSYS (0x1000c000). The PLLs' CON1 has the divider in it: frequency =
++		 * 26 MHz * PCW[21:0] / 2^14 / 2^POSDIV[26:24]. Printed raw, four words a line (topckgen 0x40..0x7f, APMIXEDSYS 0x200..0x2ff), to find MFGPLL.
++		 * Boot-arg rosemarygpu_clk=0 leaves it out.
++		 */
++		int clk = 1;
++		PE_parse_boot_argn("rosemarygpu_clk", &clk, sizeof(clk));
++		if (clk != 0) {
++			vm_offset_t apmix = ml_io_map(0x1000c000u, RG_PAGE);
++
++			for (uint32_t off = 0x40; off < 0x80; off += 0x10) {
++				printf("ROSEMARY GPU: topck %03x: %08x %08x %08x %08x\n", off, rg_rd(topck, off), rg_rd(topck, off + 4),
++				    rg_rd(topck, off + 8), rg_rd(topck, off + 12));
++			}
++			if (apmix != 0) {
++				for (uint32_t off = 0x200; off < 0x300; off += 0x10) {
++					printf("ROSEMARY GPU: apmixed %03x: %08x %08x %08x %08x\n", off, rg_rd(apmix, off), rg_rd(apmix, off + 4),
++					    rg_rd(apmix, off + 8), rg_rd(apmix, off + 12));
++				}
++			}
++		}
++	}
+ 
+ 	if (mode >= 2 && !rg_all_on(spm)) {
+ 		for (int i = 0; i < 6; i++) {
