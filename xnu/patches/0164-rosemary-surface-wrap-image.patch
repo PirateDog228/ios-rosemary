@@ -1,0 +1,158 @@
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -42,6 +42,10 @@
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	/* ROSEMARY: a surface made around memory a client already has (selector 6): the pixels are that client's
++	 * pages (a descriptor of its address range, wired), and wrapOffset is where the first byte sits in its page */
++	bool                      wrapped;
++	uint32_t                  wrapOffset;
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -92,6 +92,9 @@
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (wrapped && memory != NULL) {
++		memory->complete();             /* (prepare() was done when the surface was made) */
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -106,7 +109,7 @@
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		kernelMap = memory->map(wrapped ? kIOMapDefaultCache : kIOMapWriteCombineCache);
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -424,6 +427,7 @@
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
++	IOReturn wrapImage(IOExternalMethodArguments *args);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -581,7 +585,12 @@
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ {
+ 	bzero(out, SWEET_SURFACE_RESULT_SIZE);
+-	put64(out, 0x00, ref->data->getAddress());
++	uint64_t base = ref->data->getAddress();
++
++	if (s->wrapped && (base & (page_size - 1)) != s->wrapOffset) {
++		base = (base & ~(uint64_t)(page_size - 1)) + s->wrapOffset;     /* (the client's own first byte) */
++	}
++	put64(out, 0x00, base);
+ 	put64(out, 0x08, ref->state->getAddress());
+ 	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
+ 	put32(out, 0x18, s->id);
+@@ -754,6 +763,81 @@
+ 	return ret;
+ }
+ 
++/*
++ * Selector 6: a surface made of memory the caller already has (CoreAnimation in the window server gets a picture
++ * from another process as plain memory and wraps it for OpenGL). What the call is given (seen in the log of 0163):
++ * the address in the caller's task, then width, height, pixel format, bytes an element, bytes a row and the size
++ * in bytes of what is there (not rounded up to a page; the address need not be at the start of one).
++ * The answer is the same description a create gives. Nothing is copied: the surface is the caller's pages, kept
++ * (kIOMemoryPersistent) and wired for as long as the surface lives, and the base address the library is told
++ * is the caller's own. Not offered to the Mali (RosemaryMali.cpp surfaceBuffer): its size is not pages.
++ */
++IOReturn
++IOSurfaceRootUserClient::wrapImage(IOExternalMethodArguments *args)
++{
++	struct {
++		uint64_t address;
++		uint32_t width, height, pixelFormat, bytesPerElement, bytesPerRow, size;
++	} in;
++	static uint32_t logged;
++	static int enabled = -1;
++	char name[32];
++	IOReturn ret;
++
++	if (enabled < 0) {
++		int value = 1;
++
++		PE_parse_boot_argn("surfwrap", &value, sizeof(value));   /* surfwrap=0: refuse the call, as before 0164 */
++		enabled = value != 0;
++	}
++	if (!enabled) {
++		return kIOReturnUnsupported;
++	}
++	if (args->structureInput == NULL || args->structureInputSize != sizeof(in) || args->structureOutputSize < SWEET_SURFACE_RESULT_SIZE) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(&in, args->structureInput, sizeof(in));
++	if (in.address == 0 || in.width == 0 || in.height == 0 || in.width > SWEET_SURFACE_MAX_DIM || in.height > SWEET_SURFACE_MAX_DIM ||
++	    in.bytesPerElement == 0 || in.bytesPerElement > 64 || in.bytesPerRow < (uint64_t)in.width * in.bytesPerElement ||
++	    in.size < (uint64_t)in.bytesPerRow * (in.height - 1) + (uint64_t)in.width * in.bytesPerElement || in.size > SWEET_SURFACE_MAX_ALLOC) {
++		return kIOReturnBadArgument;
++	}
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		return kIOReturnNoMemory;
++	}
++	s->width = in.width;
++	s->height = in.height;
++	s->bytesPerRow = in.bytesPerRow;
++	s->bytesPerElement = (uint16_t)in.bytesPerElement;
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = in.pixelFormat;
++	s->allocSize = in.size;
++	s->wrapOffset = (uint32_t)(in.address & (page_size - 1));
++	s->mapCache = kIOMapDefaultCache;
++	s->memory = IOMemoryDescriptor::withAddressRange(in.address, in.size, kIODirectionInOut | kIOMemoryPersistent, fTask);
++	if (s->memory == NULL) {
++		ret = kIOReturnVMError;
++	} else if (s->memory->prepare() != kIOReturnSuccess) {
++		ret = kIOReturnVMError;
++	} else {
++		s->wrapped = true;              /* (so that free() completes what is prepared) */
++		ret = sweet_surface_publish(s) ? kIOReturnSuccess : kIOReturnNoResources;
++	}
++	proc_selfname(name, sizeof(name));
++	if (ret != kIOReturnSuccess || logged++ < 32) {
++		IOLog("SWEET SURF: %s wrap %ux%u fmt 0x%x bpe %u bpr %u size %u at 0x%llx -> id %u 0x%x\n", name, in.width, in.height, in.pixelFormat,
++		    in.bytesPerElement, in.bytesPerRow, in.size, in.address, s->id, ret);
++	}
++	if (ret != kIOReturnSuccess) {
++		s->release();
++		return ret;
++	}
++	ret = returnSurface(s, args);           /* takes the creator's user count */
++	s->release();
++	return ret;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -863,6 +947,7 @@
+ 		return ret;
+ 	}
+ 	case kSweetSurfaceWrapClientImage:
++		return wrapImage(args);
+ 	case kSweetSurfaceWrapClientMemory: {
+ 		/*
+ 		 * Making a surface of memory a client already has. Nothing here does that: a "success" with an
+--- a/iokit/Kernel/arm/RosemaryMali.cpp
++++ b/iokit/Kernel/arm/RosemaryMali.cpp
+@@ -504,7 +504,8 @@
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
+-	if (s->memory == NULL) {
++	if (s->memory == NULL || s->wrapped) {
++		/* (a surface that is a client's own pages, not a buffer of ours: not whole pages, and not at the start of one) */
+ 		s->release();
+ 		return kIOReturnUnsupported;
+ 	}
