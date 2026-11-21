@@ -18,6 +18,7 @@
 #import <stdarg.h>
 #import <execinfo.h>
 #import <stdio.h>
+#import <alloca.h>
 #import <string.h>
 
 static void say(const char *fmt, ...)
@@ -64,6 +65,50 @@ static void my_throw(id exception)
 __attribute__((used)) static struct { const void *replacement, *replacee; } interposers[]
 	__attribute__((section("__DATA,__interpose"))) = { { (const void *)my_throw, (const void *)objc_exception_throw } };
 
+/* ---- +[NSDictionary dictionaryWithObjects:forKeys:count:] with a nil object ---- */
+static id (*orig_dwo)(id, SEL, const id *, const id *, NSUInteger);
+static int nil_logged;
+
+static id my_dwo(id self, SEL _cmd, const id *objects, const id *keys, NSUInteger count)
+{
+	NSUInteger i, bad = 0;
+
+	for (i = 0; i < count; i++) {
+		if (objects[i] == nil) bad++;
+	}
+	if (bad) {
+		if (nil_logged++ < 20) {
+			void *bt[10];
+			int n = backtrace(bt, 10);
+
+			for (i = 0; i < count; i++) {
+				if (objects[i] == nil) {
+					say("NIL OBJECT at index %lu of %lu, key: %s", (unsigned long)i, (unsigned long)count,
+					    keys[i] ? [[keys[i] description] UTF8String] : "(nil)");
+				}
+			}
+			for (int k = 0; k < n; k++) {
+				Dl_info d;
+				if (dladdr(bt[k], &d) && d.dli_fname) {
+					say("   #%d %s + %lu (%s)", k, d.dli_sname ? d.dli_sname : "?",
+					    (unsigned long)((char *)bt[k] - (char *)(d.dli_saddr ? d.dli_saddr : d.dli_fbase)), d.dli_fname);
+				}
+			}
+		}
+		if (catch_mode) {   /* leave the pairs with a nil object out */
+			id *o = (id *)alloca(count * sizeof(id));
+			id *kk = (id *)alloca(count * sizeof(id));
+			NSUInteger m = 0;
+
+			for (i = 0; i < count; i++) {
+				if (objects[i] != nil) { o[m] = objects[i]; kk[m] = keys[i]; m++; }
+			}
+			return orig_dwo(self, _cmd, o, kk, m);
+		}
+	}
+	return orig_dwo(self, _cmd, objects, keys, count);
+}
+
 /* ---- _imageForView: ---- */
 static id (*orig_imageForView)(id, SEL, id);
 
@@ -77,7 +122,7 @@ static id my_imageForView(id self, SEL _cmd, id view)
 		@try {
 			result = orig_imageForView(self, _cmd, view);
 		} @catch (id e) {
-			say("_imageForView: caught the exception, answering with an empty image");
+			say("_imageForView: caught %s: %s, answering with an empty image", [[e name] UTF8String], [[e reason] UTF8String]);
 			Class img = objc_getClass("UIImage");
 			result = img ? ((id (*)(id, SEL))objc_msgSend)((id)img, sel_registerName("new")) : nil;
 		}
@@ -143,6 +188,15 @@ __attribute__((constructor)) static void init(void)
 	}
 	say("loaded (catch %d)", catch_mode);
 	metal_report();
+	{
+		Method m = class_getClassMethod(objc_getClass("NSDictionary"), sel_registerName("dictionaryWithObjects:forKeys:count:"));
+
+		if (m) {
+			orig_dwo = (id (*)(id, SEL, const id *, const id *, NSUInteger))method_getImplementation(m);
+			method_setImplementation(m, (IMP)my_dwo);
+			say("hooked +[NSDictionary dictionaryWithObjects:forKeys:count:]");
+		}
+	}
 	_dyld_register_func_for_add_image(image_added);   /* (also called for the images already there) */
 	try_swizzle();
 }
