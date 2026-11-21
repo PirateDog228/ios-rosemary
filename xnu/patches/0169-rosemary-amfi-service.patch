@@ -1,0 +1,149 @@
+Subject: rosemary-0169: AppleMobileFileIntegrity IOService + user client (every cdhash trusted): ExtensionKit reads the signed extension cache, extension points (poster extensions) come back; rosemaryamfi=0 turns it off
+
+diff --git a/iokit/Kernel/arm/SweetAMFIService.cpp b/iokit/Kernel/arm/SweetAMFIService.cpp
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAMFIService.cpp
+@@ -0,0 +1,114 @@
++/*
++ * 0169: an IOService named AppleMobileFileIntegrity, as the AMFI kext publishes on a device (ios-topaz 0151).
++ * ExtensionKit reads the signed extension cache (/System/Library/xpc/extensions.plist,
++ * +[NSDictionary _EX_dictionaryWithSignedURL:error:]) only after asking AMFI's user client whether the
++ * signature's cdhash is in the trust cache: IOServiceGetMatchingService("AppleMobileFileIntegrity"),
++ * IOServiceOpen type 0, IOConnectCallMethod selector 6 with one scalar and the cdhash. Without the service:
++ * "Unable to find AMFI", no extension point in LaunchServices, PlugInKit -10814 for every extension point
++ * (no wallpapers, widgets, file providers). This kernel enforces no code signatures (sweet_amfi.c), so
++ * every hash is trusted: every call succeeds. Each selector is logged the first time.
++ * Boot-arg rosemaryamfi=0 does not publish it.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ROSEMARY) || defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>
++
++class AppleMobileFileIntegrity : public IOService
++{
++	OSDeclareDefaultStructors(AppleMobileFileIntegrity);
++public:
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++class AppleMobileFileIntegrityUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(AppleMobileFileIntegrityUserClient);
++public:
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrity, IOService);
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrityUserClient, IOUserClient);
++
++IOReturn
++AppleMobileFileIntegrity::newUserClient(task_t owningTask, void *securityID __unused, UInt32 type __unused,
++    IOUserClient **handler)
++{
++	AppleMobileFileIntegrityUserClient *client = OSTypeAlloc(AppleMobileFileIntegrityUserClient);
++
++	if (client == NULL || !client->initWithTask(owningTask, NULL, 0) || !client->attach(this) || !client->start(this)) {
++		if (client != NULL) {
++			client->detach(this);
++			client->release();
++		}
++		return kIOReturnNoMemory;
++	}
++	*handler = client;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleMobileFileIntegrityUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *dispatch __unused, OSObject *target __unused, void *reference __unused)
++{
++	static uint64_t seen;
++
++	if (selector < 64 && !(seen & (1ULL << selector))) {
++		char name[32];
++
++		seen |= 1ULL << selector;
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AMFI: user client selector %u from %s (%u scalars, %u bytes in): trusted\n", selector, name,
++		    args->scalarInputCount, args->structureInputSize);
++	}
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleMobileFileIntegrityUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++extern "C" void
++sweet_amfi_service_init(void)
++{
++	static bool done;
++	AppleMobileFileIntegrity *amfi;
++	int on = 1;
++
++	if (done) {
++		return;
++	}
++	done = true;
++	PE_parse_boot_argn("rosemaryamfi", &on, sizeof(on));
++	if (on == 0) {
++		return;
++	}
++	amfi = OSTypeAlloc(AppleMobileFileIntegrity);
++	if (amfi == NULL || !amfi->init() || !amfi->attach(IOService::getServiceRoot())) {
++		IOLog("SWEET AMFI: no AppleMobileFileIntegrity service\n");
++		OSSafeReleaseNULL(amfi);
++		return;
++	}
++	amfi->registerService();
++	IOLog("SWEET AMFI: AppleMobileFileIntegrity service published\n");
++}
++
++#else
++extern "C" void sweet_amfi_service_init(void) {}
++#endif
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -141,6 +141,7 @@
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ #endif
++extern "C" void sweet_amfi_service_init(void);   /* iokit/Kernel/arm/SweetAMFIService.cpp (0169) */
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -227,6 +228,7 @@
+ 	}
+ #endif
+ #if defined(ROSEMARY)
++	sweet_amfi_service_init();
+ 	int accelOn = 1;
+ 	PE_parse_boot_argn("rosemaryaccel", &accelOn, sizeof(accelOn));
+ 	if (accelOn != 0) {
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -1,5 +1,6 @@
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
++iokit/Kernel/arm/SweetAMFIService.cpp                            optional iokitcpp
+ iokit/Kernel/arm/RosemaryUSBHost.cpp                              optional iokitcpp
+ iokit/Kernel/arm/RosemaryMali.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
