@@ -1,6 +1,8 @@
 Subject: rosemary-0169: AppleMobileFileIntegrity IOService + user client (every cdhash trusted): ExtensionKit reads the signed extension cache, extension points (poster extensions) come back; rosemaryamfi=0 turns it off
 
 diff --git a/iokit/Kernel/arm/SweetAMFIService.cpp b/iokit/Kernel/arm/SweetAMFIService.cpp
+new file mode 100644
+index 0000000..1111111
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAMFIService.cpp
 @@ -0,0 +1,114 @@
@@ -140,10 +142,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -1,5 +1,6 @@
- iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
- iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
-+iokit/Kernel/arm/SweetAMFIService.cpp                            optional iokitcpp
- iokit/Kernel/arm/RosemaryUSBHost.cpp                              optional iokitcpp
+@@ -6,2 +6,3 @@
  iokit/Kernel/arm/RosemaryMali.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetAMFIService.cpp                            optional iokitcpp
  iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
