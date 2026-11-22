@@ -1,0 +1,120 @@
+diff --git a/bsd/dev/rosemary_battery.c b/bsd/dev/rosemary_battery.c
+index d0d9dd0..48481cc 100644
+--- a/bsd/dev/rosemary_battery.c
++++ b/bsd/dev/rosemary_battery.c
+@@ -19,8 +19,9 @@
+  *
+  * Nothing else is written, and nothing is written unless the chip answers on 0x34.
+  *
+- * Boot-args: rosebatt=0 off; rosebattdelay=<s> start delay (default 25); rosebattsec=<s> poll
+- * period (default 10); rosebattlsb=<uV per step> (default 1250); rosebattlog=1 log every sample.
++ * Boot-args: rosebatt=0 off; rosebattdelay=<s> start delay (default 25); rosebattsec=<s> period of the
++ * voltage reading (default 10; the charger is looked at every second); rosebattfull=<mV> the voltage from
++ * which the charger saying "done" means a full battery (default 4430); rosebattlsb=<uV per step> (default 1250); rosebattlog=1 log every sample.
+  * Log lines start with "ROSEMARY BATT:".
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET) && defined(ROSEMARY)
+@@ -383,14 +384,18 @@ dump_once(void)
+ static void
+ battery_thread(void *arg, wait_result_t result)
+ {
+-	int delay_s = 25, period_s = 10, lsb = 1250, logall = 0, samples = 0;
+-	unsigned last_mv = 0, last_flags = ~0u;
++	int delay_s = 25, period_s = 10, lsb = 1250, logall = 0, samples = 0, full_mv = 4430;
++	unsigned last_mv = 0, last_flags = ~0u, cur_mv = 0;
+ 	uint8_t id = 0;
+ 
+ 	(void)PE_parse_boot_argn("rosebattdelay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("rosebattsec", &period_s, sizeof(period_s));
+ 	(void)PE_parse_boot_argn("rosebattlsb", &lsb, sizeof(lsb));
+ 	(void)PE_parse_boot_argn("rosebattlog", &logall, sizeof(logall));
++	(void)PE_parse_boot_argn("rosebattfull", &full_mv, sizeof(full_mv));
++	if (period_s < 1) {
++		period_s = 1;
++	}
+ 	sleep_ms((uint32_t)delay_s * 1000u);
+ 	gpio = ml_io_map(GPIO_PA, 0x1000);
+ 	if (!gpio) {
+@@ -406,21 +411,26 @@ battery_thread(void *arg, wait_result_t result)
+ 	printf("ROSEMARY BATT: MT6360 answers, reg 0 = %#x\n", id);
+ 	dump_once();
+ 	bus_release();
+-	for (;;) {
++	for (unsigned tick = 0;; tick++) {
+ 		uint8_t chg = 0, fod = 0, usb = 0;
+-		int raw;
+-		unsigned mv, flags = 0;
++		unsigned flags = 0;
+ 
++		/* the state of the charger every second (three short reads), the voltage every period_s */
+ 		bus_claim();
+ 		if (rd(R_CHG_STAT, &chg) || rd(R_FOD_STAT, &fod) || rd(R_USB_STATUS1, &usb)) {
+ 			bus_release();
+ 			st_valid = 0;
+-			sleep_ms((uint32_t)period_s * 1000u);
++			sleep_ms(1000);
+ 			continue;
+ 		}
+-		raw = adc_read(CH_VBAT);
++		if (cur_mv == 0 || tick % (unsigned)period_s == 0) {
++			int raw = adc_read(CH_VBAT);
++
++			if (raw > 0) {
++				cur_mv = (unsigned)((uint64_t)raw * (uint64_t)lsb / 1000u);
++			}
++		}
+ 		bus_release();
+-		mv = raw > 0 ? (unsigned)((uint64_t)raw * (uint64_t)lsb / 1000u) : 0;
+ 		if (fod & 0x10) {
+ 			flags |= BATT_EXTERNAL;
+ 			switch ((chg >> 6) & 3) {
+@@ -428,24 +438,28 @@ battery_thread(void *arg, wait_result_t result)
+ 				flags |= BATT_CHARGING;
+ 				break;
+ 			case 2:
+-				flags |= BATT_FULL;
++				/* "done" is the charger's own end of charge, at its own voltage (4.35 V when nobody
++				 * has set it higher; the cell takes 4.45 V): full only when the cell is. */
++				if (cur_mv >= (unsigned)full_mv) {
++					flags |= BATT_FULL;
++				}
+ 				break;
+ 			case 3:
+ 				flags |= BATT_FAULT;
+ 				break;
+ 			}
+ 		}
+-		st_mv = mv;
++		st_mv = cur_mv;
+ 		st_flags = flags;
+-		st_valid = mv != 0;
+-		if (logall || samples < 3 || flags != last_flags || (mv > last_mv + 50 || mv + 50 < last_mv)) {
+-			printf("ROSEMARY BATT: chg_stat %#x fod_stat %#x usb_status %#x vbat raw %d = %u mV flags %#x\n",
+-			    chg, fod, usb, raw, mv, flags);
+-			last_mv = mv;
++		st_valid = cur_mv != 0;
++		if (logall || samples < 3 || flags != last_flags || (cur_mv > last_mv + 50 || cur_mv + 50 < last_mv)) {
++			printf("ROSEMARY BATT: chg_stat %#x fod_stat %#x usb_status %#x vbat %u mV flags %#x\n",
++			    chg, fod, usb, cur_mv, flags);
++			last_mv = cur_mv;
+ 			last_flags = flags;
+ 		}
+ 		samples++;
+-		sleep_ms((uint32_t)period_s * 1000u);
++		sleep_ms(1000);
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index f972c25..163d684 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -20,7 +20,7 @@ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern "C" int rosemary_battery_start(void);
+ extern "C" int rosemary_battery_get(unsigned *mv, unsigned *flags);
+ #define SWEET_BATT_MAH 5000
+-#define SWEET_BATT_POLL_MS 10000
++#define SWEET_BATT_POLL_MS 2000
+ #else
+ #define SWEET_BATT_MAH 5020
+ #define SWEET_BATT_POLL_MS 30000
