@@ -396,6 +396,8 @@ struct image {
 	bool painted;                   /* something has been drawn into it (it is a target in fact, not only in name) */
 	unsigned looked;                /* ... the frame in which that memory was last looked at, */
 	uint64_t sum;                   /* ... and what it added up to */
+	uint64_t quick;                 /* ... what one word of every 256 bytes of it added up to, */
+	unsigned full_next;             /* ... and the frame from which the whole of it is added up again */
 	GLenum to, internal, format, type;
 	uint32_t plane, seed;
 	GLsizei width, height;
@@ -824,6 +826,65 @@ surface_shared(struct eagl *e, struct image *image)
  * a frame, when the texture is about to be drawn with, the memory is added up, and copied again
  * if the sum has changed.
  */
+#define SUM_MUL         0x9e3779b97f4a7c15ull
+static unsigned sum_every = 16;                 /* boot-arg glsum_every=N: the whole surface every N frames (0: every frame) */
+
+/* The whole of the memory: four sums side by side (one after the other the multiplications wait for each other), and
+ * `*sampled`, what sample_sum() would give. */
+static uint64_t
+add_up(const uint8_t *base, size_t size, uint64_t *sampled)
+{
+	uint64_t s[4] = { size, size ^ 0x1111, size ^ 0x2222, size ^ 0x3333 }, q = size, w[4];
+	size_t at = 0;
+
+	for (; at + 32 <= size; at += 32) {
+		memcpy(w, base + at, 32);
+		for (int k = 0; k < 4; k++) {
+			s[k] = (s[k] ^ w[k]) * SUM_MUL;
+			s[k] ^= s[k] >> 29;
+		}
+		if ((at & 255) == 0) {
+			q = (q ^ w[0]) * SUM_MUL;
+			q ^= q >> 29;
+		}
+	}
+	for (; at + 8 <= size; at += 8) {
+		memcpy(&w[0], base + at, 8);
+		s[0] = (s[0] ^ w[0]) * SUM_MUL;
+		s[0] ^= s[0] >> 29;
+		if ((at & 255) == 0) {
+			q = (q ^ w[0]) * SUM_MUL;
+			q ^= q >> 29;
+		}
+	}
+	*sampled = q;
+	return ((s[0] * 31 + s[1]) * 31 + s[2]) * 31 + s[3];
+}
+
+/* One word of every 256 bytes: a seventh of the cost, most of what a picture that is drawn on changes. */
+static uint64_t
+sample_sum(const uint8_t *base, size_t size)
+{
+	uint64_t q = size, w;
+
+	for (size_t at = 0; at + 8 <= size; at += 256) {
+		memcpy(&w, base + at, 8);
+		q = (q ^ w) * SUM_MUL;
+		q ^= q >> 29;
+	}
+	return q;
+}
+
+/*
+ * A surface that is shown goes on being drawn into after the texture has been made of it -- a
+ * sign an application draws for one of its layers, a picture CoreAnimation has made a surface
+ * around -- and not everybody who draws says so: often no seed moves, and the texture is not
+ * made again. A GPU that has the memory itself shows what is there. A copy has to notice: once
+ * a frame, when the texture is about to be drawn with, the memory is looked at, and copied again
+ * if it has changed. Adding up the whole of a window's surface (10 MB) cost a third of the
+ * window server's time, so most frames only a sample of it is added up, and the whole of it
+ * every glsum_every frames (a change the sample misses is a few frames late).
+ */
 static bool
 surface_changed(struct eagl *e, struct image *image)
 {
@@ -831,17 +892,18 @@ surface_changed(struct eagl *e, struct image *image)
 	size_t size = IOSurfaceGetBytesPerRow(surface) * (size_t)(image->height - 1) +
 	    (size_t)image->width * bytes_a_pixel(image->format, image->type);
 	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
-	uint64_t sum = size, word;
+	uint64_t sum, quick;
 
 	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
 		return false;
 	}
 	image->looked = e->frames + 1;
-	for (size_t at = 0; at + 8 <= size; at += 8) {
-		memcpy(&word, base + at, 8);
-		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
-		sum ^= sum >> 29;
+	if (sum_every != 0 && (int)(e->frames + 1 - image->full_next) < 0 && sample_sum(base, size) == image->quick) {
+		return false;
 	}
+	sum = add_up(base, size, &quick);
+	image->quick = quick;
+	image->full_next = e->frames + 1 + sum_every;
 	if (sum == image->sum) {
 		return false;
 	}
@@ -4344,6 +4406,9 @@ install(void)
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		prof_on = strstr(arguments, "glprof=1") != NULL;
+		if ((argument = strstr(arguments, "glsum_every=")) != NULL) {
+			sum_every = (unsigned)strtoul(argument + 12, NULL, 10);
+		}
 		up_swap = strstr(arguments, "glup_swap=1") != NULL;
 		up_opaque = strstr(arguments, "glup_opaque=1") != NULL;
 		up_always = strstr(arguments, "glup_always=1") != NULL;
