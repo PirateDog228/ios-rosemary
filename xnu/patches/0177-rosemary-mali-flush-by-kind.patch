@@ -1,0 +1,78 @@
+diff --git a/bsd/dev/rosemary_mali.c b/bsd/dev/rosemary_mali.c
+index 888cdbd..e0958e0 100644
+--- a/bsd/dev/rosemary_mali.c
++++ b/bsd/dev/rosemary_mali.c
+@@ -172,9 +172,20 @@ rosemary_mali_account_skip(uint64_t bytes)
+ 	rm_skip_bytes += bytes;
+ }
+ 
++/* by whose call: 0 a new buffer / a wait, 1 a buffer named by a job, 2 a surface named by a job */
++static uint64_t rm_kind_ns[3], rm_kind_bytes[3], rm_kind_calls[3];
++SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_flush_other_ns, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_kind_ns[0], "cleaning for new buffers and waits, ns");
++SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_flush_other_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_kind_bytes[0], "bytes");
++SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_flush_bo_ns, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_kind_ns[1], "cleaning of buffers named by jobs, ns");
++SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_flush_bo_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_kind_bytes[1], "bytes");
++SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_flush_bo_calls, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_kind_calls[1], "calls");
++SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_flush_surf_ns, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_kind_ns[2], "cleaning of surfaces named by jobs, ns");
++SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_flush_surf_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_kind_bytes[2], "bytes");
++SYSCTL_QUAD(_kern_rosemary, OID_AUTO, mali_flush_surf_calls, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_kind_calls[2], "calls");
++
+ /* RosemaryMali.cpp: a cache cleaning of `bytes` that took `ticks` of the clock */
+ void
+-rosemary_mali_account_flush(uint64_t ticks, uint64_t bytes)
++rosemary_mali_account_flush(uint64_t ticks, uint64_t bytes, int kind)
+ {
+ 	uint64_t ns;
+ 
+@@ -182,6 +193,11 @@ rosemary_mali_account_flush(uint64_t ticks, uint64_t bytes)
+ 	rm_flush_ns += ns;
+ 	rm_flush_bytes += bytes;
+ 	rm_flush_calls++;
++	if (kind >= 0 && kind < 3) {
++		rm_kind_ns[kind] += ns;
++		rm_kind_bytes[kind] += bytes;
++		rm_kind_calls[kind]++;
++	}
+ }
+ 
+ SYSCTL_UINT(_kern_rosemary, OID_AUTO, mali_failed, CTLFLAG_RD | CTLFLAG_LOCKED, &rm_jobs_failed, 0, "jobs that did not");
+diff --git a/iokit/Kernel/arm/RosemaryMali.cpp b/iokit/Kernel/arm/RosemaryMali.cpp
+index 882dec4..4172523 100644
+--- a/iokit/Kernel/arm/RosemaryMali.cpp
++++ b/iokit/Kernel/arm/RosemaryMali.cpp
+@@ -39,7 +39,7 @@
+ extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);            /* osfmk/arm64/caches_asm.s */
+ extern "C" void rosemary_mali_account_skip(uint64_t bytes);
+ extern "C" uint64_t mach_absolute_time(void);
+-extern "C" void rosemary_mali_account_flush(uint64_t ticks, uint64_t bytes);       /* bsd/dev/rosemary_mali.c */
++extern "C" void rosemary_mali_account_flush(uint64_t ticks, uint64_t bytes, int kind);       /* bsd/dev/rosemary_mali.c */
+ 
+ /*
+  * What a job needs cleaned from the processor's cache, made when it is submitted and done by the worker thread
+@@ -65,7 +65,7 @@ struct mali_flush_list {
+  * (sysctl kern.rosemary.mali_flush_*). Boot-arg malinoflush=1: not at all, to see what it costs.
+  */
+ static void
+-mali_flush(uintptr_t va, size_t length)
++mali_flush(uintptr_t va, size_t length, int kind = 0)
+ {
+ 	static int noflush = -1;
+ 	uint64_t t0;
+@@ -79,7 +79,7 @@ mali_flush(uintptr_t va, size_t length)
+ 	}
+ 	t0 = mach_absolute_time();
+ 	FlushPoC_DcacheRegion((vm_offset_t) va, length);
+-	rosemary_mali_account_flush(mach_absolute_time() - t0, length);
++	rosemary_mali_account_flush(mach_absolute_time() - t0, length, kind);
+ }
+ 
+ static void
+@@ -103,7 +103,7 @@ mali_flush_run(void * argument)
+ 		if (stamp != NULL) {
+ 			*stamp = mach_absolute_time();
+ 		}
+-		mali_flush(list->items[i].va, list->items[i].length);
++		mali_flush(list->items[i].va, list->items[i].length, stamp != NULL ? 1 : 2);
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");       /* the write buffers out before the GPU looks */
+ 	IOFreeData(list, list->allocated);
