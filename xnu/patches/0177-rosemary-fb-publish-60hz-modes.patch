@@ -6,26 +6,46 @@ fall back to a guessed frame clock around 20 Hz even while the panel VSync runs
 at 60 Hz. Publish one 60 Hz mode using the same logical dimensions already
 reported by GetDisplaySize (0061).
 
-Ported from ios-topaz 0948, adapted to Rosemary's patch series.
+Ported from ios-topaz 0948, adapted to Rosemary's framebuffer implementation.
 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -50,1 +50,5 @@
- #include <sys/proc.h>
+@@ -35,5 +35,9 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
 +#include <libkern/c++/OSArray.h>
 +#include <libkern/c++/OSBoolean.h>
 +#include <libkern/c++/OSDictionary.h>
 +#include <libkern/c++/OSNumber.h>
-@@ -62,1 +66,2 @@
+ #include <IOKit/IOLocks.h>
+@@ -55,5 +60,6 @@
+ 	kSweetFBGetDisplaySize          = 8,
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
  	kSweetFBNotifications           = 72,
 +	kSweetFBGetBlock                = 79,
-@@ -122,1 +127,2 @@
+ };
+@@ -118,5 +123,6 @@
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
  	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
 +	void publishModes(void);
-@@ -196,1 +202,2 @@
+ };
+@@ -193,4 +199,5 @@
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
 +	publishModes();
-@@ -619,1 +626,12 @@
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -415,5 +422,16 @@
+ 	case kSweetFBGetDotPitch:
+ 		out[0] = SWEET_FB_DOT_PITCH;
+ 		outCount = 1;
+ 		break;
 +	case kSweetFBGetBlock:
 +		/* Block 0x40: colour and timing IDs from publishModes(). */
 +		if (args->structureOutput != NULL && args->structureOutputDescriptor == NULL) {
@@ -38,7 +58,9 @@ Ported from ios-topaz 0948, adapted to Rosemary's patch series.
 +		}
 +		break;
  	case kSweetFBNotifications:
-@@ -668,1 +686,64 @@
+@@ -665,3 +683,66 @@
+ 	return ret;
+ }
 +#define SWEET_FB_TIMING_ID      1
 +#define SWEET_FB_COLOR_ID       1
 +
