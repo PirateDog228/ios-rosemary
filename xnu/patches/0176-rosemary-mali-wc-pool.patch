@@ -1,0 +1,214 @@
+diff --git a/iokit/Kernel/arm/RosemaryMali.cpp b/iokit/Kernel/arm/RosemaryMali.cpp
+index 7cad0a4..882dec4 100644
+--- a/iokit/Kernel/arm/RosemaryMali.cpp
++++ b/iokit/Kernel/arm/RosemaryMali.cpp
+@@ -224,8 +224,150 @@ struct mali_buffer {
+ 	bool mapped;                            /* a program has mapped it: only then can the processor's cache hold a line of it
+ 	                                         * the GPU has not seen (the Mali's own tiler heap, scratch and the like never are) */
+ 	uint32_t flushed_seed;                  /* a surface: its seed when its cache lines were last cleaned */
++	bool pool;                              /* from the write-combined pool: the cache never holds it, nothing is cleaned */
++	uint64_t pool_pa;                       /* where in the pool (physical), when `pool` */
+ };
+ 
++/*
++ * The GPU pool: physical RAM the kernel does not manage (outside the window the loader gives XNU), mapped
++ * write-combined, so that no cache holds what the programs and the GPU share and nothing is cleaned around
++ * jobs. (Kernel pages cannot be made write-combined: phystokv_range panics. Memory the kernel does not own
++ * can.) Boot-args: rosemary_gpupool_mb=N turns it on (default off), rosemary_gpupool_pa=ADDR (default
++ * 0xc0000000). Buffers that do not fit stay ordinary ones.
++ */
++#define POOL_UNIT               4096ull
++#define POOL_MB_MAX             512u
++
++static const struct { uint64_t start, end; } kPoolAllowed[] = {
++	/* RAM below the window of XNU (0x100000000), minus what the stock firmware reserves (TWRP's
++	 * reserved-memory of rosemary: ATF, pstore, TEE, the loader's framebuffer, SSPM, logs, PICACHU) */
++	{ 0x80000000ull, 0xbfc00000ull },
++	{ 0xc0000000ull, 0xffd00000ull },
++};
++
++static uint64_t gPoolPA, gPoolSize;
++static uintptr_t gPoolKVA;
++static uint32_t * gPoolBits;                    /* one bit for each POOL_UNIT: 1 = taken */
++static uint64_t gPoolUnits, gPoolUsed;
++static IOMemoryMap * gPoolMap;
++static int gPoolState;                          /* 0 not tried, 1 there, -1 not */
++
++static bool
++pool_allowed(uint64_t pa, uint64_t size)
++{
++	for (unsigned i = 0; i < sizeof(kPoolAllowed) / sizeof(kPoolAllowed[0]); i++) {
++		if (pa >= kPoolAllowed[i].start && pa + size <= kPoolAllowed[i].end) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* With the lock held (or before there are clients). */
++static bool
++pool_init(void)
++{
++	uint32_t mb = 0;
++	uint64_t pa = 0xc0000000ull;
++	IOMemoryDescriptor * md;
++
++	if (gPoolState != 0) {
++		return gPoolState > 0;
++	}
++	gPoolState = -1;
++	if (!PE_parse_boot_argn("rosemary_gpupool_mb", &mb, sizeof(mb)) || mb == 0) {
++		return false;
++	}
++	(void)PE_parse_boot_argn("rosemary_gpupool_pa", &pa, sizeof(pa));
++	if (mb > POOL_MB_MAX || (pa & 0xfffff) != 0 || !pool_allowed(pa, (uint64_t) mb << 20)) {
++		IOLog("RedwoodMali: GPU pool %#llx + %u MB refused (not 1 MB aligned, or on reserved/XNU memory)\n", pa, mb);
++		return false;
++	}
++	/* the cache mode goes into the descriptor: for RAM the kernel does not manage the default is Device memory */
++	md = IOMemoryDescriptor::withAddressRange(pa, (uint64_t) mb << 20,
++	    kIODirectionInOut | (kIOWriteCombineCache << kIOMemoryBufferCacheShift), TASK_NULL);
++	if (md == NULL) {
++		IOLog("RedwoodMali: GPU pool: no descriptor\n");
++		return false;
++	}
++	gPoolMap = md->map(kIOMapWriteCombineCache);
++	md->release();                                  /* the map holds it */
++	if (gPoolMap == NULL) {
++		IOLog("RedwoodMali: GPU pool: cannot be mapped\n");
++		return false;
++	}
++	gPoolKVA = (uintptr_t) gPoolMap->getVirtualAddress();
++	gPoolSize = (uint64_t) mb << 20;
++	gPoolPA = pa;
++	gPoolUnits = gPoolSize / POOL_UNIT;
++	gPoolBits = IONewZero(uint32_t, gPoolUnits / 32);
++	if (gPoolBits == NULL) {
++		OSSafeReleaseNULL(gPoolMap);
++		return false;
++	}
++	/* a test: the memory is there, takes what is written and gives it back, at both ends */
++	{
++		volatile uint32_t * lo = (volatile uint32_t *) gPoolKVA;
++		volatile uint32_t * hi = (volatile uint32_t *) (gPoolKVA + gPoolSize - 4);
++		bool ok;
++
++		*lo = 0x5a5aa5a5;
++		*hi = 0xa5a55a5a;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ok = *lo == 0x5a5aa5a5 && *hi == 0xa5a55a5a;
++		*lo = 0;
++		*hi = 0;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		if (!ok) {
++			IOLog("RedwoodMali: GPU pool %#llx + %u MB: read-back test FAILED, not used\n", pa, mb);
++			IODelete(gPoolBits, uint32_t, gPoolUnits / 32);
++			gPoolBits = NULL;
++			OSSafeReleaseNULL(gPoolMap);
++			return false;
++		}
++	}
++	gPoolState = 1;
++	IOLog("RedwoodMali: GPU pool %#llx + %u MB write-combined at %#lx, test passed\n", pa, mb, gPoolKVA);
++	return true;
++}
++
++/* A run of `size` bytes (a whole number of units) of the pool, first fit; 0 when none. With the lock held. */
++static uint64_t
++pool_alloc(uint64_t size)
++{
++	uint64_t need = size / POOL_UNIT, run = 0;
++
++	if (!pool_init() || need == 0 || need > gPoolUnits - gPoolUsed) {
++		return 0;
++	}
++	for (uint64_t i = 0; i < gPoolUnits; i++) {
++		if (gPoolBits[i / 32] & (1u << (i % 32))) {
++			run = 0;
++			continue;
++		}
++		if (++run == need) {
++			uint64_t first = i + 1 - need;
++
++			for (uint64_t k = first; k <= i; k++) {
++				gPoolBits[k / 32] |= 1u << (k % 32);
++			}
++			gPoolUsed += need;
++			return gPoolPA + first * POOL_UNIT;
++		}
++	}
++	return 0;
++}
++
++static void
++pool_free(uint64_t pa, uint64_t size)
++{
++	uint64_t first = (pa - gPoolPA) / POOL_UNIT, n = size / POOL_UNIT;
++
++	for (uint64_t k = first; k < first + n; k++) {
++		gPoolBits[k / 32] &= ~(1u << (k % 32));
++	}
++	gPoolUsed -= n;
++}
+ 
+ static IOLock * gMaliLock;
+ static uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliRefused;
+@@ -405,6 +547,9 @@ RedwoodMaliUserClient::freeBuffer(struct mali_buffer * b)
+ 		return;
+ 	}
+ 	b->memory->release();
++	if (b->pool) {
++		pool_free(b->pool_pa, b->size);
++	}
+ 	if (b->surface != NULL) {
+ 		b->surface->release();
+ 	}
+@@ -467,6 +612,30 @@ RedwoodMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
+ 	if (size == 0 || size > MALI_BUFFER_MAX) {
+ 		return kIOReturnBadArgument;
+ 	}
++	/* from the write-combined pool, when there is one with room: nothing is ever cleaned for it */
++	{
++		uint64_t pa = pool_alloc(size);
++
++		if (pa != 0) {
++			IOMemoryDescriptor * pm = IOMemoryDescriptor::withAddressRange(pa, size,
++			    kIODirectionInOut | (kIOWriteCombineCache << kIOMemoryBufferCacheShift), TASK_NULL);
++
++			b = pm != NULL ? newBuffer(pm, size, &request->handle) : NULL;
++			if (b == NULL) {
++				OSSafeReleaseNULL(pm);
++				pool_free(pa, size);
++			} else {
++				b->memory = pm;
++				b->pool = true;
++				b->pool_pa = pa;
++				b->kva = gPoolKVA + (pa - gPoolPA);
++				bzero((void *) b->kva, (size_t) size);
++				__asm__ volatile ("dsb sy" ::: "memory");
++				request->offset = b->address;
++				return kIOReturnSuccess;
++			}
++		}
++	}
+ 	/*
+ 	 * wired kernel memory, zero when made, in the default cache mode (a write-combine mapping of kernel pages
+ 	 * panics this port in phystokv_range): the cache is cleaned at submit instead (kPanfrostSubmit)
+@@ -644,7 +813,7 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 			IOLockLock(gMaliLock);
+ 			b = buffer(r.wait.handle);
+ 			seq = b != NULL ? b->last_seq : 0;
+-			waitva = b != NULL && b->surface == NULL && b->mapped ? b->kva : 0;
++			waitva = b != NULL && b->surface == NULL && b->mapped && !b->pool ? b->kva : 0;
+ 			waitsize = b != NULL ? b->size : 0;
+ 			IOLockUnlock(gMaliLock);
+ 			timeout = r.wait.timeout_ns;
+@@ -739,7 +908,7 @@ RedwoodMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 							list->count++;
+ 							b->flushed_seed = seed;
+ 						}
+-					} else if (b->mapped && b->kva != 0) {
++					} else if (b->mapped && b->kva != 0 && !b->pool) {
+ 						list->items[list->count].va = b->kva;
+ 						list->items[list->count].length = (size_t) b->size;
+ 						list->items[list->count].stamp = &b->flush_stamp;
