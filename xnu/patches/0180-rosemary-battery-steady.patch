@@ -1,0 +1,100 @@
+diff --git a/bsd/dev/rosemary_battery.c b/bsd/dev/rosemary_battery.c
+index 48481cc..e194558 100644
+--- a/bsd/dev/rosemary_battery.c
++++ b/bsd/dev/rosemary_battery.c
+@@ -411,6 +411,7 @@ battery_thread(void *arg, wait_result_t result)
+ 	printf("ROSEMARY BATT: MT6360 answers, reg 0 = %#x\n", id);
+ 	dump_once();
+ 	bus_release();
++	unsigned next_adc = 0, was_ext = 2;
+ 	for (unsigned tick = 0;; tick++) {
+ 		uint8_t chg = 0, fod = 0, usb = 0;
+ 		unsigned flags = 0;
+@@ -423,9 +424,18 @@ battery_thread(void *arg, wait_result_t result)
+ 			sleep_ms(1000);
+ 			continue;
+ 		}
+-		if (cur_mv == 0 || tick % (unsigned)period_s == 0) {
++		/* a plug or an unplug changes the voltage for a few seconds: look again when it has settled */
++		if (was_ext != ((fod >> 4) & 1u)) {
++			if (was_ext != 2) {
++				next_adc = tick + 5;
++			}
++			was_ext = (fod >> 4) & 1u;
++		}
++		if (cur_mv == 0 || tick >= next_adc) {
+ 			int raw = adc_read(CH_VBAT);
+ 
++			next_adc = tick + (unsigned)period_s;
++
+ 			if (raw > 0) {
+ 				cur_mv = (unsigned)((uint64_t)raw * (uint64_t)lsb / 1000u);
+ 			}
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 163d684..1ccf7e4 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -38,6 +38,8 @@ private:
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
++	unsigned fShown, fRise, fHold;          /* rosemary: the percentage shown, and what holds it steady */
++	bool fWasExternal;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -82,6 +84,8 @@ SweetBattery::init(OSDictionary *dictionary)
+ 		}
+ 	}
+ 	fLastMode = -1;
++	fShown = fRise = fHold = 0;
++	fWasExternal = false;
+ 	return true;
+ }
+ 
+@@ -243,12 +247,40 @@ SweetBattery::poll(void)
+ 	bool rexternal = (rflags & 1u) != 0;
+ 	bool rcharging = (rflags & 2u) != 0;
+ 	bool rfull = (rflags & 4u) != 0;
+-	/* charging lifts the voltage: about 60 mV above the resting value at the usual current */
+-	unsigned rpercent = estimatePercent(rcharging && rmv > 3460 ? rmv - 60 : rmv);
+-	if (rcharging && rpercent > 99) {
+-		rpercent = 99;
++	/*
++	 * With the supply there the charger lifts the voltage of the cell by 100..140 mV (it reads 4.3..4.38 V
++	 * at a charge that rests at 4.24 V), and for a few seconds after it is pulled the reading is still
++	 * high. So there is no percentage to be had from the voltage on the supply, and none for those
++	 * seconds. On the battery the percentage follows the voltage downwards; on the supply it starts
++	 * from the voltage less 100 mV and goes up by one in a minute at most; at a change it holds for
++	 * 12 s, until the voltage has settled. A real gauge (the MT6359 coulomb counter) would replace all this.
++	 */
++	unsigned rest = estimatePercent(rexternal && rmv > 3500 ? rmv - 100 : rmv);
++	if (rexternal != fWasExternal) {
++		fWasExternal = rexternal;
++		fHold = 6;
++		fRise = 0;
+ 	}
+-	publish(rfull ? 100 : rpercent, rmv, 0, rexternal, rexternal, rcharging, rfull, true, false);
++	if (fShown == 0) {
++		fShown = rest;
++	} else if (fHold > 0) {
++		fHold--;
++	} else if (rexternal) {
++		if (rest > fShown && ++fRise >= 30) {
++			fShown++;
++			fRise = 0;
++		}
++	} else if (rest < fShown || rest > fShown + 4) {
++		fShown = rest;
++	}
++	if (fShown > 99 && !rfull) {
++		fShown = 99;
++	}
++	unsigned rpercent = rfull ? 100 : fShown;
++	if (rfull) {
++		fShown = 100;
++	}
++	publish(rpercent, rmv, 0, rexternal, rexternal, rcharging, rfull, true, false);
+ 	return;
+ #else
+ 	uint8_t type, present, usb, path, charger, error, temperature;
