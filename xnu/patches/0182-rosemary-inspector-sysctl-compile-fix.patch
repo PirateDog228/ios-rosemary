@@ -1,0 +1,39 @@
+--- a/bsd/dev/rosemary_inspector.c
++++ b/bsd/dev/rosemary_inspector.c
+@@ -39,11 +39,15 @@
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+ extern unsigned panic_active(void);
+ 
++/* The parent node is created in rosemary_mali.c by patch 0150. */
++SYSCTL_DECL(_kern_rosemary);
++
+ SYSCTL_NODE(_kern_rosemary, OID_AUTO, inspector, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
+ 	"Rosemary Inspector API");
+ 
+ static int
+-rosemary_inspector_sysctl_log_position(SYSCTL_HANDLER_ARGS)
++rosemary_inspector_sysctl_log_position(struct sysctl_oid *oidp, void *arg1,
++    int arg2, struct sysctl_req *req)
+ {
+ #pragma unused(oidp, arg1, arg2)
+ 	uint64_t position = sweet_log_position();
+@@ -52,7 +56,8 @@
+ }
+ 
+ static int
+-rosemary_inspector_sysctl_panic_active(SYSCTL_HANDLER_ARGS)
++rosemary_inspector_sysctl_panic_active(struct sysctl_oid *oidp, void *arg1,
++    int arg2, struct sysctl_req *req)
+ {
+ #pragma unused(oidp, arg1, arg2)
+ 	int active = panic_active() ? 1 : 0;
+@@ -61,7 +66,8 @@
+ }
+ 
+ static int
+-rosemary_inspector_sysctl_readlog(SYSCTL_HANDLER_ARGS)
++rosemary_inspector_sysctl_readlog(struct sysctl_oid *oidp, void *arg1,
++    int arg2, struct sysctl_req *req)
+ {
+ #pragma unused(oidp, arg1, arg2)
+ 	struct rosemary_inspector_read_request query;
