@@ -1,0 +1,163 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,2 +106,3 @@
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/rosemary_inspector.c		standard
+ bsd/dev/sweet_sample.c			standard
+--- /dev/null
++++ b/bsd/dev/rosemary_inspector.c
+@@ -0,0 +1,154 @@
++/*
++ * Rosemary Inspector read-only diagnostic API.
++ *
++ * The console ring itself is owned by sweet_ufs.c.  This file exposes bounded
++ * cursor-based reads through sysctl so a small userland agent can relay the
++ * data to the host without adding networking code to the kernel.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/kalloc.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#define ROSEMARY_INSPECTOR_LOG_SIZE       (4u << 20)
++#define ROSEMARY_INSPECTOR_MAX_READ       (32u << 10)
++
++#define ROSEMARY_INSPECTOR_F_OVERRUN     0x00000001u
++#define ROSEMARY_INSPECTOR_F_MORE        0x00000002u
++
++struct rosemary_inspector_read_request {
++	uint64_t cursor;
++	uint32_t max_bytes;
++	uint32_t reserved;
++};
++
++struct rosemary_inspector_read_reply {
++	uint64_t cursor;
++	uint64_t next_cursor;
++	uint64_t total;
++	uint64_t oldest;
++	uint32_t bytes;
++	uint32_t flags;
++	uint8_t data[];
++};
++
++extern uint64_t sweet_log_position(void);
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern unsigned panic_active(void);
++
++SYSCTL_NODE(_kern_rosemary, OID_AUTO, inspector, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
++	"Rosemary Inspector API");
++
++static int
++rosemary_inspector_sysctl_log_position(SYSCTL_HANDLER_ARGS)
++{
++#pragma unused(oidp, arg1, arg2)
++	uint64_t position = sweet_log_position();
++
++	return SYSCTL_OUT(req, &position, sizeof(position));
++}
++
++static int
++rosemary_inspector_sysctl_panic_active(SYSCTL_HANDLER_ARGS)
++{
++#pragma unused(oidp, arg1, arg2)
++	int active = panic_active() ? 1 : 0;
++
++	return SYSCTL_OUT(req, &active, sizeof(active));
++}
++
++static int
++rosemary_inspector_sysctl_readlog(SYSCTL_HANDLER_ARGS)
++{
++#pragma unused(oidp, arg1, arg2)
++	struct rosemary_inspector_read_request query;
++	struct rosemary_inspector_read_reply *reply;
++	uint64_t total, oldest, pos, next_total;
++	uint32_t wanted, copied, flags = 0;
++	size_t allocation, output_size;
++	int error;
++
++	if (req->newptr == USER_ADDR_NULL || req->newlen != sizeof(query)) {
++		return EINVAL;
++	}
++	error = SYSCTL_IN(req, &query, sizeof(query));
++	if (error) {
++		return error;
++	}
++	if (query.max_bytes == 0 || query.max_bytes > ROSEMARY_INSPECTOR_MAX_READ) {
++		return EINVAL;
++	}
++
++	total = sweet_log_position();
++	if (query.cursor > total) {
++		return EINVAL;
++	}
++	oldest = total > ROSEMARY_INSPECTOR_LOG_SIZE ?
++	    total - ROSEMARY_INSPECTOR_LOG_SIZE : 0;
++	pos = query.cursor;
++	if (pos < oldest) {
++		pos = oldest;
++		flags |= ROSEMARY_INSPECTOR_F_OVERRUN;
++	}
++	wanted = (uint32_t)MIN((uint64_t)query.max_bytes, total - pos);
++	allocation = sizeof(*reply) + wanted;
++
++	/* sysctl size-probe path; the caller can then allocate exactly enough. */
++	if (req->oldptr == USER_ADDR_NULL) {
++		req->oldidx = allocation;
++		return 0;
++	}
++
++	reply = kalloc_data(allocation, Z_WAITOK);
++	if (reply == NULL) {
++		return ENOMEM;
++	}
++
++	/* sweet_log_copy() adjusts pos forward if the producer wrapped mid-read. */
++	copied = sweet_log_copy(&pos, (char *)reply->data, wanted);
++	next_total = sweet_log_position();
++	oldest = next_total > ROSEMARY_INSPECTOR_LOG_SIZE ?
++	    next_total - ROSEMARY_INSPECTOR_LOG_SIZE : 0;
++	if (pos >= copied && pos - copied > query.cursor) {
++		flags |= ROSEMARY_INSPECTOR_F_OVERRUN;
++	}
++	if (pos < next_total) {
++		flags |= ROSEMARY_INSPECTOR_F_MORE;
++	}
++
++	reply->cursor = pos - copied;
++	reply->next_cursor = pos;
++	reply->total = next_total;
++	reply->oldest = oldest;
++	reply->bytes = copied;
++	reply->flags = flags;
++	output_size = sizeof(*reply) + copied;
++	error = SYSCTL_OUT(req, reply, output_size);
++	kfree_data(reply, allocation);
++	return error;
++}
++
++static u_int rosemary_inspector_log_capacity = ROSEMARY_INSPECTOR_LOG_SIZE;
++static int rosemary_inspector_protocol_version = 1;
++
++SYSCTL_PROC(_kern_rosemary_inspector, OID_AUTO, log_position,
++	CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++	rosemary_inspector_sysctl_log_position, "Q", "Monotonic SWEETLOG byte position");
++SYSCTL_PROC(_kern_rosemary_inspector, OID_AUTO, panic_active,
++	CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++	rosemary_inspector_sysctl_panic_active, "I", "Whether XNU is currently in panic flow");
++SYSCTL_UINT(_kern_rosemary_inspector, OID_AUTO, log_capacity,
++	CTLFLAG_RD | CTLFLAG_LOCKED, &rosemary_inspector_log_capacity, 0,
++	"SWEETLOG ring capacity in bytes");
++SYSCTL_INT(_kern_rosemary_inspector, OID_AUTO, protocol_version,
++	CTLFLAG_RD | CTLFLAG_LOCKED, &rosemary_inspector_protocol_version, 0,
++	"Rosemary Inspector kernel API version");
++SYSCTL_PROC(_kern_rosemary_inspector, OID_AUTO, readlog,
++	CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++	rosemary_inspector_sysctl_readlog, "S,rosemary_inspector_read_reply",
++	"Read SWEETLOG bytes using a monotonic cursor");
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */

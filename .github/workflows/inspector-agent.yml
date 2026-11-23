@@ -1,0 +1,23 @@
+name: rosemary-inspector-agent
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tools/inspector-agent/**"
+      - "tools/build-inspector-agent-ios.sh"
+      - ".github/workflows/inspector-agent.yml"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build arm64 iOS agent
+        run: bash tools/build-inspector-agent-ios.sh out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rosemary-inspectord-ios-arm64
+          path: out/rosemary-inspectord
+          retention-days: 14
