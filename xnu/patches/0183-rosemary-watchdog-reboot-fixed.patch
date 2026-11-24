@@ -8,6 +8,15 @@ diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.c
  #include <IOKit/IORangeAllocator.h>
  #include <IOKit/IOWorkLoop.h>
  #include <IOKit/pwr_mgt/RootDomain.h>
+@@ -58,6 +58,8 @@ extern "C" {
+ #include <machine/machine_routines.h>
++/* ml_io_map is private-gated in arm/machine_routines.h; use its kernel ABI. */
++vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #include <pexpert/pexpert.h>
+ #include <uuid/uuid.h>
+ #include <sys/sysctl.h>
+ }
+
 @@ -338,10 +339,46 @@
  int
  IOPlatformExpert::haltRestart(unsigned int type)
