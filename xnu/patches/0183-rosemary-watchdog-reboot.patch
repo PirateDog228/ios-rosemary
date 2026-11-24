@@ -1,0 +1,57 @@
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -35,5 +35,6 @@
+ #include <IOKit/IONVRAM.h>
+ #include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOLib.h>
+ #include <IOKit/IORangeAllocator.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/pwr_mgt/RootDomain.h>
+@@ -338,10 +339,46 @@
+ int
+ IOPlatformExpert::haltRestart(unsigned int type)
+ {
+ 	if (type == kPEPanicSync) {
+ 		return 0;
+ 	}
++
++#if defined(ROSEMARY) && defined(__arm64__)
++	/*
++	 * Redmi Note 10S / MT6785 TOPRGU watchdog reset.
++	 * Device-tree: watchdog@10007000, reg = <0 0x10007000 0 0x1000>.
++	 * WDT_MODE: 0x00 (key 0x22000000, IRQ mode bit 3).
++	 * WDT_SWRST: 0x14 (software-reset key 0x1209).
++	 *
++	 * This lives in IOPlatformExpert rather than the Rosemary platform
++	 * subclass so it also works when the DeviceTree platform expert falls
++	 * back to IODTPlatformExpert. Keep the workaround ROSEMARY-only.
++	 */
++	if (type == kPERestartCPU || type == kPEPanicRestartCPU) {
++		vm_offset_t wdt_base = ml_io_map((vm_offset_t)0x10007000,
++		    (vm_size_t)0x1000);
++		if (wdt_base == 0) {
++			IOLog("ROSEMARY WDT: cannot map TOPRGU at 0x10007000\n");
++			return PE_halt_restart ? (*PE_halt_restart)(type) : -1;
++		}
++
++		volatile uint32_t *wdt = (volatile uint32_t *)wdt_base;
++		uint32_t mode = wdt[0];
++		IOLog("ROSEMARY WDT: TOPRGU=%p MODE=0x%08x, requesting reset\n",
++		    (void *)wdt_base, mode);
++
++		/* Ensure watchdog expiry causes a reset, not an interrupt. */
++		wdt[0] = (mode & ~(1U << 3)) | 0x22000000U;
++		__asm__ volatile("dsb sy" ::: "memory");
++
++		for (;;) {
++			wdt[0x14 / sizeof(uint32_t)] = 0x1209U;
++			__asm__ volatile("dsb sy" ::: "memory");
++			IODelay(5000);
++		}
++	}
++#endif /* ROSEMARY && __arm64__ */
+ 
+ 	if (type == kPEHangCPU) {
+ 		while (true) {
+ 			asm volatile ("");
