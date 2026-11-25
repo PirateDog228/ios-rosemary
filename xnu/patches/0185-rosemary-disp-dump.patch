@@ -1,0 +1,119 @@
+Subject: rosemary-0185: boot-arg rosedispdump=<mask>: read-only dump of the MT6785 display pipeline (mmsys, ovl, rdma, color..dither, dsi0, mutex, disp_pwm0, mipi_tx0) the ABL left running, with the registers that hold the panel-memory address called out and the ones that change in a second; groundwork for zero-copy scanout, a real vsync and panel DCS
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -191,6 +191,106 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++#if defined(ROSEMARY)
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/*
++ * 0185: boot-arg rosedispdump=<mask>: a READ-ONLY dump of the display pipeline the ABL (LK) left running, to see
++ * how the panel is driven before the framebuffer is made a real one (zero-copy scanout, flips on a real vsync,
++ * panel on/off and brightness over DCS). Addresses are the MT6785 device tree's (mmsys 0x14000000 ... dsi0
++ * 0x14014000, disp_pwm0 0x1100e000, mipi_tx0 0x11e50000). Nothing is written.
++ *
++ * Every nonzero register is printed ("ROSEMARY DISP: <block> off=value ..."); any value that lies inside the
++ * panel memory is called out, which finds the registers that hold the scanout address without a datasheet. One
++ * second later the registers that changed are printed (live counters; an address that flips = the ABL
++ * double-buffers).
++ *
++ * A block whose clock is off could hang the bus on a read, so the mask picks blocks (bit = index below) and the
++ * name of the block is logged BEFORE it is read: the last line says which one stopped a boot. Start with 1
++ * (mmsys), then 0x2e (ovl0, rdma0, color0... add one at a time), then 0x200 (dsi0).
++ * 0:mmsys 1:ovl0 2:ovl0_2l 3:rdma0 4:color0 5:ccorr0 6:aal0 7:gamma0 8:dither0 9:dsi0 10:mutex
++ * 11:postmask0 12:disp_pwm0 13:mipi_tx0 14:dsi_split 15:ovl1_2l
++ */
++struct rosemary_disp_blk {
++	const char *name;
++	uint32_t    pa;
++};
++
++static const rosemary_disp_blk rosemary_disp_blks[] = {
++	{ "mmsys", 0x14000000 }, { "ovl0", 0x14008000 }, { "ovl0_2l", 0x14009000 }, { "rdma0", 0x1400b000 },
++	{ "color0", 0x1400e000 }, { "ccorr0", 0x1400f000 }, { "aal0", 0x14010000 }, { "gamma0", 0x14011000 },
++	{ "dither0", 0x14012000 }, { "dsi0", 0x14014000 }, { "mutex", 0x14016000 }, { "postmask0", 0x14021000 },
++	{ "disp_pwm0", 0x1100e000 }, { "mipi_tx0", 0x11e50000 }, { "dsi_split", 0x14013000 }, { "ovl1_2l", 0x1400a000 },
++};
++#define ROSEMARY_DISP_NBLK  (sizeof(rosemary_disp_blks) / sizeof(rosemary_disp_blks[0]))
++
++static uint32_t rosemary_disp_snap[ROSEMARY_DISP_NBLK][1024];
++
++static void
++rosemary_disp_dump(uint64_t fbPhys, uint64_t fbBytes)
++{
++	uint32_t mask = 0;
++	volatile uint32_t *reg[ROSEMARY_DISP_NBLK] = { NULL };
++
++	if (!PE_parse_boot_argn("rosedispdump", &mask, sizeof(mask)) || mask == 0) {
++		return;
++	}
++	IOLog("ROSEMARY DISP: dump mask %#x, panel memory %#llx + %#llx\n", mask, fbPhys, fbBytes);
++	for (unsigned b = 0; b < ROSEMARY_DISP_NBLK; b++) {
++		if (!(mask & (1u << b))) {
++			continue;
++		}
++		IOLog("ROSEMARY DISP: reading %s @ %#x\n", rosemary_disp_blks[b].name, rosemary_disp_blks[b].pa);
++		reg[b] = (volatile uint32_t *)ml_io_map(rosemary_disp_blks[b].pa, 0x1000);
++		if (reg[b] == NULL) {
++			IOLog("ROSEMARY DISP: %s: mapping failed\n", rosemary_disp_blks[b].name);
++			continue;
++		}
++		uint32_t pairs[5][2];
++		unsigned np = 0;
++		for (uint32_t i = 0; i < 1024; i++) {
++			uint32_t v = reg[b][i];
++			rosemary_disp_snap[b][i] = v;
++			if (v == 0) {
++				continue;
++			}
++			if (v >= fbPhys && v < fbPhys + fbBytes) {
++				IOLog("ROSEMARY DISP: %s+%#x = %#x  <-- inside the panel memory (+%#llx)\n",
++				    rosemary_disp_blks[b].name, i * 4, v, (uint64_t)v - fbPhys);
++			}
++			pairs[np][0] = i * 4;
++			pairs[np][1] = v;
++			if (++np == 5) {
++				IOLog("ROSEMARY DISP: %s %03x=%08x %03x=%08x %03x=%08x %03x=%08x %03x=%08x\n",
++				    rosemary_disp_blks[b].name, pairs[0][0], pairs[0][1], pairs[1][0], pairs[1][1],
++				    pairs[2][0], pairs[2][1], pairs[3][0], pairs[3][1], pairs[4][0], pairs[4][1]);
++				np = 0;
++			}
++		}
++		for (unsigned k = 0; k < np; k++) {
++			IOLog("ROSEMARY DISP: %s %03x=%08x\n", rosemary_disp_blks[b].name, pairs[k][0], pairs[k][1]);
++		}
++	}
++	IOSleep(1000);
++	for (unsigned b = 0; b < ROSEMARY_DISP_NBLK; b++) {
++		unsigned changed = 0;
++
++		if (reg[b] == NULL) {
++			continue;
++		}
++		for (uint32_t i = 0; i < 1024 && changed < 40; i++) {
++			uint32_t v = reg[b][i];
++			if (v != rosemary_disp_snap[b][i]) {
++				IOLog("ROSEMARY DISP: %s+%#x changed %#x -> %#x after 1 s\n", rosemary_disp_blks[b].name,
++				    i * 4, rosemary_disp_snap[b][i], v);
++				changed++;
++			}
++		}
++	}
++	IOLog("ROSEMARY DISP: dump done\n");
++}
++#endif
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -299,6 +399,7 @@
+ 		}
+ 		OSSafeReleaseNULL(bl);
+ 	}
++	rosemary_disp_dump(fPhys, 0x02300000ull);     /* the ABL's splash memory is 0x22e0000 bytes */
+ #endif
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",

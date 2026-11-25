@@ -1,0 +1,254 @@
+Subject: rosemary-0184: brightness. AppleARMBacklight service for CoreBrightness (the slider was dead without it) and IOMFBBrightnessLevel on the framebuffer, applied as gamma-corrected software dimming while a frame is copied to the panel; boot-args rosebl=0 / rosedim=0 / rosebl_max=<nits>
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -44,6 +44,7 @@
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
+@@ -120,6 +121,14 @@
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++#if defined(ROSEMARY)
++	/* 0184 brightness: IOMFBBrightnessLevel (nits, 16.16) from CoreBrightness, applied as a gamma-corrected
++	 * multiplier (8.8, 256 = full) while the frame is copied to the panel */
++	uint64_t      fNits16, fMaxNits16;
++	uint32_t      fDimScale;
++	bool          fSoftDim;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++#endif
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -140,6 +149,21 @@
+ };
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++/*
++ * 0184: CoreBrightness (-[CBDisplayContaineriOS findBacklight]) matches {IOPropertyMatch: {backlight-control: true}}
++ * and wants a service conforming to AppleARMBacklight; without one there is no display module and the brightness
++ * slider is dead. It sets "brightness-nits" here (SetBLDriverNitsValue) and IOMFBBrightnessLevel on the framebuffer.
++ * Idea and layout from ios-topaz 0105.
++ */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	AppleCLCD *fFB;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+ #endif
+ extern "C" void sweet_amfi_service_init(void);   /* iokit/Kernel/arm/SweetAMFIService.cpp (0169) */
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -242,6 +266,39 @@
+ 		}
+ 		OSSafeReleaseNULL(accel);
+ 	}
++	/*
++	 * Brightness. The panel is scanned out of RAM by the ABL's display pipe and nothing here drives its backlight
++	 * or DCS, so the level is applied in software while a frame is copied to the panel memory (rosemary_dim_copy).
++	 * Boot-args: rosebl=0 no AppleARMBacklight service (as before 0184); rosedim=0 take the level but do not
++	 * dim; rosebl_max=<nits> what 100% is (default 500).
++	 */
++	uint32_t maxNits = 500, dimOn = 1, blOn = 1;
++	PE_parse_boot_argn("rosebl_max", &maxNits, sizeof(maxNits));
++	PE_parse_boot_argn("rosedim", &dimOn, sizeof(dimOn));
++	PE_parse_boot_argn("rosebl", &blOn, sizeof(blOn));
++	if (maxNits < 1 || maxNits > 10000) {
++		maxNits = 500;
++	}
++	fMaxNits16 = (uint64_t)maxNits << 16;
++	fNits16 = fMaxNits16;
++	fDimScale = 256;
++	fSoftDim = dimOn != 0;
++	setProperty("IOMFBBrightnessLevel", fNits16, 32);
++	if (blOn != 0) {
++		AppleARMBacklight *bl = OSTypeAlloc(AppleARMBacklight);
++		if (bl != NULL && bl->init()) {
++			bl->fFB = this;
++			bl->setProperty("backlight-control", true);
++			bl->setProperty("brightness-nits", (unsigned long long)maxNits, 32);
++			bl->setProperty("max-nits", (unsigned long long)maxNits, 32);
++			if (bl->attach(this)) {
++				bl->registerService();
++				IOLog("ROSEMARY BL: AppleARMBacklight published, 100%% = %u nits, software dimming %s\n",
++				    maxNits, fSoftDim ? "on" : "off");
++			}
++		}
++		OSSafeReleaseNULL(bl);
++	}
+ #endif
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+@@ -323,6 +380,145 @@
+ }
+ #endif
+ 
++#if defined(ROSEMARY)
++/*
++ * 0184: brightness in software. gamma[i] = round(256 * (i / 64) ^ (1 / 2.2)): the multiplier for the encoded
++ * (sRGB-ish) values that scales the light output to i/64 of full; the slider's nits are a light output.
++ * Index 0 is held at index 1: the darkest level is about 1.6 % of the light, not black (display off is
++ * RequestPowerChange).
++ */
++static const uint16_t rosemary_dim_gamma[65] = { 39, 39, 53, 64, 73, 80, 87, 94, 99, 105, 110, 115, 120, 124, 128, 132, 136, 140, 144, 147, 151, 154, 158, 161, 164, 167, 170, 173, 176, 179, 181, 184, 187, 189, 192, 195, 197, 200, 202, 204, 207, 209, 211, 214, 216, 218, 220, 222, 225, 227, 229, 231, 233, 235, 237, 239, 241, 243, 245, 247, 249, 250, 252, 254, 256 };
++
++/* nits16 / max16 (16.16 nits) -> multiplier, 8.8 fixed point, 256 = unchanged */
++static uint32_t
++rosemary_dim_scale(uint64_t nits16, uint64_t max16)
++{
++	if (max16 == 0 || nits16 >= max16) {
++		return 256;
++	}
++	uint64_t u = nits16 * 16384ull / max16;        /* k * 64, 8.8 */
++	uint32_t i = (uint32_t)(u >> 8), f = (uint32_t)(u & 255);
++	return rosemary_dim_gamma[i] + (((uint32_t)rosemary_dim_gamma[i + 1] - rosemary_dim_gamma[i]) * f >> 8);
++}
++
++static inline uint32_t
++rosemary_dim_px(uint32_t px, uint32_t s)
++{
++	uint32_t rb = (((px & 0x00ff00ffu) * s) >> 8) & 0x00ff00ffu;
++	uint32_t g = ((((px >> 8) & 0xffu) * s) >> 8) & 0xffu;
++	return (px & 0xff000000u) | rb | (g << 8);
++}
++
++/*
++ * memcpy of BGRA pixels that scales every channel by s/256 (alpha kept). Two pixels per 64-bit step: the
++ * channels sit in 16-bit lanes, 255 * 256 does not carry into the next lane. Stores are 8-byte aligned (the
++ * panel memory is not cached); the source may be 4-byte aligned. Checked on the host against a per-pixel
++ * reference for every alignment and length.
++ */
++static void
++rosemary_dim_copy(void *dstv, const void *srcv, size_t bytes, uint32_t s)
++{
++	uint32_t *d = (uint32_t *)dstv;
++	const uint32_t *p = (const uint32_t *)srcv;
++	size_t n = bytes / 4;
++	const uint64_t M = 0x00ff00ff00ff00ffull;
++
++	if (((uintptr_t)d & 4) && n) {
++		*d++ = rosemary_dim_px(*p++, s);
++		n--;
++	}
++	while (n >= 2) {
++		uint64_t v = (uint64_t)p[0] | ((uint64_t)p[1] << 32);
++		uint64_t rb = (((v & M) * s) >> 8) & M;
++		uint64_t ag = ((((v >> 8) & M) * s) >> 8) & M;
++		*(uint64_t *)d = ((rb | (ag << 8)) & 0x00ffffff00ffffffull) | (v & 0xff000000ff000000ull);
++		d += 2;
++		p += 2;
++		n -= 2;
++	}
++	if (n) {
++		*d = rosemary_dim_px(*p, s);
++	}
++}
++
++/* Log the first properties CoreBrightness sets (names and numbers), to see what else it wants. */
++static void
++rosemary_bl_log(const char *who, OSDictionary *d)
++{
++	static uint32_t logs;
++
++	if (d == NULL || logs >= 24) {
++		return;
++	}
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++	OSSymbol *k;
++	while (it != NULL && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++		OSObject *v = d->getObject(k);
++		OSNumber *n = OSDynamicCast(OSNumber, v);
++
++		if (logs++ < 24) {
++			IOLog("ROSEMARY BL: %s set %s = %s %llu\n", who, k->getCStringNoCopy(),
++			    v ? v->getMetaClass()->getClassName() : "null", n ? n->unsigned64BitValue() : 0);
++		}
++	}
++	OSSafeReleaseNULL(it);
++}
++
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("IOMFBBrightnessLevel")) : NULL;
++
++	rosemary_bl_log("iomfb", d);
++	if (n == NULL) {
++		return IOService::setProperties(properties);
++	}
++	uint64_t v = n->unsigned64BitValue();
++	setProperty("IOMFBBrightnessLevel", v, 32);
++	uint32_t scale = fSoftDim ? rosemary_dim_scale(v, fMaxNits16) : 256;
++	IOLockLock(fLock);
++	fNits16 = v;
++	if (scale != fDimScale) {
++		fDimScale = scale;
++		fDirty = true;          /* show the latest frame again at the new level */
++	}
++	IOLockUnlock(fLock);
++	static uint32_t logs;
++	if (logs++ < 12) {
++		IOLog("ROSEMARY BL: level %llu.%03llu nits -> multiplier %u/256\n", v >> 16,
++		    ((v & 0xffff) * 1000) >> 16, scale);
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("brightness-nits")) : NULL;
++
++	rosemary_bl_log("backlight", d);
++	if (n != NULL && fFB != NULL) {
++		OSDictionary *m = OSDictionary::withCapacity(1);
++		/* the same 16.16 nits scale as IOMFBBrightnessLevel; a plain nits value is shifted up */
++		uint64_t v = n->unsigned64BitValue();
++		if (v < 0x10000) {
++			v <<= 16;
++		}
++		OSNumber *nn = OSNumber::withNumber(v, 64);
++		if (m != NULL && nn != NULL) {
++			m->setObject("IOMFBBrightnessLevel", nn);
++			fFB->setProperties(m);
++			setProperty("brightness-nits", n);
++		}
++		OSSafeReleaseNULL(nn);
++		OSSafeReleaseNULL(m);
++	}
++	return kIOReturnSuccess;
++}
++#endif
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -544,7 +740,18 @@
+ 		}
+ #endif
+ 		if (src != 0 && bpe == 4) {
++#if defined(ROSEMARY)
++			uint32_t dim = fDimScale;       /* 0184: below 256 the copy dims */
++#endif
+ 			for (int32_t y = 0; y < h; y++) {
++#if defined(ROSEMARY)
++				if (dim < 256) {
++					rosemary_dim_copy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++					    (size_t)w * 4, dim);
++					continue;
++				}
++#endif
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
