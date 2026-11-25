@@ -1,0 +1,76 @@
+Subject: rosemary-0188: send the panel brightness packet: load VM_CMD_DATA, then a 0 -> 1 edge on DSI_START.VM_CMD_START (bit 16, left set by the ABL), DSI_INTSTA.VM_CMD_DONE as the completion; 0187 only set VM_CMD_EN and nothing was sent
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -308,7 +308,11 @@
+  * Nothing is written unless DSI is in video mode and the ABL's last command is a 0x51 (else "not touching").
+  */
+ #define ROSEMARY_DSI_PA         0x14014000u
++#define ROSEMARY_DSI_START      0x000u
++#define ROSEMARY_DSI_INTSTA     0x00cu
+ #define ROSEMARY_DSI_MODE       0x014u
++#define ROSEMARY_DSI_VM_CMD_START   (1u << 16)  /* DSI_START: a 0 -> 1 edge sends the packet in VM_CMD_DATA */
++#define ROSEMARY_DSI_INT_VM_CMD_DONE (1u << 5)  /* DSI_INTSTA */
+ #define ROSEMARY_DSI_VM_CON     0x130u
+ #define ROSEMARY_DSI_VM_DATA0   0x134u
+ #define ROSEMARY_DBV_MIN        8u
+@@ -335,22 +339,40 @@
+ 		return;
+ 	}
+ 	IOLockLock(rosemary_dsi_lock);
++	/*
++	 * 0188: EN alone sends nothing (0187 logged EN staying set and the panel not changing). The ABL's dsi0 dump
++	 * had DSI_START = 0x00010001: bit 0 the running video stream, bit 16 VM_CMD_START, left set after its last
++	 * command. So: load the packet, then give VM_CMD_START a 0 -> 1 edge (bit 0 is kept: it is the stream),
++	 * and the hardware sends it in the next vertical front porch and sets VM_CMD_DONE in DSI_INTSTA.
++	 * INTSTA flags are write-0-to-clear in the MTK block; if the DONE flag does not clear that way it is not
++	 * used and the wait is a fixed 40 ms.
++	 */
++	uint32_t ints0 = rosemary_dsi[ROSEMARY_DSI_INTSTA / 4];
++	rosemary_dsi_wr(ROSEMARY_DSI_INTSTA, ~ROSEMARY_DSI_INT_VM_CMD_DONE);
++	uint32_t ints1 = rosemary_dsi[ROSEMARY_DSI_INTSTA / 4];
++	bool doneUsable = !(ints1 & ROSEMARY_DSI_INT_VM_CMD_DONE);
++
+ 	rosemary_dsi_wr(ROSEMARY_DSI_VM_CON, con & ~1u);        /* not sending while the payload changes */
+ 	rosemary_dsi_wr(ROSEMARY_DSI_VM_DATA0, data);
+ 	rosemary_dsi_wr(ROSEMARY_DSI_VM_CON, con);
+-	uint32_t waited = 0, now = con;
+-	while (waited < 40) {                                   /* a frame is 16.7 ms: wait up to 40 ms for EN to clear */
+-		now = rosemary_dsi[ROSEMARY_DSI_VM_CON / 4];
+-		if (!(now & 1u)) {
++	uint32_t st = rosemary_dsi[ROSEMARY_DSI_START / 4];
++	rosemary_dsi_wr(ROSEMARY_DSI_START, st & ~ROSEMARY_DSI_VM_CMD_START);
++	rosemary_dsi_wr(ROSEMARY_DSI_START, st | ROSEMARY_DSI_VM_CMD_START);
++	uint32_t waited = 0, ints2 = ints1;
++	while (waited < 40) {                                   /* a frame is 16.7 ms */
++		ints2 = rosemary_dsi[ROSEMARY_DSI_INTSTA / 4];
++		if (doneUsable && (ints2 & ROSEMARY_DSI_INT_VM_CMD_DONE)) {
+ 			break;
+ 		}
+ 		IOSleep(1);
+ 		waited++;
+ 	}
++	uint32_t st2 = rosemary_dsi[ROSEMARY_DSI_START / 4];
+ 	IOLockUnlock(rosemary_dsi_lock);
+ 	if (logs++ < 16) {
+-		IOLog("ROSEMARY PANEL: brightness %u (%#x): VM_CMD_CON %#x -> %#x after %u ms (%s), data %#x\n", dbv, dbv, con, now,
+-		    waited, (now & 1u) ? "EN stays set: sent every frame or not taken" : "EN cleared by hardware", data);
++		IOLog("ROSEMARY PANEL: brightness %u (%#x): data %#x, START %#x -> %#x, INTSTA %#x -> %#x -> %#x, %u ms, DONE flag %s\n",
++		    dbv, dbv, data, st, st2, ints0, ints1, ints2, waited,
++		    !doneUsable ? "not usable (waited the full time)" : ((ints2 & ROSEMARY_DSI_INT_VM_CMD_DONE) ? "set: sent" : "never set"));
+ 	}
+ }
+ 
+@@ -375,8 +397,10 @@
+ 	uint32_t con = rosemary_dsi[ROSEMARY_DSI_VM_CON / 4];
+ 	uint32_t data = rosemary_dsi[ROSEMARY_DSI_VM_DATA0 / 4];
+ 	IOLog("ROSEMARY PANEL: dsi0 mode %u (1 = sync pulse video), VM_CMD_CON %#x, VM_CMD_DATA0 %#x\n", mode, con, data);
+-	if (mode == 0 || ((con >> 8) & 0xffu) != 0x39u || (data & 0xffu) != 0x51u) {
+-		IOLog("ROSEMARY PANEL: not what the ABL leaves (video mode, a 0x51 long write): not touching the panel\n");
++	uint32_t start = rosemary_dsi[ROSEMARY_DSI_START / 4];
++	IOLog("ROSEMARY PANEL: DSI_START %#x, DSI_INTSTA %#x\n", start, rosemary_dsi[ROSEMARY_DSI_INTSTA / 4]);
++	if (mode == 0 || !(start & 1u) || ((con >> 8) & 0xffu) != 0x39u || (data & 0xffu) != 0x51u) {
++		IOLog("ROSEMARY PANEL: not what the ABL leaves (video mode running, a 0x51 long write): not touching the panel\n");
+ 		rosemary_dsi = NULL;
+ 		return false;
+ 	}
