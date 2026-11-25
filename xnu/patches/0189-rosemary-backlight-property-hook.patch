@@ -1,0 +1,70 @@
+Subject: rosemary-0189: CoreBrightness may write brightness-nits as an IORegistry property, bypassing setProperties
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -177,6 +177,7 @@ class AppleARMBacklight : public IOService {
+ public:
+ 	AppleCLCD *fFB;
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	bool setProperty(const OSSymbol *key, OSObject *value) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+@@ -205,6 +206,35 @@ rosemary_bl_log(const char *who, OSDictionary *d)
+ 	OSSafeReleaseNULL(it);
+ }
+ 
++/* CoreBrightness can update a single IORegistry property without calling setProperties(). */
++bool
++AppleARMBacklight::setProperty(const OSSymbol *key, OSObject *value)
++{
++	static uint32_t logs;
++	bool ok = IORegistryEntry::setProperty(key, value);
++	const char *name = key ? key->getCStringNoCopy() : NULL;
++	OSNumber *n = OSDynamicCast(OSNumber, value);
++
++	if (ok && name != NULL && strcmp(name, "brightness-nits") == 0 && n != NULL && fFB != NULL) {
++		uint64_t v = n->unsigned64BitValue();
++		if (v < 0x10000) {
++			v <<= 16;                         /* plain nits -> 16.16 */
++		}
++		OSDictionary *m = OSDictionary::withCapacity(1);
++		OSNumber *nn = OSNumber::withNumber(v, 64);
++		if (m != NULL && nn != NULL) {
++			m->setObject("IOMFBBrightnessLevel", nn);
++			if (logs++ < 24) {
++				IOLog("ROSEMARY BL: registry brightness-nits %llu -> IOMFBBrightnessLevel %llu\n", n->unsigned64BitValue(), v);
++			}
++			fFB->setProperties(m);
++		}
++		OSSafeReleaseNULL(nn);
++		OSSafeReleaseNULL(m);
++	}
++	return ok;
++}
++
+ IOReturn
+ AppleCLCD::setProperties(OSObject *properties)
+ {
+@@ -238,19 +265,7 @@ AppleARMBacklight::setProperties(OSObject *properties)
+ 	rosemary_bl_log("backlight", d);
+ 	if (n != NULL && fFB != NULL) {
+-		OSDictionary *m = OSDictionary::withCapacity(1);
+-		/* the same 16.16 nits scale as IOMFBBrightnessLevel; a plain nits value is shifted up */
+-		uint64_t v = n->unsigned64BitValue();
+-		if (v < 0x10000) {
+-			v <<= 16;
+-		}
+-		OSNumber *nn = OSNumber::withNumber(v, 64);
+-		if (m != NULL && nn != NULL) {
+-			m->setObject("IOMFBBrightnessLevel", nn);
+-			fFB->setProperties(m);
+-			setProperty("brightness-nits", n);
+-		}
+-		OSSafeReleaseNULL(nn);
+-		OSSafeReleaseNULL(m);
++		/* Reuse the registry-property path; it forwards exactly once to the framebuffer. */
++		setProperty("brightness-nits", n);
+ 	}
+ 	return kIOReturnSuccess;
+ }
