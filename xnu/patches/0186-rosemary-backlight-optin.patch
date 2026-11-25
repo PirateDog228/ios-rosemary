@@ -1,0 +1,19 @@
+Subject: rosemary-0186: the AppleARMBacklight service of 0184 only with rosebl=1 (with it CoreBrightness ran a colour filter over every frame: about 1 fps, as ios-topaz 0110 found)
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -369,10 +369,11 @@
+ 	/*
+ 	 * Brightness. The panel is scanned out of RAM by the ABL's display pipe and nothing here drives its backlight
+ 	 * or DCS, so the level is applied in software while a frame is copied to the panel memory (rosemary_dim_copy).
+-	 * Boot-args: rosebl=0 no AppleARMBacklight service (as before 0184); rosedim=0 take the level but do not
+-	 * dim; rosebl_max=<nits> what 100% is (default 500).
++	 * Boot-args: rosebl=1 publishes the AppleARMBacklight service (OFF by default since 0186: with it
++	 * CoreBrightness also ran a colour filter over every frame and the UI fell to about 1 fps, as in ios-topaz
++	 * 0110); rosedim=0 take the level but do not dim; rosebl_max=<nits> what 100% is (default 500).
+ 	 */
+-	uint32_t maxNits = 500, dimOn = 1, blOn = 1;
++	uint32_t maxNits = 500, dimOn = 1, blOn = 0;
+ 	PE_parse_boot_argn("rosebl_max", &maxNits, sizeof(maxNits));
+ 	PE_parse_boot_argn("rosedim", &dimOn, sizeof(dimOn));
+ 	PE_parse_boot_argn("rosebl", &blOn, sizeof(blOn));

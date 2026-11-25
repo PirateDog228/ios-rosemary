@@ -1,0 +1,160 @@
+Subject: rosemary-0187: the panel's own brightness: DCS 0x51 over the DSI video-mode command registers (0x130/0x134, the packet the ABL left there: 51 07 f8); rosepanelbl=1 for CoreBrightness levels, rosepanelbl_test=1 steps the panel at boot; refuses unless DSI is in video mode and the ABL's last command is a 0x51
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -127,6 +127,7 @@
+ 	uint64_t      fNits16, fMaxNits16;
+ 	uint32_t      fDimScale;
+ 	bool          fSoftDim;
++	bool          fPanelHw;       /* 0187: brightness is sent to the panel (DCS 0x51 over DSI) */
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ #endif
+ 
+@@ -291,6 +292,110 @@
+ }
+ #endif
+ 
++#if defined(ROSEMARY)
++/*
++ * 0187: the panel's own brightness. The 0185 dump of dsi0 (video mode, 4 lanes, RGB888 3240 bytes a line, no DSC;
++ * panel dsi_panel_k7_38_0c_0a_fhdp_video) still holds the last command the ABL sent while the pipe runs, in the
++ * video-mode command registers:
++ *   DSI_VM_CMD_CON   0x130 = 0x00033923  VM_CMD_EN | LONG_PKT | TS_VFP_EN, data id 0x39 (DCS long write), count 3
++ *   DSI_VM_CMD_DATA0 0x134 = 0x00f80751  bytes 51 07 f8 = DCS 0x51 (set display brightness), 0x07f8 = 255 * 8
++ * so the ABL maps an 8-bit level to the panel's 11-bit brightness by 8 and sends it in the vertical front porch.
++ * The same packet is sent here with another value: EN is cleared, the payload is written, EN is set again, and the
++ * hardware's clearing of EN (if it does) is waited for. Boot-args:
++ *   rosepanelbl=1       use the panel brightness for the levels CoreBrightness sets (default 0)
++ *   rosepanelbl_test=1  at boot, step the panel 2040 -> 1020 -> 400 -> 120 -> 2040 (1.5 s each) and log it
++ *   rosepanelbl_max=<n> brightness value of 100% (default 2040, the ABL's top level; the panel takes up to 2047)
++ * Nothing is written unless DSI is in video mode and the ABL's last command is a 0x51 (else "not touching").
++ */
++#define ROSEMARY_DSI_PA         0x14014000u
++#define ROSEMARY_DSI_MODE       0x014u
++#define ROSEMARY_DSI_VM_CON     0x130u
++#define ROSEMARY_DSI_VM_DATA0   0x134u
++#define ROSEMARY_DBV_MIN        8u
++
++static volatile uint32_t *rosemary_dsi;
++static IOLock *rosemary_dsi_lock;
++static uint32_t rosemary_dbv_max = 2040;
++
++static inline void
++rosemary_dsi_wr(uint32_t off, uint32_t v)
++{
++	rosemary_dsi[off / 4] = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++rosemary_panel_set_dbv(uint32_t dbv)
++{
++	static uint32_t logs;
++	uint32_t con = (3u << 16) | (0x39u << 8) | 0x23u;
++	uint32_t data = 0x51u | (((dbv >> 8) & 0xffu) << 8) | ((dbv & 0xffu) << 16);
++
++	if (rosemary_dsi == NULL) {
++		return;
++	}
++	IOLockLock(rosemary_dsi_lock);
++	rosemary_dsi_wr(ROSEMARY_DSI_VM_CON, con & ~1u);        /* not sending while the payload changes */
++	rosemary_dsi_wr(ROSEMARY_DSI_VM_DATA0, data);
++	rosemary_dsi_wr(ROSEMARY_DSI_VM_CON, con);
++	uint32_t waited = 0, now = con;
++	while (waited < 40) {                                   /* a frame is 16.7 ms: wait up to 40 ms for EN to clear */
++		now = rosemary_dsi[ROSEMARY_DSI_VM_CON / 4];
++		if (!(now & 1u)) {
++			break;
++		}
++		IOSleep(1);
++		waited++;
++	}
++	IOLockUnlock(rosemary_dsi_lock);
++	if (logs++ < 16) {
++		IOLog("ROSEMARY PANEL: brightness %u (%#x): VM_CMD_CON %#x -> %#x after %u ms (%s), data %#x\n", dbv, dbv, con, now,
++		    waited, (now & 1u) ? "EN stays set: sent every frame or not taken" : "EN cleared by hardware", data);
++	}
++}
++
++/* Map and check the DSI block; true if brightness commands can be sent. */
++static bool
++rosemary_panel_init(void)
++{
++	uint32_t v = 0;
++
++	PE_parse_boot_argn("rosepanelbl_max", &v, sizeof(v));
++	if (v >= 64 && v <= 2047) {
++		rosemary_dbv_max = v;
++	}
++	rosemary_dsi = (volatile uint32_t *)ml_io_map(ROSEMARY_DSI_PA, 0x1000);
++	rosemary_dsi_lock = IOLockAlloc();
++	if (rosemary_dsi == NULL || rosemary_dsi_lock == NULL) {
++		rosemary_dsi = NULL;
++		IOLog("ROSEMARY PANEL: no DSI mapping\n");
++		return false;
++	}
++	uint32_t mode = rosemary_dsi[ROSEMARY_DSI_MODE / 4] & 3u;
++	uint32_t con = rosemary_dsi[ROSEMARY_DSI_VM_CON / 4];
++	uint32_t data = rosemary_dsi[ROSEMARY_DSI_VM_DATA0 / 4];
++	IOLog("ROSEMARY PANEL: dsi0 mode %u (1 = sync pulse video), VM_CMD_CON %#x, VM_CMD_DATA0 %#x\n", mode, con, data);
++	if (mode == 0 || ((con >> 8) & 0xffu) != 0x39u || (data & 0xffu) != 0x51u) {
++		IOLog("ROSEMARY PANEL: not what the ABL leaves (video mode, a 0x51 long write): not touching the panel\n");
++		rosemary_dsi = NULL;
++		return false;
++	}
++	IOLog("ROSEMARY PANEL: ABL level %u, 100%% = %u\n", (((data >> 8) & 0xffu) << 8) | ((data >> 16) & 0xffu), rosemary_dbv_max);
++	return true;
++}
++
++static void
++rosemary_panel_test(void)
++{
++	static const uint32_t steps[] = { 2040, 1020, 400, 120, 2040 };
++
++	for (unsigned i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
++		rosemary_panel_set_dbv(steps[i]);
++		IOSleep(1500);
++	}
++}
++#endif
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -384,6 +489,21 @@
+ 	fNits16 = fMaxNits16;
+ 	fDimScale = 256;
+ 	fSoftDim = dimOn != 0;
++	uint32_t panelOn = 0, panelTest = 0;
++	PE_parse_boot_argn("rosepanelbl", &panelOn, sizeof(panelOn));
++	PE_parse_boot_argn("rosepanelbl_test", &panelTest, sizeof(panelTest));
++	if (panelOn != 0 || panelTest != 0) {
++		fPanelHw = rosemary_panel_init();
++		if (fPanelHw && panelOn != 0) {
++			fSoftDim = false;               /* the panel does it: no second dimming */
++		}
++		if (fPanelHw && panelTest != 0) {
++			rosemary_panel_test();
++		}
++		if (panelOn == 0) {
++			fPanelHw = false;               /* test only */
++		}
++	}
+ 	setProperty("IOMFBBrightnessLevel", fNits16, 32);
+ 	if (blOn != 0) {
+ 		AppleARMBacklight *bl = OSTypeAlloc(AppleARMBacklight);
+@@ -579,6 +699,14 @@
+ 	uint64_t v = n->unsigned64BitValue();
+ 	setProperty("IOMFBBrightnessLevel", v, 32);
+ 	uint32_t scale = fSoftDim ? rosemary_dim_scale(v, fMaxNits16) : 256;
++	if (fPanelHw) {
++		uint64_t dbv = v >= fMaxNits16 ? rosemary_dbv_max : v * rosemary_dbv_max / fMaxNits16;
++
++		if (dbv < ROSEMARY_DBV_MIN) {
++			dbv = ROSEMARY_DBV_MIN;
++		}
++		rosemary_panel_set_dbv((uint32_t)dbv);
++	}
+ 	IOLockLock(fLock);
+ 	fNits16 = v;
+ 	if (scale != fDimScale) {
